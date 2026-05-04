@@ -433,26 +433,59 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
 
 @lru_cache(1)
 def get_window_topk_idxs(window_size: int, bsz: int, seqlen: int, start_pos: int):
-    if start_pos >= window_size - 1:
-        start_pos %= window_size
-        matrix = torch.cat([torch.arange(start_pos + 1, window_size),  torch.arange(0, start_pos + 1)], dim=0)
-    elif start_pos > 0:
-        matrix = F.pad(torch.arange(start_pos + 1), (0, window_size - start_pos - 1), value=-1)
-    else:
+    if start_pos == 0:
         base = torch.arange(seqlen).unsqueeze(1)
         matrix = (base - window_size + 1).clamp(0) + torch.arange(min(seqlen, window_size))
         matrix = torch.where(matrix > base, -1, matrix)
+        return matrix.unsqueeze(0).expand(bsz, -1, -1)
+    # start_pos > 0: produce one window-row per query position. Matrix shape
+    # is [seqlen, window]. For seqlen=1 this collapses to the original
+    # single-row implementation. For seqlen>1 (speculative-verify decode)
+    # we additionally mask out slots that the kv_cache write for a *later*
+    # position in the same chunk has already overwritten — for query at
+    # local index i, those are slots holding positions
+    # (start_pos + i+1, ..., start_pos + seqlen - 1).
+    rows = []
+    for i in range(seqlen):
+        cur_pos = start_pos + i
+        if cur_pos >= window_size - 1:
+            cur = cur_pos % window_size
+            row = torch.cat([torch.arange(cur + 1, window_size), torch.arange(0, cur + 1)], dim=0)
+        else:
+            row = F.pad(torch.arange(cur_pos + 1), (0, window_size - cur_pos - 1), value=-1)
+        if seqlen > 1:
+            for j in range(i + 1, seqlen):
+                future_slot = (start_pos + j) % window_size
+                row = torch.where(row == future_slot, torch.full_like(row, -1), row)
+        rows.append(row)
+    matrix = torch.stack(rows, dim=0)  # [seqlen, window]
     return matrix.unsqueeze(0).expand(bsz, -1, -1)
 
 
 @lru_cache(2)
 def get_compress_topk_idxs(ratio: int, bsz: int, seqlen: int, start_pos: int, offset: int):
-    if start_pos > 0:
-        matrix = torch.arange(0, (start_pos + 1) // ratio) + offset
-    else:
+    if start_pos == 0:
         matrix = torch.arange(seqlen // ratio).repeat(seqlen, 1)
         mask = matrix >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
         matrix = torch.where(mask, -1, matrix + offset)
+        return matrix.unsqueeze(0).expand(bsz, -1, -1)
+    # start_pos > 0
+    if seqlen == 1:
+        matrix = torch.arange(0, (start_pos + 1) // ratio) + offset
+        return matrix.unsqueeze(0).expand(bsz, -1, -1)
+    rows = []
+    for i in range(seqlen):
+        cur_pos = start_pos + i
+        rows.append(torch.arange(0, (cur_pos + 1) // ratio) + offset)
+    # Pad rows to the same length so we can stack.
+    max_len = max(r.numel() for r in rows)
+    padded = []
+    for r in rows:
+        if r.numel() < max_len:
+            pad = torch.full((max_len - r.numel(),), -1, dtype=r.dtype)
+            r = torch.cat([r, pad], dim=0)
+        padded.append(r)
+    matrix = torch.stack(padded, dim=0)  # [seqlen, max_len]
     return matrix.unsqueeze(0).expand(bsz, -1, -1)
 
 
@@ -648,7 +681,15 @@ class Indexer(torch.nn.Module):
         q = rotate_activation(q)
         # use fp4 simulation for q and kv in indexer
         fp4_act_quant(q, fp4_block_size, True)
-        self.compressor(x, start_pos)
+        if start_pos > 0 and seqlen > 1:
+            # Decode-time speculative verify: advance compressor state position
+            # by position. The compressor's stateful kv_state/score_state
+            # depend on `start_pos % ratio`, so feeding a length-2 chunk
+            # directly would confuse it.
+            for i in range(seqlen):
+                self.compressor(x[:, i:i+1], start_pos + i)
+        else:
+            self.compressor(x, start_pos)
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
         # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
         index_score = torch.einsum("bshd,btd->bsht", q, self.kv_cache[:bsz, :end_pos // ratio])
@@ -658,10 +699,32 @@ class Indexer(torch.nn.Module):
         if start_pos == 0:
             mask = torch.arange(seqlen // ratio).repeat(seqlen, 1) >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
             index_score += torch.where(mask, float("-inf"), 0)
+        elif seqlen > 1:
+            # Speculative-verify decode: each query position `i` may only attend
+            # to compressor cells `[0 .. (start_pos+i+1)//ratio)`. Mask the
+            # later ones (which exist in the slice because end_pos//ratio
+            # rounds up over the seqlen=2 window).
+            t_dim = index_score.size(-1)
+            valid_per_row = torch.tensor(
+                [min(t_dim, (start_pos + i + 1) // ratio) for i in range(seqlen)],
+                device=index_score.device,
+            )
+            t_idx = torch.arange(t_dim, device=index_score.device).unsqueeze(0)  # [1, t]
+            mask = t_idx >= valid_per_row.unsqueeze(-1)  # [seqlen, t]
+            index_score = index_score.masked_fill(mask.unsqueeze(0), float("-inf"))
         topk_idxs = index_score.topk(min(self.index_topk, end_pos // ratio), dim=-1)[1]
         if start_pos == 0:
             mask = topk_idxs >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
             topk_idxs = torch.where(mask, -1, topk_idxs + offset)
+        elif seqlen > 1:
+            # Per-row masking: position i can only validly index cells up to
+            # (start_pos+i+1)//ratio. Beyond that, mark as -1.
+            valid_per_row = torch.tensor(
+                [(start_pos + i + 1) // ratio for i in range(seqlen)],
+                device=topk_idxs.device,
+            )
+            invalid_mask = topk_idxs >= valid_per_row.view(1, seqlen, 1)
+            topk_idxs = torch.where(invalid_mask, torch.full_like(topk_idxs, -1), topk_idxs + offset)
         else:
             topk_idxs += offset
         return topk_idxs
@@ -923,10 +986,24 @@ class Attention(nn.Module):
                 t_compressor = mark()
             o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         else:
+            # Decode path. seqlen==1 is the standard fast path; seqlen>1 is
+            # the speculative-verify path used when speculative decoding is
+            # active. For seqlen>1 we write `seqlen` consecutive slots into
+            # the windowed kv_cache (with wrap-around), call the per-position
+            # compressor seqlen times, and let sparse_attn handle a multi-q
+            # batch.
             if not kv_cache_fold:
-                self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
+                if seqlen == 1:
+                    self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
+                else:
+                    for i in range(seqlen):
+                        self.kv_cache[:bsz, (start_pos + i) % win] = kv[:, i]
             if self.compress_ratio:
-                self.compressor(x, start_pos)
+                if seqlen == 1:
+                    self.compressor(x, start_pos)
+                else:
+                    for i in range(seqlen):
+                        self.compressor(x[:, i:i+1], start_pos + i)
                 t_compressor = mark()
             o = sparse_attn(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
         t_sparse = mark()
@@ -1825,25 +1902,26 @@ class ParallelHead(nn.Module):
             self.register_buffer("lm_head_fp16_weight", weight, persistent=False)
         return weight
 
-    def get_logits(self, x):
-        x = x[:, -1]
+    def get_logits(self, x, keep_all_positions: bool = False):
+        if not keep_all_positions:
+            x = x[:, -1]
         if self.lm_head_fp16_enabled and x.is_cuda and self.weight.is_cuda:
             return F.linear(x.to(torch.float16), self._lm_head_fp16_weight()).to(torch.float32)
         return F.linear(x.float(), self.weight)
 
-    def forward(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, norm: RMSNorm):
+    def forward(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, norm: RMSNorm, keep_all_positions: bool = False):
         # x: [b,s,hc,d]
         x = self.hc_head(x, hc_fn, hc_scale, hc_base)
-        logits = self.get_logits(norm(x))
+        logits = self.get_logits(norm(x), keep_all_positions=keep_all_positions)
         if world_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(world_size)]
             dist.all_gather(all_logits, logits)
             logits = torch.cat(all_logits, dim=-1)
         return logits
 
-    def next_token(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
+    def next_token(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, norm: RMSNorm, keep_all_positions: bool = False) -> torch.Tensor:
         x = self.hc_head(x, hc_fn, hc_scale, hc_base)
-        logits = self.get_logits(norm(x))
+        logits = self.get_logits(norm(x), keep_all_positions=keep_all_positions)
         values, indices = logits.max(dim=-1)
         if world_size > 1:
             all_values = [torch.empty_like(values) for _ in range(world_size)]
@@ -1991,7 +2069,7 @@ class Transformer(nn.Module):
             layer.release_gpu_prefill_moe_cache()
 
     @torch.inference_mode()
-    def forward(self, input_ids: torch.Tensor, start_pos: int = 0, return_next_token: bool = False, return_hidden: bool = False):
+    def forward(self, input_ids: torch.Tensor, start_pos: int = 0, return_next_token: bool = False, return_hidden: bool = False, keep_all_positions: bool = False):
         h = self.embed(input_ids)
         # Expand to hc_mult copies for Hyper-Connections
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
@@ -2001,11 +2079,11 @@ class Transformer(nn.Module):
             prefetch_next = self.layers[layer_idx + 1] if layer_idx + 1 < len(self.layers) else None
             h = layer(h, start_pos, input_ids, prefetch_next=prefetch_next)
         if return_next_token:
-            next_token = self.head.next_token(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
+            next_token = self.head.next_token(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm, keep_all_positions=keep_all_positions)
             if return_hidden:
                 return next_token, h
             return next_token
-        logits = self.head(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
+        logits = self.head(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm, keep_all_positions=keep_all_positions)
         if return_hidden:
             return logits, h
         return logits
