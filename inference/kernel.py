@@ -5,6 +5,8 @@ from typing import Optional
 
 import torch
 
+from cuda_kernel_backend import load_cuda_kernel
+
 
 _USE_TILELANG = False
 _FORCE_FALLBACK = os.getenv("DEEPSEEK_FORCE_FALLBACK", "0").lower() in {"1", "true", "yes"}
@@ -12,6 +14,14 @@ _FORCE_TORCH_GEMM = os.getenv("DEEPSEEK_FORCE_TORCH_GEMM", "0").lower() in {"1",
 _FP8_IMPL = os.getenv("DEEPSEEK_FP8_IMPL", "auto")
 _FP4_IMPL = os.getenv("DEEPSEEK_FP4_IMPL", "auto")
 _INT8_IMPL = os.getenv("DEEPSEEK_INT8_IMPL", "torch")
+_FUSED_DECODE_ATTN = os.getenv("DEEPSEEK_FUSED_DECODE_ATTN", "0").lower() in {"1", "true", "yes"}
+_FUSED_DECODE_ATTN_CUDA = os.getenv("DEEPSEEK_FUSED_DECODE_ATTN_CUDA", "0").lower() in {"1", "true", "yes"}
+_TENSOR_CORE_ATTN = os.getenv("DEEPSEEK_TENSOR_CORE_ATTN", "0").lower() in {"1", "true", "yes"}
+_TENSOR_CORE_ATTN_CUDA = os.getenv("DEEPSEEK_TENSOR_CORE_ATTN_CUDA", "0").lower() in {"1", "true", "yes"}
+_FLASHINFER_STYLE_ATTN_CUDA = os.getenv("DEEPSEEK_FLASHINFER_STYLE_ATTN_CUDA", "0").lower() in {"1", "true", "yes"}
+_PREFILL_SPARSE_ATTN_CUDA = os.getenv("DEEPSEEK_PREFILL_SPARSE_ATTN_CUDA", "1").lower() in {"1", "true", "yes"}
+_SHARED_EXPERT_PAIR_INT8_CUDA = os.getenv("DEEPSEEK_SHARED_EXPERT_PAIR_INT8_CUDA", "0").lower() in {"1", "true", "yes"}
+_INT8_CUDA_EXT = None
 
 if not _FORCE_FALLBACK:
     try:
@@ -349,6 +359,73 @@ if _USE_TRITON:
         c_ptrs = C + N * offs_cm[:, None] + offs_cn[None, :]
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
         tl.store(c_ptrs, c, mask=c_mask)
+
+    @triton.jit
+    def _decode_sparse_attn_kernel(
+        q_ptr,
+        kv_ptr,
+        sink_ptr,
+        idx_ptr,
+        out_ptr,
+        topk: tl.constexpr,
+        kv_len: tl.constexpr,
+        heads: tl.constexpr,
+        dim: tl.constexpr,
+        stride_q_b: tl.constexpr,
+        stride_q_h: tl.constexpr,
+        stride_kv_b: tl.constexpr,
+        stride_kv_t: tl.constexpr,
+        stride_out_b: tl.constexpr,
+        stride_out_h: tl.constexpr,
+        softmax_scale: tl.constexpr,
+        BLOCK_T: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_h = tl.program_id(1)
+        pid_d = tl.program_id(2)
+        offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+        d_mask = offs_d < dim
+
+        max_score = tl.load(sink_ptr + pid_h).to(tl.float32)
+        denom = 0.0
+        acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+        for start in range(0, topk, BLOCK_T):
+            offs_t = start + tl.arange(0, BLOCK_T)
+            valid_t = offs_t < topk
+            idx = tl.load(idx_ptr + pid_b * topk + offs_t, mask=valid_t, other=-1)
+            valid = valid_t & (idx >= 0) & (idx < kv_len)
+            scores = tl.zeros((BLOCK_T,), dtype=tl.float32)
+            for d0 in range(0, dim, BLOCK_D):
+                kd = d0 + tl.arange(0, BLOCK_D)
+                mask_d = kd < dim
+                q_blk = tl.load(q_ptr + pid_b * stride_q_b + pid_h * stride_q_h + kd, mask=mask_d, other=0.0).to(tl.float32)
+                kv = tl.load(kv_ptr + pid_b * stride_kv_b + idx[:, None] * stride_kv_t + kd[None, :], mask=valid[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+                scores += tl.sum(kv * q_blk[None, :], axis=1)
+            scores = tl.where(valid, scores * softmax_scale, -float("inf"))
+            max_score = tl.maximum(max_score, tl.max(scores, axis=0))
+
+        sink_score = tl.load(sink_ptr + pid_h).to(tl.float32)
+        denom += tl.exp(sink_score - max_score)
+        for start in range(0, topk, BLOCK_T):
+            offs_t = start + tl.arange(0, BLOCK_T)
+            valid_t = offs_t < topk
+            idx = tl.load(idx_ptr + pid_b * topk + offs_t, mask=valid_t, other=-1)
+            valid = valid_t & (idx >= 0) & (idx < kv_len)
+            scores = tl.zeros((BLOCK_T,), dtype=tl.float32)
+            for d0 in range(0, dim, BLOCK_D):
+                kd = d0 + tl.arange(0, BLOCK_D)
+                mask_d = kd < dim
+                q_blk = tl.load(q_ptr + pid_b * stride_q_b + pid_h * stride_q_h + kd, mask=mask_d, other=0.0).to(tl.float32)
+                kv = tl.load(kv_ptr + pid_b * stride_kv_b + idx[:, None] * stride_kv_t + kd[None, :], mask=valid[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+                scores += tl.sum(kv * q_blk[None, :], axis=1)
+            scores = tl.where(valid, scores * softmax_scale, -float("inf"))
+            weights = tl.exp(scores - max_score)
+            denom += tl.sum(weights, axis=0)
+            kv_out = tl.load(kv_ptr + pid_b * stride_kv_b + idx[:, None] * stride_kv_t + offs_d[None, :], mask=valid[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
+            acc += tl.sum(weights[:, None] * kv_out, axis=0)
+        acc = acc / denom
+        tl.store(out_ptr + pid_b * stride_out_b + pid_h * stride_out_h + offs_d, acc, mask=d_mask)
 
     @triton.jit
     def _matmul_kernel(
@@ -720,6 +797,46 @@ def soft_bf16_weight_gemm_int8_triton(
     return y.view(*x.shape[:-1], n).to(torch.get_default_dtype())
 
 
+def soft_bf16_weight_gemm_int8_cuda_ext(
+    x: torch.Tensor,
+    weight_q: torch.Tensor,
+    weight_s: torch.Tensor,
+) -> torch.Tensor:
+    global _INT8_CUDA_EXT
+    if _INT8_CUDA_EXT is None:
+        _INT8_CUDA_EXT = load_cuda_kernel()
+    if _INT8_CUDA_EXT is None:
+        raise RuntimeError("INT8 CUDA extension is unavailable")
+    y = _INT8_CUDA_EXT.int8_gemm_forward(
+        x.contiguous(),
+        weight_q.contiguous(),
+        weight_s.contiguous(),
+    )
+    return y.to(torch.get_default_dtype())
+
+
+def soft_bf16_weight_gemm_int8_pair_cuda_ext(
+    x: torch.Tensor,
+    weight_q0: torch.Tensor,
+    weight_s0: torch.Tensor,
+    weight_q1: torch.Tensor,
+    weight_s1: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    global _INT8_CUDA_EXT
+    if _INT8_CUDA_EXT is None:
+        _INT8_CUDA_EXT = load_cuda_kernel()
+    if _INT8_CUDA_EXT is None or not hasattr(_INT8_CUDA_EXT, "int8_gemm_pair_forward"):
+        raise RuntimeError("paired INT8 CUDA extension is unavailable")
+    y = _INT8_CUDA_EXT.int8_gemm_pair_forward(
+        x.contiguous(),
+        weight_q0.contiguous(),
+        weight_s0.contiguous(),
+        weight_q1.contiguous(),
+        weight_s1.contiguous(),
+    )
+    return y[0].to(torch.get_default_dtype()), y[1].to(torch.get_default_dtype())
+
+
 def soft_bf16_weight_gemm_int8(
     x: torch.Tensor,
     weight_q: torch.Tensor,
@@ -728,6 +845,12 @@ def soft_bf16_weight_gemm_int8(
 ) -> torch.Tensor:
     if impl == "auto":
         impl = _INT8_IMPL
+    flat_m = x.numel() // x.shape[-1]
+    if impl == "cuda_ext" and x.is_cuda and weight_q.is_cuda and weight_s.is_cuda and flat_m <= 4:
+        try:
+            return soft_bf16_weight_gemm_int8_cuda_ext(x, weight_q, weight_s)
+        except Exception:
+            pass
     if impl == "triton" and _USE_TRITON:
         return soft_bf16_weight_gemm_int8_triton(x, weight_q, weight_s)
     return soft_bf16_weight_gemm_int8_torch(x, weight_q, weight_s)
@@ -885,6 +1008,70 @@ def fp4_gemm(
     return soft_fp4_raise_to_fp8_blockfp4_gemm(a, a_s, packed, b_s, act_block_size=128, impl=_FP4_IMPL)
 
 
+def _fused_decode_sparse_attn_triton(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    assert _USE_TRITON
+    b, s, h, d = q.shape
+    assert s == 1
+    topk = topk_idxs.size(-1)
+    out = torch.empty((b, h, d), device=q.device, dtype=q.dtype)
+    _decode_sparse_attn_kernel[(b, h, triton.cdiv(d, 64))](
+        q.contiguous(),
+        kv.contiguous(),
+        attn_sink.contiguous(),
+        topk_idxs.contiguous(),
+        out,
+        topk,
+        kv.size(1),
+        h,
+        d,
+        h * d,
+        d,
+        kv.size(1) * d,
+        d,
+        h * d,
+        d,
+        float(softmax_scale),
+        BLOCK_T=1024,
+        BLOCK_D=64,
+        num_warps=8,
+        num_stages=3,
+    )
+    return out.view(b, 1, h, d)
+
+
+def _tensor_core_decode_sparse_attn(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_idxs: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    b, s, h, d = q.shape
+    assert s == 1
+    topk = topk_idxs.size(-1)
+    safe_idxs = topk_idxs.clamp_min(0)
+    batch_idx = torch.arange(b, device=q.device).view(b, 1, 1).expand_as(safe_idxs)
+    gathered = kv[batch_idx, safe_idxs]
+    valid = topk_idxs >= 0
+    gathered_h = gathered[:, 0].unsqueeze(1).expand(b, h, topk, d)
+    q_tc = q[:, 0].reshape(b, h, 1, d).reshape(b * h, 1, d).to(torch.float16)
+    kv_tc = gathered_h.reshape(b * h, topk, d).transpose(1, 2).contiguous().to(torch.float16)
+    scores = torch.bmm(q_tc, kv_tc).view(b, h, 1, topk).permute(0, 2, 1, 3).to(torch.float32) * softmax_scale
+    scores = scores.masked_fill(~valid.unsqueeze(2), float("-inf"))
+    sink = attn_sink.to(torch.float32).view(1, 1, h, 1).expand(b, 1, h, 1)
+    weights = torch.softmax(torch.cat([scores, sink], dim=-1), dim=-1)[..., :topk]
+    weights_tc = weights.permute(0, 2, 1, 3).reshape(b * h, 1, topk).to(torch.float16)
+    v_tc = gathered_h.reshape(b * h, topk, d).contiguous().to(torch.float16)
+    out = torch.bmm(weights_tc, v_tc).view(b, h, 1, d).permute(0, 2, 1, 3)
+    return out.to(q.dtype)
+
+
 def sparse_attn(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -892,8 +1079,57 @@ def sparse_attn(
     topk_idxs: torch.Tensor,
     softmax_scale: float,
 ) -> torch.Tensor:
+    global _INT8_CUDA_EXT
     if _USE_TILELANG:
         return _tilelang_sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)
+    if _PREFILL_SPARSE_ATTN_CUDA and q.is_cuda and q.size(1) > 1 and q.size(-1) == 512:
+        if _INT8_CUDA_EXT is None:
+            _INT8_CUDA_EXT = load_cuda_kernel()
+        if _INT8_CUDA_EXT is not None and hasattr(_INT8_CUDA_EXT, "prefill_sparse_attn_forward"):
+            return _INT8_CUDA_EXT.prefill_sparse_attn_forward(
+                q.contiguous(),
+                kv.contiguous(),
+                attn_sink.contiguous(),
+                topk_idxs.contiguous().to(torch.int32),
+                float(softmax_scale),
+            )
+    if _FLASHINFER_STYLE_ATTN_CUDA and q.is_cuda and q.size(1) == 1 and q.size(-1) == 512 and topk_idxs.size(-1) <= 256:
+        if _INT8_CUDA_EXT is None:
+            _INT8_CUDA_EXT = load_cuda_kernel()
+        if _INT8_CUDA_EXT is not None and hasattr(_INT8_CUDA_EXT, "flashinfer_style_sparse_attn_forward"):
+            return _INT8_CUDA_EXT.flashinfer_style_sparse_attn_forward(
+                q.contiguous(),
+                kv.contiguous(),
+                attn_sink.contiguous(),
+                topk_idxs.contiguous().to(torch.int32),
+                float(softmax_scale),
+            )
+    if _TENSOR_CORE_ATTN_CUDA and q.is_cuda and q.size(1) == 1 and q.size(-1) == 512 and topk_idxs.size(-1) <= 256:
+        if _INT8_CUDA_EXT is None:
+            _INT8_CUDA_EXT = load_cuda_kernel()
+        if _INT8_CUDA_EXT is not None and hasattr(_INT8_CUDA_EXT, "fused_decode_sparse_attn_wmma_forward"):
+            return _INT8_CUDA_EXT.fused_decode_sparse_attn_wmma_forward(
+                q.contiguous().to(torch.float16),
+                kv.contiguous().to(torch.float16),
+                attn_sink.contiguous(),
+                topk_idxs.contiguous().to(torch.int32),
+                float(softmax_scale),
+            ).to(q.dtype)
+    if _TENSOR_CORE_ATTN and q.is_cuda and q.size(1) == 1 and q.size(-1) == 512:
+        return _tensor_core_decode_sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)
+    if _FUSED_DECODE_ATTN_CUDA and q.is_cuda and q.size(1) == 1:
+        if _INT8_CUDA_EXT is None:
+            _INT8_CUDA_EXT = load_cuda_kernel()
+        if _INT8_CUDA_EXT is not None and hasattr(_INT8_CUDA_EXT, "fused_decode_sparse_attn_forward"):
+            return _INT8_CUDA_EXT.fused_decode_sparse_attn_forward(
+                q.contiguous(),
+                kv.contiguous(),
+                attn_sink.contiguous(),
+                topk_idxs.contiguous().to(torch.int32),
+                float(softmax_scale),
+            )
+    if _FUSED_DECODE_ATTN and _USE_TRITON and q.is_cuda and q.size(1) == 1 and q.size(-1) == 512 and topk_idxs.size(-1) <= 1024:
+        return _fused_decode_sparse_attn_triton(q, kv, attn_sink, topk_idxs, softmax_scale)
 
     b, s, h, d = q.shape
     topk = topk_idxs.size(-1)

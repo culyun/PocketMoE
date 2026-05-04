@@ -1,26 +1,29 @@
 # Inference code for DeepSeek models
 
-First convert huggingface model weight files to the format of this project.
+Convert the original DeepSeek-V4-Flash checkpoint to INT8 W8A8 routed-expert weights while preserving the original 46-file safetensors layout and `model.safetensors.index.json` mapping.
+
 ```bash
-export EXPERTS=256
-export MP=4
-export CONFIG=config.json
-python convert.py --hf-ckpt-path ${HF_CKPT_PATH} --save-path ${SAVE_PATH} --n-experts ${EXPERTS} --model-parallel ${MP}
+python convert.py \
+  --hf-ckpt-path /mnt/data1/modelscope/deepseek-ai/DeepSeek-V4-Flash \
+  --save-path /mnt/data1/modelscope/deepseek-ai/DeepSeek-V4-Flash-w8a8
 ```
 
-Then chat with DeepSeek model at will!
+Run batch inference from file:
+
 ```bash
-torchrun --nproc-per-node ${MP} generate.py --ckpt-path ${SAVE_PATH} --config ${CONFIG} --interactive
+torchrun --nproc-per-node 4 generate.py \
+  --ckpt-path /mnt/data1/modelscope/deepseek-ai/DeepSeek-V4-Flash-w8a8 \
+  --config config.json \
+  --input-file smoke_input.txt \
+  --routed-experts-device cpu
 ```
 
-Or batch inference from file.
-```bash
-torchrun --nproc-per-node ${MP} generate.py --ckpt-path ${SAVE_PATH} --config ${CONFIG} --input-file ${FILE}
-```
+Run interactive chat:
 
-Or multi nodes inference.
 ```bash
-torchrun --nnodes ${NODES} --nproc-per-node $((MP / NODES)) --node-rank $RANK --master-addr $ADDR generate.py --ckpt-path ${SAVE_PATH} --config ${CONFIG} --input-file ${FILE}
+torchrun --nproc-per-node 4 generate.py \
+  --ckpt-path /mnt/data1/modelscope/deepseek-ai/DeepSeek-V4-Flash-w8a8 \
+  --config config.json \
+  --interactive \
+  --routed-experts-device cpu
 ```
-
-If you want to use fp8, just remove `"expert_dtype": "fp4"` in `config.json` and specify `--expert-dtype fp8` in `convert.py`.

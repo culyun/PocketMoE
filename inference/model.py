@@ -1,5 +1,6 @@
 import math
 import os
+import time
 from dataclasses import dataclass
 from typing import Tuple, Optional, Literal
 from functools import lru_cache
@@ -11,13 +12,18 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.autograd.profiler import record_function
 
-from cpu_routed_backend import CPURoutedExpertsBackend
-from kernel import act_quant, fp4_act_quant, fp8_gemm, fp4_gemm, sparse_attn, hc_split_sinkhorn, Packed4BitWeightAlongK, _quantize_int8_weight_torch, soft_bf16_weight_gemm_int8, _dequant_fp4_weight_torch
-from wo_a_cuda_backend import load_wo_a_cuda_ext
+from cpu_routed_backend import CPURoutedExpertsBackend, start_in_process_cpu_moe_server
+from gpu_prefill_moe_backend import GPUPrefillMoEBackend
+from kernel import act_quant, fp4_act_quant, fp8_gemm, fp4_gemm, sparse_attn, hc_split_sinkhorn, Packed4BitWeightAlongK, _quantize_int8_weight_torch, soft_bf16_weight_gemm_int8, soft_bf16_weight_gemm_int8_pair_cuda_ext, _SHARED_EXPERT_PAIR_INT8_CUDA, _dequant_fp4_weight_torch, soft_fp8_blockfp8_weight_dequant
+from cuda_kernel_backend import load_cuda_kernel
 
 
 world_size = 1
 rank = 0
+_cpu_moe_server_ipc = None
+_cpu_moe_server_ipc_name = None
+_cpu_moe_server_last_seq = 0
+_cpu_moe_server_predict_seq = 0
 block_size = 128
 fp4_block_size = 32
 default_dtype = torch.bfloat16
@@ -25,6 +31,56 @@ scale_fmt = None
 scale_dtype = torch.float32
 
 
+def _get_cpu_moe_server_shm_name() -> str:
+    global _cpu_moe_server_ipc_name
+    if _cpu_moe_server_ipc_name is not None:
+        return _cpu_moe_server_ipc_name
+    default_name = os.getenv("DEEPSEEK_CPU_MOE_SERVER_SHM", "dsv4_cpu_moe_server")
+    if dist.is_initialized() and _env_enabled("DEEPSEEK_CPU_MOE_INPROC_SERVER") and world_size > 1:
+        objects = [default_name if rank == 0 else None]
+        dist.broadcast_object_list(objects, src=0)
+        _cpu_moe_server_ipc_name = str(objects[0])
+    else:
+        _cpu_moe_server_ipc_name = default_name
+    return _cpu_moe_server_ipc_name
+
+
+def _get_cpu_moe_server_ipc(dim: int, topk: int):
+    global _cpu_moe_server_ipc, _cpu_moe_server_ipc_name
+    from cpu_moe_ipc import CPUMoESharedMemory
+    name = _get_cpu_moe_server_shm_name()
+    if _cpu_moe_server_ipc is None or _cpu_moe_server_ipc_name != name:
+        _cpu_moe_server_ipc = CPUMoESharedMemory(name, dim, topk, create=False)
+        _cpu_moe_server_ipc_name = name
+    return _cpu_moe_server_ipc
+
+
+def _env_enabled(name: str) -> bool:
+    active_name = name.replace("DEEPSEEK_", "DEEPSEEK_ACTIVE_", 1)
+    if active_name in os.environ:
+        return os.getenv(active_name, "0").lower() in {"1", "true", "yes"}
+    return os.getenv(name, "0").lower() in {"1", "true", "yes"}
+
+
+def _any_phase_env_enabled(suffix: str) -> bool:
+    return any(
+        os.getenv(f"DEEPSEEK_PD_{phase}_{suffix}", "0").lower() in {"1", "true", "yes"}
+        for phase in ("PREFILL", "DECODE")
+    )
+
+def _phase_env_enabled(suffix: str, default: bool = False) -> bool:
+    phase = os.getenv("DEEPSEEK_PD_ACTIVE_PHASE", "")
+    active_key = f"DEEPSEEK_ACTIVE_{suffix}"
+    if active_key in os.environ:
+        return _env_enabled(active_key)
+    if phase in {"prefill", "decode"}:
+        phase_key = f"DEEPSEEK_PD_{phase.upper()}_{suffix}"
+        if phase_key in os.environ:
+            return _env_enabled(phase_key)
+    global_key = f"DEEPSEEK_{suffix}"
+    if global_key in os.environ:
+        return _env_enabled(global_key)
+    return default
 
 
 def _pack_fp4_weight_rows_for_tile_decode(
@@ -71,9 +127,26 @@ class ModelArgs:
     max_seq_len: int = 4096
     dtype: Literal["bf16", "fp8"] = "fp8"
     scale_fmt: Literal[None, "ue8m0"] = "ue8m0"
-    expert_dtype: Literal[None, "fp4"] = None
+    expert_dtype: Literal[None, "fp4", "int8"] = None
     scale_dtype: Literal["fp32", "fp8"] = "fp8"
     routed_experts_device: Literal["gpu", "cpu"] = "gpu"
+    attn_int8: bool = False
+    shared_expert_int8: bool = False
+    mtp_int8: bool = False
+    preloaded_attn_int8: bool = False
+    preloaded_shared_expert_int8: bool = False
+    preload_wq_a_int8: bool = False
+    preload_wq_b_int8: bool = False
+    preload_wkv_int8: bool = False
+    preload_wo_a_int8: bool = False
+    preload_wo_b_int8: bool = False
+    preload_indexer_wq_b_int8: bool = False
+    preload_shared_w1_int8: bool = False
+    preload_shared_w2_int8: bool = False
+    preload_shared_w3_int8: bool = False
+    preload_mtp_e_proj_int8: bool = False
+    preload_mtp_h_proj_int8: bool = False
+    preload_routed_fp4_dequant: bool = False
     vocab_size: int = 129280
     dim: int = 4096
     moe_inter_dim: int = 4096
@@ -150,6 +223,8 @@ def linear(x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor] =
     elif weight.dtype == torch.float8_e4m3fn:
         x, s = act_quant(x, block_size, scale_fmt, scale_dtype)
         return fp8_gemm(x, s, weight, weight.scale, scale_dtype)
+    elif weight.dtype == torch.int8:
+        return soft_bf16_weight_gemm_int8(x, weight, weight.scale)
     else:
         return F.linear(x, weight)
 
@@ -161,6 +236,9 @@ class Linear(nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.online_int8_enabled = False
+        self._online_int8_ready = False
+        self.phase_env_suffix: str | None = None
         dtype = dtype or default_dtype
         if dtype == torch.float4_e2m1fn_x2:
             # FP4: weight is [out, in//2] in float4_e2m1fn_x2, logically [out, in] in fp4
@@ -174,6 +252,10 @@ class Linear(nn.Module):
             scale_out_features = (out_features + block_size - 1) // block_size
             scale_in_features = (in_features + block_size - 1) // block_size
             self.weight.scale = self.scale = nn.Parameter(torch.empty(scale_out_features, scale_in_features, dtype=torch.float8_e8m0fnu))
+        elif dtype == torch.int8:
+            self.register_buffer("weight", torch.empty(out_features, in_features, dtype=torch.int8))
+            self.register_buffer("scale", torch.empty(out_features, dtype=torch.float32))
+            self.weight.scale = self.scale
         else:
             self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=dtype))
             self.register_parameter("scale", None)
@@ -182,7 +264,57 @@ class Linear(nn.Module):
         else:
             self.register_parameter("bias", None)
 
+    def set_int8_storage(self, weight: torch.Tensor, scale: torch.Tensor) -> None:
+        if weight.dtype != torch.int8:
+            raise TypeError(f"expected int8 weight, got {weight.dtype}")
+        if scale.dtype != torch.float32:
+            raise TypeError(f"expected float32 scale, got {scale.dtype}")
+        if weight.shape != self.weight.shape:
+            raise ValueError(f"weight shape mismatch: got {tuple(weight.shape)}, expected {tuple(self.weight.shape)}")
+        if scale.shape != self.scale.shape:
+            raise ValueError(f"scale shape mismatch: got {tuple(scale.shape)}, expected {tuple(self.scale.shape)}")
+        self._buffers["weight"] = weight
+        self._buffers["scale"] = scale
+        self.weight = weight
+        self.scale = scale
+        self.weight.scale = self.scale
+        self._online_int8_ready = False
+
+    def enable_online_int8(self) -> None:
+        self.online_int8_enabled = True
+
+    def set_preloaded_int8(self, weight: torch.Tensor, scale: torch.Tensor) -> None:
+        self.online_int8_enabled = True
+        self.register_buffer("online_int8_weight", weight.detach().to(device=self.weight.device, dtype=torch.int8), persistent=False)
+        self.register_buffer("online_int8_scale", scale.detach().to(device=self.weight.device, dtype=torch.float32), persistent=False)
+        self._online_int8_ready = True
+
+    def _online_int8_active(self) -> bool:
+        if self.phase_env_suffix is not None:
+            return _phase_env_enabled(self.phase_env_suffix, self.online_int8_enabled)
+        return self.online_int8_enabled
+
+    def _ensure_online_int8(self) -> None:
+        if not self._online_int8_active() or self._online_int8_ready:
+            return
+        if self.weight.dtype == torch.int8:
+            self.register_buffer("online_int8_weight", self.weight.detach(), persistent=False)
+            self.register_buffer("online_int8_scale", self.weight.scale.detach(), persistent=False)
+            self._online_int8_ready = True
+            return
+        if self.weight.dtype == torch.float8_e4m3fn:
+            weight = soft_fp8_blockfp8_weight_dequant(self.weight.detach(), self.weight.scale.detach()).float()
+        else:
+            weight = self.weight.detach().float()
+        weight_q, weight_s = _quantize_int8_weight_torch(weight)
+        self.register_buffer("online_int8_weight", weight_q, persistent=False)
+        self.register_buffer("online_int8_scale", weight_s, persistent=False)
+        self._online_int8_ready = True
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._online_int8_active():
+            self._ensure_online_int8()
+            return soft_bf16_weight_gemm_int8(x, self.online_int8_weight, self.online_int8_scale)
         return linear(x, self.weight, self.bias)
 
 
@@ -194,6 +326,9 @@ class ColumnParallelLinear(Linear):
         super().__init__(in_features, self.part_out_features, bias, dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._online_int8_active():
+            self._ensure_online_int8()
+            return soft_bf16_weight_gemm_int8(x, self.online_int8_weight, self.online_int8_scale)
         return linear(x, self.weight, self.bias)
 
 
@@ -205,7 +340,11 @@ class RowParallelLinear(Linear):
         super().__init__(self.part_in_features, out_features, bias, dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = linear(x, self.weight, None)
+        if self._online_int8_active():
+            self._ensure_online_int8()
+            y = soft_bf16_weight_gemm_int8(x, self.online_int8_weight, self.online_int8_scale)
+        else:
+            y = linear(x, self.weight, None)
         if world_size > 1:
             reduce_dtype = x.dtype
             y_reduce = y.to(reduce_dtype)
@@ -281,13 +420,15 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = F
 
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
-    """Applies randomized Hadamard rotation to spread information across dims before FP8 quant."""
     assert x.dtype == torch.bfloat16
     try:
         from fast_hadamard_transform import hadamard_transform
+        return hadamard_transform(x, scale=x.size(-1) ** -0.5)
     except ImportError:
+        ext = load_cuda_kernel() if x.is_cuda and x.size(-1) == 128 else None
+        if ext is not None and hasattr(ext, "hadamard128_forward"):
+            return ext.hadamard128_forward(x)
         return x
-    return hadamard_transform(x, scale=x.size(-1) ** -0.5)
 
 
 @lru_cache(1)
@@ -424,19 +565,69 @@ class Indexer(torch.nn.Module):
         super().__init__()
         self.dim = args.dim
         self.n_heads = args.index_n_heads
-        self.n_local_heads = args.index_n_heads // world_size
+        self.replicated_c4_indexer = _env_enabled("DEEPSEEK_REPLICATED_C4_INDEXER")
+        self.n_local_heads = self.n_heads if self.replicated_c4_indexer else self.n_heads // world_size
         self.head_dim = args.index_head_dim
         self.rope_head_dim = args.rope_head_dim
         self.index_topk = args.index_topk
         self.q_lora_rank = args.q_lora_rank
-        self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.head_dim)
-        self.weights_proj = ColumnParallelLinear(self.dim, self.n_heads, dtype=torch.bfloat16)
+        indexer_linear = Linear if self.replicated_c4_indexer else ColumnParallelLinear
+        self.wq_b = indexer_linear(self.q_lora_rank, self.n_heads * self.head_dim, dtype=torch.int8 if args.attn_int8 else None)
+        self.wq_b.phase_env_suffix = "INDEXER_WQ_B_INT8"
+        self.wq_b.replicated_c4_indexer = self.replicated_c4_indexer
+        preload_indexer_wq_b = args.preloaded_attn_int8 or args.preload_indexer_wq_b_int8
+        preload_indexer_wq_b = preload_indexer_wq_b or _any_phase_env_enabled("INDEXER_WQ_B_INT8")
+        if preload_indexer_wq_b:
+            self.wq_b.enable_online_int8()
+        if _env_enabled("DEEPSEEK_INDEXER_WQ_B_INT8"):
+            self.wq_b.enable_online_int8()
+        self.weights_proj = indexer_linear(self.dim, self.n_heads, dtype=torch.bfloat16)
+        self.weights_proj.replicated_c4_indexer = self.replicated_c4_indexer
         self.softmax_scale = self.head_dim ** -0.5
         self.compress_ratio = compress_ratio
 
         self.compressor = Compressor(args, compress_ratio, self.head_dim, True)
         self.register_buffer("kv_cache", torch.zeros(args.max_batch_size, args.max_seq_len // compress_ratio, self.head_dim), persistent=False)
         self.freqs_cis = None
+        self.fused_c4_indexer_enabled = _env_enabled("DEEPSEEK_FUSED_C4_INDEXER_CUDA")
+        self._fused_c4_indexer_ext = load_cuda_kernel() if self.fused_c4_indexer_enabled else None
+
+    def _fused_decode_forward(self, x: torch.Tensor, q: torch.Tensor, start_pos: int, offset: int):
+        if self._fused_c4_indexer_ext is None or start_pos == 0 or x.size(1) != 1 or self.compress_ratio != 4:
+            return None
+        freqs_cis = self.freqs_cis[start_pos:start_pos + 1]
+        rd = self.rope_head_dim
+        q = q.contiguous()
+        apply_rotary_emb(q[..., -rd:], freqs_cis)
+        kv = self.compressor.wkv(x.float()).contiguous()
+        score = self.compressor.wgate(x.float()).contiguous()
+        weights = (self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)).contiguous()
+        freqs = torch.view_as_real(self.freqs_cis[start_pos + 1 - self.compress_ratio]).flatten().contiguous()
+        result = self._fused_c4_indexer_ext.fused_c4_indexer_decode_forward(
+            q,
+            kv,
+            score,
+            weights,
+            self.compressor.ape,
+            self.compressor.norm.weight,
+            freqs,
+            self.compressor.kv_state,
+            self.compressor.score_state,
+            self.kv_cache,
+            int(start_pos),
+            int(offset),
+            int(self.index_topk),
+            float(self.compressor.norm.eps),
+            world_size > 1 and not self.replicated_c4_indexer,
+        )
+        if world_size > 1 and not self.replicated_c4_indexer:
+            dist.all_reduce(result)
+            return self._fused_c4_indexer_ext.c4_topk_from_scores(
+                result.contiguous(),
+                int(offset),
+                int(min(self.index_topk, (start_pos + 1) // self.compress_ratio)),
+            )
+        return result
 
     def forward(self, x: torch.Tensor, qr: torch.Tensor, start_pos: int, offset: int):
         bsz, seqlen, _ = x.size()
@@ -449,6 +640,10 @@ class Indexer(torch.nn.Module):
             self.compressor.freqs_cis = self.freqs_cis
         q = self.wq_b(qr)
         q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
+        if self.fused_c4_indexer_enabled:
+            fused = self._fused_decode_forward(x, q, start_pos, offset)
+            if fused is not None:
+                return fused
         apply_rotary_emb(q[..., -rd:], freqs_cis)
         q = rotate_activation(q)
         # use fp4 simulation for q and kv in indexer
@@ -458,7 +653,7 @@ class Indexer(torch.nn.Module):
         # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
         index_score = torch.einsum("bshd,btd->bsht", q, self.kv_cache[:bsz, :end_pos // ratio])
         index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
-        if world_size > 1:
+        if world_size > 1 and not self.replicated_c4_indexer:
             dist.all_reduce(index_score)
         if start_pos == 0:
             mask = torch.arange(seqlen // ratio).repeat(seqlen, 1) >= torch.arange(1, seqlen + 1).unsqueeze(1) // ratio
@@ -492,19 +687,64 @@ class Attention(nn.Module):
         self.compress_ratio = args.compress_ratios[layer_id]
         self.eps = args.norm_eps
 
+        preload_wq_a = args.preloaded_attn_int8 or args.preload_wq_a_int8
+        preload_wq_b = args.preloaded_attn_int8 or args.preload_wq_b_int8
+        preload_wkv = args.preloaded_attn_int8 or args.preload_wkv_int8
+        preload_wo_a = args.preloaded_attn_int8 or args.preload_wo_a_int8
+        preload_wo_b = args.preloaded_attn_int8 or args.preload_wo_b_int8
+        preload_wq_a = preload_wq_a or _any_phase_env_enabled("WQ_A_INT8")
+        preload_wq_b = preload_wq_b or _any_phase_env_enabled("WQ_B_INT8")
+        preload_wkv = preload_wkv or _any_phase_env_enabled("WKV_INT8")
+        preload_wo_a = preload_wo_a or _any_phase_env_enabled("WO_A_INT8")
+        preload_wo_b = preload_wo_b or _any_phase_env_enabled("WO_B_INT8")
+
         self.attn_sink = nn.Parameter(torch.empty(self.n_local_heads, dtype=torch.float32))
-        self.wq_a = Linear(self.dim, self.q_lora_rank)
+        self.wq_a = Linear(self.dim, self.q_lora_rank, dtype=torch.int8 if args.attn_int8 else None)
+        self.wq_a.phase_env_suffix = "WQ_A_INT8"
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
-        self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.head_dim)
-        self.wkv = Linear(self.dim, self.head_dim)
+        self.wq_b = ColumnParallelLinear(self.q_lora_rank, self.n_heads * self.head_dim, dtype=torch.int8 if args.attn_int8 else None)
+        self.wq_b.phase_env_suffix = "WQ_B_INT8"
+        self.wkv = Linear(self.dim, self.head_dim, dtype=torch.int8 if args.attn_int8 else None)
+        self.wkv.phase_env_suffix = "WKV_INT8"
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
-        self.wo_a = ColumnParallelLinear(self.n_heads * self.head_dim // self.n_groups, self.n_groups * args.o_lora_rank, dtype=torch.bfloat16)
-        self.wo_a_int8_enabled = os.getenv("DEEPSEEK_WO_A_INT8", "0").lower() in {"1", "true", "yes"}
+        self.wo_a = ColumnParallelLinear(self.n_heads * self.head_dim // self.n_groups, self.n_groups * args.o_lora_rank, dtype=torch.int8 if args.attn_int8 else torch.bfloat16)
+        self.wo_a_int8_enabled = args.attn_int8 or _env_enabled("DEEPSEEK_WO_A_INT8") or preload_wo_a
+        self.wo_a_fp16_enabled = _env_enabled("DEEPSEEK_WO_A_FP16")
+        self.wo_a_bmm_enabled = _env_enabled("DEEPSEEK_WO_A_BMM")
         self._wo_a_int8_ready = False
-        self._wo_a_cuda_ext = load_wo_a_cuda_ext() if self.wo_a_int8_enabled else None
+        self._wo_a_phase_env_enabled = preload_wo_a
+        self._wo_a_cuda_ext = load_cuda_kernel() if self.wo_a_int8_enabled else None
         self._wo_a_cuda_enabled = self._wo_a_cuda_ext is not None
-        self.wo_b = RowParallelLinear(self.n_groups * args.o_lora_rank, self.dim)
+        self.wo_b = RowParallelLinear(self.n_groups * args.o_lora_rank, self.dim, dtype=torch.int8 if args.attn_int8 else None)
+        self.wo_b.phase_env_suffix = "WO_B_INT8"
+        if preload_wq_a:
+            self.wq_a.enable_online_int8()
+        if preload_wq_b:
+            self.wq_b.enable_online_int8()
+        if preload_wkv:
+            self.wkv.enable_online_int8()
+        if preload_wo_b:
+            self.wo_b.enable_online_int8()
+        if _env_enabled("DEEPSEEK_WQ_A_INT8"):
+            self.wq_a.enable_online_int8()
+        if _env_enabled("DEEPSEEK_WQ_B_INT8"):
+            self.wq_b.enable_online_int8()
+        if _env_enabled("DEEPSEEK_WKV_INT8"):
+            self.wkv.enable_online_int8()
+        if _env_enabled("DEEPSEEK_WO_B_INT8"):
+            self.wo_b.enable_online_int8()
         self.softmax_scale = self.head_dim ** -0.5
+        self.attn_profile_enabled = _env_enabled("DEEPSEEK_ATTN_PROFILE")
+        # Plan B-小-v2: fused attention decode prefuse kernels (q rmsnorm+rope; kv norm+rope+actquant).
+        self._fused_attn_prefuse_enabled = _env_enabled("DEEPSEEK_FUSED_ATTN_PREFUSE")
+        self._fused_attn_prefuse_ext = load_cuda_kernel() if self._fused_attn_prefuse_enabled else None
+        if self._fused_attn_prefuse_ext is not None and (
+            not hasattr(self._fused_attn_prefuse_ext, "fused_q_rmsnorm_rope_inplace")
+            or not hasattr(self._fused_attn_prefuse_ext, "fused_kv_rope_actquant_inplace")
+        ):
+            # Built extension does not contain the new ops; disable rather than crash.
+            self._fused_attn_prefuse_enabled = False
+            self._fused_attn_prefuse_ext = None
 
         if self.compress_ratio:
             self.compressor = Compressor(args, self.compress_ratio, self.head_dim)
@@ -524,8 +764,54 @@ class Attention(nn.Module):
                                          rope_theta, args.rope_factor, args.beta_fast, args.beta_slow)
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
 
+    def set_preloaded_wo_a_int8(self, weight: torch.Tensor, scale: torch.Tensor) -> None:
+        self.wo_a_int8_enabled = True
+        self.register_buffer(
+            "wo_a_int8_weight",
+            weight.detach().to(device=self.wo_a.weight.device, dtype=torch.int8).view(self.n_local_groups, self.o_lora_rank, -1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "wo_a_int8_scale",
+            scale.detach().to(device=self.wo_a.weight.device, dtype=torch.float32).view(self.n_local_groups, self.o_lora_rank),
+            persistent=False,
+        )
+        self._wo_a_int8_ready = True
+
+    def _wo_a_int8_active(self) -> bool:
+        return _phase_env_enabled("WO_A_INT8", self.wo_a_int8_enabled or self._wo_a_phase_env_enabled)
+
+    def _get_prefuse_freqs(self, start_pos: int, seqlen: int):
+        # Returns (real, imag) fp32 contiguous tensors of shape [S, rd/2] on the freqs_cis device.
+        # Builds two persistent fp32 buffers once (full sequence length), then narrows per call so
+        # decode steps only pay one .narrow() each (no copy, no dtype cast).
+        full_r = getattr(self, "_freqs_real_full", None)
+        full_i = getattr(self, "_freqs_imag_full", None)
+        if full_r is None or full_r.size(0) != self.freqs_cis.size(0) or full_r.device != self.freqs_cis.device:
+            full_r = self.freqs_cis.real.to(torch.float32).contiguous()
+            full_i = self.freqs_cis.imag.to(torch.float32).contiguous()
+            self._freqs_real_full = full_r
+            self._freqs_imag_full = full_i
+        return (
+            full_r.narrow(0, start_pos, seqlen),
+            full_i.narrow(0, start_pos, seqlen),
+        )
+
+    def _wo_a_fp16_weight(self) -> torch.Tensor:
+        weight = getattr(self, "wo_a_fp16_weight", None)
+        if weight is None or weight.device != self.wo_a.weight.device:
+            weight = self.wo_a.weight.detach().to(dtype=torch.float16).view(self.n_local_groups, self.o_lora_rank, -1)
+            self.register_buffer("wo_a_fp16_weight", weight, persistent=False)
+        return weight
+
     def forward(self, x: torch.Tensor, start_pos: int):
         bsz, seqlen, _ = x.size()
+        profile = self.attn_profile_enabled
+        def mark():
+            if profile and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            return time.perf_counter() if profile else 0.0
+        t0 = mark()
         freqs_cis = self.freqs_cis[start_pos:start_pos+seqlen]
         win = self.window_size
         ratio = self.compress_ratio
@@ -535,25 +821,49 @@ class Attention(nn.Module):
             self.compressor.freqs_cis = self.freqs_cis
             if self.indexer is not None:
                 self.indexer.freqs_cis = self.freqs_cis
+        # Decide once per call whether the prefuse kernels apply (decode bf16 path only).
+        use_prefuse = (
+            self._fused_attn_prefuse_enabled
+            and self._fused_attn_prefuse_ext is not None
+            and seqlen == 1
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+        )
         # q
         qr = q = self.q_norm(self.wq_a(x))
         q = self.wq_b(q).unflatten(-1, (self.n_local_heads, self.head_dim))
-        q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
-        apply_rotary_emb(q[..., -rd:], freqs_cis)
+        if use_prefuse:
+            fr, fi = self._get_prefuse_freqs(start_pos, seqlen)
+            self._fused_attn_prefuse_ext.fused_q_rmsnorm_rope_inplace(q, fr, fi, float(self.eps))
+        else:
+            q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
+            apply_rotary_emb(q[..., -rd:], freqs_cis)
+        t_q = mark()
 
         # win kv & topk_idxs
         kv = self.wkv(x)
-        kv = self.kv_norm(kv)
-        apply_rotary_emb(kv[..., -rd:], freqs_cis)
-        # FP8-simulate non-rope dims to match QAT; rope dims stay bf16 for positional precision
-        act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
+        if use_prefuse:
+            fr, fi = self._get_prefuse_freqs(start_pos, seqlen)
+            self._fused_attn_prefuse_ext.fused_kv_rope_actquant_inplace(
+                kv, self.kv_norm.weight, fr, fi, 64, float(self.kv_norm.eps)
+            )
+        else:
+            kv = self.kv_norm(kv)
+            apply_rotary_emb(kv[..., -rd:], freqs_cis)
+            # FP8-simulate non-rope dims to match QAT; rope dims stay bf16 for positional precision
+            act_quant(kv[..., :-rd], 64, scale_fmt, scale_dtype, True)
+        t_kv = mark()
         topk_idxs = get_window_topk_idxs(win, bsz, seqlen, start_pos)
+        t_window_idx = mark()
+        t_compress_idx = t_window_idx
+        t_compressor = t_window_idx
         if self.compress_ratio:
             offset = kv.size(1) if start_pos == 0 else win
             if self.indexer is not None:
                 compress_topk_idxs = self.indexer(x, qr, start_pos, offset)
             else:
                 compress_topk_idxs = get_compress_topk_idxs(ratio, bsz, seqlen, start_pos, offset)
+            t_compress_idx = mark()
             topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
         topk_idxs = topk_idxs.int()
 
@@ -567,28 +877,47 @@ class Attention(nn.Module):
             if self.compress_ratio:
                 if (kv_compress := self.compressor(x, start_pos)) is not None:
                     kv = torch.cat([kv, kv_compress], dim=1)
-            # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
+                t_compressor = mark()
             o = sparse_attn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
         else:
             self.kv_cache[:bsz, start_pos % win] = kv.squeeze(1)
             if self.compress_ratio:
                 self.compressor(x, start_pos)
+                t_compressor = mark()
             o = sparse_attn(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
+        t_sparse = mark()
         apply_rotary_emb(o[..., -rd:], freqs_cis, True)
 
         # o
         o = o.view(bsz, seqlen, self.n_local_groups, -1)
-        if self.wo_a_int8_enabled:
+        if self._wo_a_int8_active():
             if not self._wo_a_int8_ready:
-                weight = self.wo_a.weight.detach().view(self.n_local_groups, self.o_lora_rank, -1)
-                q_chunks = []
-                s_chunks = []
-                for g in range(self.n_local_groups):
-                    weight_q, weight_s = _quantize_int8_weight_torch(weight[g])
-                    q_chunks.append(weight_q)
-                    s_chunks.append(weight_s)
-                self.register_buffer("wo_a_int8_weight", torch.stack(q_chunks, dim=0), persistent=False)
-                self.register_buffer("wo_a_int8_scale", torch.stack(s_chunks, dim=0), persistent=False)
+                if getattr(self.wo_a, "_online_int8_ready", False) and hasattr(self.wo_a, "online_int8_weight"):
+                    self.register_buffer(
+                        "wo_a_int8_weight",
+                        self.wo_a.online_int8_weight.detach().view(self.n_local_groups, self.o_lora_rank, -1),
+                        persistent=False,
+                    )
+                    self.register_buffer(
+                        "wo_a_int8_scale",
+                        self.wo_a.online_int8_scale.detach().view(self.n_local_groups, self.o_lora_rank),
+                        persistent=False,
+                    )
+                else:
+                    weight = self.wo_a.weight.detach().view(self.n_local_groups, self.o_lora_rank, -1)
+                    if self.wo_a.weight.dtype == torch.int8:
+                        scale = self.wo_a.weight.scale.detach()
+                        self.register_buffer("wo_a_int8_weight", weight, persistent=False)
+                        self.register_buffer("wo_a_int8_scale", scale.view(self.n_local_groups, -1), persistent=False)
+                    else:
+                        q_chunks = []
+                        s_chunks = []
+                        for g in range(self.n_local_groups):
+                            weight_q, weight_s = _quantize_int8_weight_torch(weight[g])
+                            q_chunks.append(weight_q)
+                            s_chunks.append(weight_s)
+                        self.register_buffer("wo_a_int8_weight", torch.stack(q_chunks, dim=0), persistent=False)
+                        self.register_buffer("wo_a_int8_scale", torch.stack(s_chunks, dim=0), persistent=False)
                 self._wo_a_int8_ready = True
             if self._wo_a_cuda_enabled and o.is_cuda:
                 o = self._wo_a_cuda_ext.wo_a_int8_forward(
@@ -603,9 +932,30 @@ class Attention(nn.Module):
                     proj_chunks.append(proj_g.unsqueeze(2))
                 o = torch.cat(proj_chunks, dim=2)
         else:
-            wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-            o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+            if self.wo_a_fp16_enabled and o.is_cuda and self.wo_a.weight.is_cuda:
+                wo_a = self._wo_a_fp16_weight()
+                o = torch.einsum("bsgd,grd->bsgr", o.to(torch.float16), wo_a).to(torch.get_default_dtype())
+            else:
+                wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+                if self.wo_a_bmm_enabled and o.is_cuda:
+                    o_shape = o.shape
+                    o = torch.bmm(
+                        o.permute(2, 0, 1, 3).reshape(self.n_local_groups, -1, o_shape[-1]),
+                        wo_a.transpose(1, 2),
+                    ).view(self.n_local_groups, o_shape[0], o_shape[1], self.o_lora_rank).permute(1, 2, 0, 3)
+                else:
+                    o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+        t_wo_a = mark()
         x = self.wo_b(o.flatten(2))
+        t_wo_b = mark()
+        if profile:
+            print(
+                f"attn_detail layer={self.layer_id} pos={start_pos} batch={bsz} seqlen={seqlen} ratio={ratio} topk={topk_idxs.size(-1)} "
+                f"q={t_q - t0:.6f}s kv={t_kv - t_q:.6f}s win_idx={t_window_idx - t_kv:.6f}s "
+                f"cmp_idx={t_compress_idx - t_window_idx:.6f}s compressor={t_compressor - t_compress_idx:.6f}s "
+                f"sparse={t_sparse - t_compressor:.6f}s wo_a={t_wo_a - t_sparse:.6f}s wo_b={t_wo_b - t_wo_a:.6f}s",
+                flush=True,
+            )
         return x
 
 
@@ -652,12 +1002,14 @@ class Gate(nn.Module):
 
 class Expert(nn.Module):
     """Single MoE expert: SwiGLU FFN (w1, w2, w3). Computation in float32 for stability."""
-    def __init__(self, dim: int, inter_dim: int, dtype=None, swiglu_limit=0):
+    def __init__(self, dim: int, inter_dim: int, dtype=None, swiglu_limit=0, shared_int8_enabled: bool = False):
         super().__init__()
         self.w1 = Linear(dim, inter_dim, dtype=dtype)
         self.w2 = Linear(inter_dim, dim, dtype=dtype)
         self.w3 = Linear(dim, inter_dim, dtype=dtype)
         self.swiglu_limit = swiglu_limit
+        self.preload_fp4_dequant = False
+        self._cpu_predequantized = False
         self._cpu_materialized = False
         self._cpu_w1 = None
         self._cpu_w2 = None
@@ -668,10 +1020,45 @@ class Expert(nn.Module):
         self._cpu_w2_tiled = None
         self._cpu_w2_scale_tiled = None
         self._cpu_tile_rows = FP4_CPU_TILE_ROWS
+        self.shared_expert_int8_enabled = shared_int8_enabled
+        self.shared_expert_fp16_enabled = _env_enabled("DEEPSEEK_SHARED_EXPERT_FP16")
+        self._shared_fp16_ready = False
+        self._shared_w13_fp16 = None
+        self._shared_w2_fp16 = None
+        self._shared_int8_ready = False
+
+    def _predequantize_fp4_weights_on_gpu(self):
+        if self._cpu_predequantized or self.w1.weight.dtype != torch.float4_e2m1fn_x2:
+            return
+        device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else self.w1.weight.device
+        w1 = _dequant_fp4_weight_torch(
+            Packed4BitWeightAlongK.convert_from(self.w1.weight.detach().to(device)),
+            self.w1.weight.scale.detach().to(device, dtype=torch.float32),
+            block_size=fp4_block_size,
+        ).cpu().contiguous()
+        w2 = _dequant_fp4_weight_torch(
+            Packed4BitWeightAlongK.convert_from(self.w2.weight.detach().to(device)),
+            self.w2.weight.scale.detach().to(device, dtype=torch.float32),
+            block_size=fp4_block_size,
+        ).cpu().contiguous()
+        w3 = _dequant_fp4_weight_torch(
+            Packed4BitWeightAlongK.convert_from(self.w3.weight.detach().to(device)),
+            self.w3.weight.scale.detach().to(device, dtype=torch.float32),
+            block_size=fp4_block_size,
+        ).cpu().contiguous()
+        self._cpu_w1 = w1
+        self._cpu_w2 = w2
+        self._cpu_w3 = w3
+        self._cpu_predequantized = True
+        self._cpu_materialized = True
 
     def _materialize_cpu_weights(self):
         if self._cpu_materialized:
             return
+        if self.preload_fp4_dequant:
+            self._predequantize_fp4_weights_on_gpu()
+            if self._cpu_materialized:
+                return
         if self.w1.weight.dtype == torch.float4_e2m1fn_x2:
             self._cpu_w1 = Packed4BitWeightAlongK.convert_from(self.w1.weight.detach().cpu())
             self._cpu_w2 = Packed4BitWeightAlongK.convert_from(self.w2.weight.detach().cpu())
@@ -685,22 +1072,107 @@ class Expert(nn.Module):
                 tile_rows=self._cpu_tile_rows,
                 block_size=fp4_block_size,
             )
+        elif self.w1.weight.dtype == torch.int8:
+            self._cpu_w1 = self.w1.weight.detach().cpu().contiguous()
+            self._cpu_w2 = self.w2.weight.detach().cpu().contiguous()
+            self._cpu_w3 = self.w3.weight.detach().cpu().contiguous()
+            self._cpu_w1_scale = self.w1.weight.scale.detach().cpu().float().contiguous()
+            self._cpu_w2_scale = self.w2.weight.scale.detach().cpu().float().contiguous()
+            self._cpu_w3_scale = self.w3.weight.scale.detach().cpu().float().contiguous()
         else:
             self._cpu_w1 = self.w1.weight.detach().cpu().to(torch.float32)
             self._cpu_w2 = self.w2.weight.detach().cpu().to(torch.float32)
             self._cpu_w3 = self.w3.weight.detach().cpu().to(torch.float32)
         self._cpu_materialized = True
 
+    def _ensure_shared_fp16(self):
+        if not self.shared_expert_fp16_enabled or self._shared_fp16_ready:
+            return
+        if self.w1.weight.dtype == torch.float8_e4m3fn:
+            w1 = soft_fp8_blockfp8_weight_dequant(self.w1.weight.detach(), self.w1.weight.scale.detach()).float()
+            w2 = soft_fp8_blockfp8_weight_dequant(self.w2.weight.detach(), self.w2.weight.scale.detach()).float()
+            w3 = soft_fp8_blockfp8_weight_dequant(self.w3.weight.detach(), self.w3.weight.scale.detach()).float()
+        elif self.w1.weight.dtype == torch.int8:
+            w1 = self.w1.weight.detach().float() * self.w1.weight.scale.detach().float().unsqueeze(1)
+            w2 = self.w2.weight.detach().float() * self.w2.weight.scale.detach().float().unsqueeze(1)
+            w3 = self.w3.weight.detach().float() * self.w3.weight.scale.detach().float().unsqueeze(1)
+        else:
+            w1 = self.w1.weight.detach().float()
+            w2 = self.w2.weight.detach().float()
+            w3 = self.w3.weight.detach().float()
+        self.register_buffer("shared_w13_fp16", torch.cat([w1, w3], dim=0).to(device=self.w1.weight.device, dtype=torch.float16).contiguous(), persistent=False)
+        self.register_buffer("shared_w2_fp16", w2.to(device=self.w1.weight.device, dtype=torch.float16).contiguous(), persistent=False)
+        self._shared_fp16_ready = True
+
+    def _ensure_shared_int8(self):
+        if not self.shared_expert_int8_enabled or self._shared_int8_ready:
+            return
+        if self.w1.weight.dtype == torch.int8:
+            self.register_buffer("shared_int8_w1", self.w1.weight.detach(), persistent=False)
+            self.register_buffer("shared_int8_s1", self.w1.weight.scale.detach(), persistent=False)
+            self.register_buffer("shared_int8_w2", self.w2.weight.detach(), persistent=False)
+            self.register_buffer("shared_int8_s2", self.w2.weight.scale.detach(), persistent=False)
+            self.register_buffer("shared_int8_w3", self.w3.weight.detach(), persistent=False)
+            self.register_buffer("shared_int8_s3", self.w3.weight.scale.detach(), persistent=False)
+            self._shared_int8_ready = True
+            return
+        if self.w1.weight.dtype == torch.float8_e4m3fn:
+            w1 = soft_fp8_blockfp8_weight_dequant(self.w1.weight.detach(), self.w1.weight.scale.detach()).float()
+            w2 = soft_fp8_blockfp8_weight_dequant(self.w2.weight.detach(), self.w2.weight.scale.detach()).float()
+            w3 = soft_fp8_blockfp8_weight_dequant(self.w3.weight.detach(), self.w3.weight.scale.detach()).float()
+        else:
+            w1 = self.w1.weight.detach().float()
+            w2 = self.w2.weight.detach().float()
+            w3 = self.w3.weight.detach().float()
+        w1_q, w1_s = _quantize_int8_weight_torch(w1)
+        w2_q, w2_s = _quantize_int8_weight_torch(w2)
+        w3_q, w3_s = _quantize_int8_weight_torch(w3)
+        self.register_buffer("shared_int8_w1", w1_q, persistent=False)
+        self.register_buffer("shared_int8_s1", w1_s, persistent=False)
+        self.register_buffer("shared_int8_w2", w2_q, persistent=False)
+        self.register_buffer("shared_int8_s2", w2_s, persistent=False)
+        self.register_buffer("shared_int8_w3", w3_q, persistent=False)
+        self.register_buffer("shared_int8_s3", w3_s, persistent=False)
+        self._shared_int8_ready = True
+
     def forward(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None) -> torch.Tensor:
         dtype = x.dtype
-        gate = self.w1(x).float()
-        up = self.w3(x).float()
+        if self.shared_expert_fp16_enabled and x.is_cuda:
+            self._ensure_shared_fp16()
+            gate_up = F.linear(x.to(torch.float16), self.shared_w13_fp16).float()
+            gate, up = gate_up.chunk(2, dim=-1)
+        elif self.shared_expert_int8_enabled:
+            self._ensure_shared_int8()
+            if _SHARED_EXPERT_PAIR_INT8_CUDA and x.is_cuda:
+                try:
+                    gate, up = soft_bf16_weight_gemm_int8_pair_cuda_ext(
+                        x,
+                        self.shared_int8_w1,
+                        self.shared_int8_s1,
+                        self.shared_int8_w3,
+                        self.shared_int8_s3,
+                    )
+                    gate = gate.float()
+                    up = up.float()
+                except Exception:
+                    gate = soft_bf16_weight_gemm_int8(x, self.shared_int8_w1, self.shared_int8_s1).float()
+                    up = soft_bf16_weight_gemm_int8(x, self.shared_int8_w3, self.shared_int8_s3).float()
+            else:
+                gate = soft_bf16_weight_gemm_int8(x, self.shared_int8_w1, self.shared_int8_s1).float()
+                up = soft_bf16_weight_gemm_int8(x, self.shared_int8_w3, self.shared_int8_s3).float()
+        else:
+            gate = self.w1(x).float()
+            up = self.w3(x).float()
         if self.swiglu_limit > 0:
             up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
             gate = torch.clamp(gate, max=self.swiglu_limit)
         x = F.silu(gate) * up
         if weights is not None:
             x = weights * x
+        if self.shared_expert_fp16_enabled and x.is_cuda:
+            return F.linear(x.to(torch.float16), self.shared_w2_fp16).to(dtype)
+        if self.shared_expert_int8_enabled:
+            return soft_bf16_weight_gemm_int8(x.to(dtype), self.shared_int8_w2, self.shared_int8_s2).to(dtype)
         return self.w2(x.to(dtype))
 
     def forward_cpu(self, x: torch.Tensor, weights: Optional[torch.Tensor] = None, x_cpu: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -738,26 +1210,66 @@ class MoE(nn.Module):
         self.n_routed_experts = args.n_routed_experts
         self.n_local_experts = args.n_routed_experts // world_size
         self.n_activated_experts = args.n_activated_experts
-        self.experts_start_idx = rank * self.n_local_experts
-        self.experts_end_idx = self.experts_start_idx + self.n_local_experts
-        self.gate = Gate(layer_id, args)
         self.routed_experts_device = args.routed_experts_device
-        expert_dtype = torch.float4_e2m1fn_x2 if args.expert_dtype == "fp4" else None
+        self.pd_phase_auto_select_enabled = _env_enabled("DEEPSEEK_PD_PHASE_AUTO_SELECT")
+        self.pd_single_cpu_moe_weights_enabled = _env_enabled("DEEPSEEK_PD_SINGLE_CPU_MOE_WEIGHTS")
+        self.cpu_moe_inproc_server_enabled = self.routed_experts_device == "cpu" and _env_enabled("DEEPSEEK_CPU_MOE_INPROC_SERVER")
+        self.cpu_moe_rank0_server_enabled = self.routed_experts_device == "cpu" and _env_enabled("DEEPSEEK_CPU_MOE_RANK0_SERVER")
+        self.cpu_moe_external_server_enabled = self.routed_experts_device == "cpu" and _env_enabled("DEEPSEEK_CPU_MOE_EXTERNAL_SERVER")
+        self.cpu_moe_external_prefill_local_enabled = self.cpu_moe_external_server_enabled and os.getenv("DEEPSEEK_CPU_MOE_EXTERNAL_PREFILL_LOCAL", "1").lower() in {"1", "true", "yes"}
+        self.cpu_moe_predict_seq_enabled = (self.cpu_moe_external_server_enabled or self.cpu_moe_inproc_server_enabled) and _env_enabled("DEEPSEEK_CPU_MOE_PREDICT_SEQ")
+        if self.cpu_moe_external_server_enabled and not self.cpu_moe_external_prefill_local_enabled and not self.pd_single_cpu_moe_weights_enabled:
+            self.experts_start_idx = 0
+            self.experts_end_idx = 0
+        elif self.cpu_moe_inproc_server_enabled:
+            # The rank-0 in-process daemon thread runs the full-routes int8
+            # CPU MoE kernel; it requires the full per-layer pointer table to
+            # cover all routed experts. We therefore have rank 0 own all
+            # experts (OOM caveat: increases per-rank GPU prefill MoE staging
+            # cache; lower DEEPSEEK_GPU_PREFILL_MOE_MAX_CACHED_LAYERS or
+            # disable DEEPSEEK_GPU_PREFILL_MOE for long prefill if needed).
+            # Ranks 1-3 own no experts and only contribute the shared expert
+            # plus the post-MoE allreduce skip.
+            if rank == 0:
+                self.experts_start_idx = 0
+                self.experts_end_idx = self.n_routed_experts
+            else:
+                self.experts_start_idx = 0
+                self.experts_end_idx = 0
+        elif self.cpu_moe_rank0_server_enabled and rank == 0:
+            self.experts_start_idx = 0
+            self.experts_end_idx = self.n_routed_experts
+        else:
+            self.experts_start_idx = rank * self.n_local_experts
+            self.experts_end_idx = self.experts_start_idx + self.n_local_experts
+        self.gate = Gate(layer_id, args)
+        expert_dtype = None
+        if args.expert_dtype == "fp4":
+            expert_dtype = torch.float4_e2m1fn_x2
+        elif args.expert_dtype == "int8":
+            expert_dtype = torch.int8
         if self.routed_experts_device == "cpu":
-            with torch.device("cpu"):
-                self.experts = nn.ModuleList([
-                    Expert(args.dim, args.moe_inter_dim, dtype=expert_dtype, swiglu_limit=args.swiglu_limit)
-                    if self.experts_start_idx <= i < self.experts_end_idx else None
-                    for i in range(self.n_routed_experts)
-                ])
-            self.cpu_backend = CPURoutedExpertsBackend(
-                layer_idx=self.layer_id,
-                experts=self.experts,
-                experts_start_idx=self.experts_start_idx,
-                experts_end_idx=self.experts_end_idx,
-                num_experts_per_tok=self.n_activated_experts,
-                output_dim=self.dim,
-            )
+            if self.cpu_moe_external_server_enabled and not self.cpu_moe_external_prefill_local_enabled:
+                self.experts = [None for _ in range(self.n_routed_experts)]
+                self.cpu_backend = None
+            else:
+                with torch.device("cpu"):
+                    self.experts = nn.ModuleList([
+                        Expert(args.dim, args.moe_inter_dim, dtype=expert_dtype, swiglu_limit=args.swiglu_limit, shared_int8_enabled=False)
+                        if self.experts_start_idx <= i < self.experts_end_idx else None
+                        for i in range(self.n_routed_experts)
+                    ])
+                    for expert in self.experts:
+                        if expert is not None:
+                            expert.preload_fp4_dequant = args.preload_routed_fp4_dequant
+                self.cpu_backend = CPURoutedExpertsBackend(
+                    layer_idx=self.layer_id,
+                    experts=self.experts,
+                    experts_start_idx=self.experts_start_idx,
+                    experts_end_idx=self.experts_end_idx,
+                    num_experts_per_tok=self.n_activated_experts,
+                    output_dim=self.dim,
+                )
         else:
             self.experts = nn.ModuleList([
                 Expert(args.dim, args.moe_inter_dim, dtype=expert_dtype, swiglu_limit=args.swiglu_limit)
@@ -766,29 +1278,290 @@ class MoE(nn.Module):
             ])
             self.cpu_backend = None
         assert args.n_shared_experts == 1
-        self.shared_experts = Expert(args.dim, args.moe_inter_dim)
+        self.shared_experts = Expert(
+            args.dim,
+            args.moe_inter_dim,
+            dtype=torch.int8 if args.shared_expert_int8 else None,
+            shared_int8_enabled=args.shared_expert_int8 or _env_enabled("DEEPSEEK_SHARED_EXPERT_INT8"),
+        )
+        if args.preloaded_shared_expert_int8 or args.preload_shared_w1_int8:
+            self.shared_experts.w1.enable_online_int8()
+        if args.preloaded_shared_expert_int8 or args.preload_shared_w2_int8:
+            self.shared_experts.w2.enable_online_int8()
+        if args.preloaded_shared_expert_int8 or args.preload_shared_w3_int8:
+            self.shared_experts.w3.enable_online_int8()
         self.async_allreduce_enabled = os.getenv("DEEPSEEK_MOE_ASYNC_ALLREDUCE", "0").lower() in {"1", "true", "yes"}
+        self.cpu_host_reduce_enabled = self.routed_experts_device == "cpu" and _env_enabled("DEEPSEEK_CPU_MOE_HOST_REDUCE")
+        self.reduce_fp16_enabled = _env_enabled("DEEPSEEK_MOE_REDUCE_FP16")
+        self._profile_enabled = os.getenv("DEEPSEEK_MOE_PROFILE", "0").lower() in {"1", "true", "yes"}
+        self._rank_route_profile_enabled = _env_enabled("DEEPSEEK_RANK_ROUTE_PROFILE")
         self._allreduce_stream = torch.cuda.Stream() if self.async_allreduce_enabled and torch.cuda.is_available() else None
+        self.gpu_prefill_moe_enabled = self.routed_experts_device == "cpu" and _env_enabled("DEEPSEEK_GPU_PREFILL_MOE")
+        self.gpu_prefill_moe_min_tokens = int(os.getenv("DEEPSEEK_GPU_PREFILL_MOE_MIN_TOKENS", "64"))
+        self.gpu_prefill_backend = None
+
+    def _pd_active_phase(self) -> Optional[str]:
+        if not self.pd_phase_auto_select_enabled:
+            return None
+        phase = os.getenv("DEEPSEEK_PD_ACTIVE_PHASE", "")
+        return phase if phase in {"prefill", "decode"} else None
+
+    def _should_use_gpu_prefill_moe(self, x: torch.Tensor) -> bool:
+        phase = self._pd_active_phase()
+        return (
+            phase != "decode"
+            and self.gpu_prefill_moe_enabled
+            and self.cpu_backend is not None
+            and self.experts_end_idx > self.experts_start_idx
+            and x.is_cuda
+            and x.shape[0] >= self.gpu_prefill_moe_min_tokens
+        )
+
+    def _ensure_gpu_prefill_backend(self) -> GPUPrefillMoEBackend:
+        if self.gpu_prefill_backend is None:
+            self.gpu_prefill_backend = GPUPrefillMoEBackend(
+                self.cpu_backend,
+                dim=self.dim,
+                num_experts=self.n_routed_experts,
+                experts_start_idx=self.experts_start_idx,
+                experts_end_idx=self.experts_end_idx,
+            )
+        return self.gpu_prefill_backend
+
+
+    def prefetch_gpu_prefill_moe(self, device: torch.device, token_count: int) -> None:
+        if (
+            self.gpu_prefill_moe_enabled
+            and self.cpu_backend is not None
+            and self.experts_end_idx > self.experts_start_idx
+            and device.type == "cuda"
+            and token_count >= self.gpu_prefill_moe_min_tokens
+        ):
+            self._ensure_gpu_prefill_backend().prefetch(device)
+
+    def _should_use_in_process_cpu_server(self, x: torch.Tensor) -> bool:
+        if not self.cpu_moe_inproc_server_enabled or world_size <= 1 or x.shape[0] != 1:
+            return False
+        return self._pd_active_phase() != "prefill"
+
+    def _should_use_rank0_cpu_server(self, x: torch.Tensor) -> bool:
+        return self.cpu_moe_rank0_server_enabled and world_size > 1 and x.shape[0] == 1
+
+
+    def _should_use_external_cpu_server(self, x: torch.Tensor) -> bool:
+        if not self.cpu_moe_external_server_enabled or world_size <= 1 or x.shape[0] != 1:
+            return False
+        return self._pd_active_phase() != "prefill"
+
+    def _external_cpu_server_submit_decode(self, x: torch.Tensor, indices: torch.Tensor, weights: torch.Tensor) -> int:
+        global _cpu_moe_server_last_seq, _cpu_moe_server_predict_seq
+        if rank != 0:
+            if self.cpu_moe_predict_seq_enabled:
+                _cpu_moe_server_predict_seq += 1
+                return _cpu_moe_server_predict_seq
+            return -1
+        ipc = _get_cpu_moe_server_ipc(self.dim, self.n_activated_experts)
+        req, _resp, _layer, _stop = ipc.read_header()
+        seq_to_reuse = req + 1 - ipc.output_slots
+        if seq_to_reuse > 0:
+            ipc.wait_slot_acks(seq_to_reuse, world_size)
+        seq = ipc.submit(self.layer_id, x, indices, weights)
+        _cpu_moe_server_last_seq = seq
+        _cpu_moe_server_predict_seq = seq
+        return seq
+
+    def _external_cpu_server_wait_decode(self, seq: int, x: torch.Tensor) -> torch.Tensor:
+        ipc = _get_cpu_moe_server_ipc(self.dim, self.n_activated_experts)
+        if self.cpu_moe_predict_seq_enabled:
+            if rank == 0:
+                global _cpu_moe_server_predict_seq
+                _cpu_moe_server_predict_seq = seq
+        else:
+            seq_tensor = torch.empty(1, device=x.device, dtype=torch.long)
+            if rank == 0:
+                seq_tensor.fill_(seq)
+            dist.broadcast(seq_tensor, src=0)
+            seq = int(seq_tensor.item())
+        ipc.wait_response(seq)
+        y = ipc.output_tensor(seq).to(device=x.device, dtype=torch.float32, non_blocking=False)
+        if rank != 0:
+            ipc.ack(rank, seq)
+        return y
+
+
+    def _external_cpu_server_sync(self, x: torch.Tensor, indices: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        global _cpu_moe_server_last_seq, _cpu_moe_server_predict_seq
+        profile = _env_enabled("DEEPSEEK_CPU_MOE_SERVER_PROFILE")
+        ipc = _get_cpu_moe_server_ipc(self.dim, self.n_activated_experts)
+        outputs = []
+        seq_tensor = torch.empty(1, device=x.device, dtype=torch.long)
+        t_total = time.perf_counter() if profile else 0.0
+        for row in range(x.shape[0]):
+            if rank == 0:
+                req, _resp, _layer, _stop = ipc.read_header()
+                seq_to_reuse = req + 1 - ipc.output_slots
+                if seq_to_reuse > 0:
+                    ipc.wait_slot_acks(seq_to_reuse, world_size)
+                seq = ipc.submit(self.layer_id, x[row:row + 1], indices[row:row + 1], weights[row:row + 1])
+                _cpu_moe_server_last_seq = seq
+                _cpu_moe_server_predict_seq = seq
+                seq_tensor.fill_(seq)
+            dist.broadcast(seq_tensor, src=0)
+            seq = int(seq_tensor.item())
+            if self.cpu_moe_predict_seq_enabled and rank != 0:
+                _cpu_moe_server_predict_seq = seq
+            ipc.wait_response(seq)
+            y_row = ipc.output_tensor(seq).to(device=x.device, dtype=torch.float32, non_blocking=False)
+            if rank != 0:
+                ipc.ack(rank, seq)
+            outputs.append(y_row)
+        y = torch.cat(outputs, dim=0) if len(outputs) > 1 else outputs[0]
+        if profile:
+            print(
+                f"cpu_moe_external_profile layer={self.layer_id} rank={rank} batch={x.shape[0]} total={time.perf_counter() - t_total:.6f}s",
+                flush=True,
+            )
+        return y
+
+    def _rank0_cpu_server_sync(self, x: torch.Tensor) -> torch.Tensor:
+        if rank == 0:
+            y = self.cpu_backend.sync_forward(x).to(torch.float32)
+        else:
+            y = torch.empty_like(x, dtype=torch.float32)
+        dist.broadcast(y, src=0)
+        return y
+
+    def _should_use_cpu_host_reduce(self, x: torch.Tensor) -> bool:
+        phase = self._pd_active_phase()
+        return phase != "prefill" and self.cpu_host_reduce_enabled and world_size > 1 and x.shape[0] == 1
+
+    def _cpu_host_reduce(self, x: torch.Tensor) -> tuple[torch.Tensor, float, float, float]:
+        t0 = time.perf_counter() if self._profile_enabled else 0.0
+        y_cpu, current_slot, batch_size, device = self.cpu_backend.sync_forward_cpu(x)
+        t_sync = time.perf_counter() if self._profile_enabled else 0.0
+        if not hasattr(self.cpu_backend, "host_float_allreduce"):
+            raise RuntimeError("DEEPSEEK_CPU_MOE_HOST_REDUCE requires native host_float_allreduce")
+        self.cpu_backend.host_float_allreduce(y_cpu, rank, world_size)
+        t_reduce = time.perf_counter() if self._profile_enabled else 0.0
+        y = self.cpu_backend.copy_cpu_output_to_device(y_cpu, current_slot, batch_size, device, x).to(torch.float32)
+        t_h2d = time.perf_counter() if self._profile_enabled else 0.0
+        return y, t_sync - t0, t_reduce - t_sync, t_h2d - t_reduce
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         shape = x.size()
         x = x.view(-1, self.dim)
         weights, indices = self.gate(x, input_ids.flatten())
-        if self.routed_experts_device == "cpu" and self.async_allreduce_enabled and world_size > 1 and self._allreduce_stream is not None:
-            self.cpu_backend.submit_forward(x, indices, weights)
-            y = self.cpu_backend.sync_forward(x)
-            y_reduce = y.to(x.dtype)
-            current_stream = torch.cuda.current_stream(y_reduce.device)
-            self._allreduce_stream.wait_stream(current_stream)
-            with torch.cuda.stream(self._allreduce_stream):
-                dist.all_reduce(y_reduce, async_op=False)
+        if self._rank_route_profile_enabled and x.shape[0] == 1:
+            local = ((indices >= self.experts_start_idx) & (indices < self.experts_end_idx)).sum().item()
+            print(f"rank_route layer={self.layer_id} rank={rank} local={int(local)} ids={indices.flatten().tolist()}", flush=True)
+        used_gpu_prefill_moe = False
+        used_remote_only = False
+        if self.routed_experts_device == "cpu" and self._should_use_gpu_prefill_moe(x):
             shared = self.shared_experts(x)
-            current_stream.wait_stream(self._allreduce_stream)
-            y = y_reduce.to(torch.float32)
+            y = self._ensure_gpu_prefill_backend().forward(
+                x,
+                indices,
+                weights,
+                self.cpu_backend._swiglu_limit,
+            )
+            used_gpu_prefill_moe = True
+        elif self.routed_experts_device == "cpu" and self._should_use_in_process_cpu_server(x):
+            profile = self._profile_enabled
+            t0 = time.perf_counter() if profile else 0.0
+            seq = self._external_cpu_server_submit_decode(x, indices, weights)
+            t_submit = time.perf_counter() if profile else 0.0
+            shared = self.shared_experts(x)
+            if profile and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t_shared = time.perf_counter() if profile else 0.0
+            y = self._external_cpu_server_wait_decode(seq, x)
+            if profile and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t_wait = time.perf_counter() if profile else 0.0
+            if profile:
+                print(
+                    f"moe_inproc_overlap_profile layer={self.layer_id} rank={rank} "
+                    f"submit={t_submit - t0:.6f}s shared={t_shared - t_submit:.6f}s wait_h2d={t_wait - t_shared:.6f}s total={t_wait - t0:.6f}s",
+                    flush=True,
+                )
+        elif self.routed_experts_device == "cpu" and self._should_use_external_cpu_server(x):
+            if x.shape[0] == 1:
+                profile = self._profile_enabled
+                t0 = time.perf_counter() if profile else 0.0
+                seq = self._external_cpu_server_submit_decode(x, indices, weights)
+                t_submit = time.perf_counter() if profile else 0.0
+                shared = self.shared_experts(x)
+                if profile and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                t_shared = time.perf_counter() if profile else 0.0
+                y = self._external_cpu_server_wait_decode(seq, x)
+                if profile and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                t_wait = time.perf_counter() if profile else 0.0
+                if profile:
+                    print(
+                        f"moe_external_overlap_profile layer={self.layer_id} rank={rank} "
+                        f"submit={t_submit - t0:.6f}s shared={t_shared - t_submit:.6f}s wait_h2d={t_wait - t_shared:.6f}s total={t_wait - t0:.6f}s",
+                        flush=True,
+                    )
+            else:
+                shared = self.shared_experts(x)
+                y = self._external_cpu_server_sync(x, indices, weights)
+        elif self.routed_experts_device == "cpu" and self._should_use_rank0_cpu_server(x):
+            if rank == 0:
+                self.cpu_backend.submit_forward(x, indices, weights)
+            shared = self.shared_experts(x)
+            y = self._rank0_cpu_server_sync(x)
+        elif self.routed_experts_device == "cpu" and self.cpu_moe_inproc_server_enabled and rank != 0:
+            y = torch.zeros_like(x, dtype=torch.float32)
+            shared = self.shared_experts(x)
+            used_remote_only = True
+        elif self.routed_experts_device == "cpu" and self.async_allreduce_enabled and world_size > 1 and self._allreduce_stream is not None:
+            profile = self._profile_enabled
+            t0 = time.perf_counter() if profile else 0.0
+            self.cpu_backend.submit_forward(x, indices, weights)
+            t_submit = time.perf_counter() if profile else 0.0
+            shared = self.shared_experts(x)
+            if profile and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t_shared = time.perf_counter() if profile else 0.0
+            with torch.cuda.stream(self._allreduce_stream):
+                if self._should_use_cpu_host_reduce(x):
+                    y, host_sync_time, host_reduce_time, host_h2d_time = self._cpu_host_reduce(x)
+                else:
+                    y = self.cpu_backend.sync_forward(x)
+                    if profile and torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    t_sync = time.perf_counter() if profile else 0.0
+                    y_reduce = y.to(torch.float16 if self.reduce_fp16_enabled else x.dtype)
+                    dist.all_reduce(y_reduce, async_op=False)
+                    if profile and torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    t_reduce = time.perf_counter() if profile else 0.0
+                    y = y_reduce.to(torch.float32)
+            torch.cuda.current_stream(y.device).wait_stream(self._allreduce_stream)
+            if 'host_sync_time' in locals():
+                if profile and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                t_sync = time.perf_counter() if profile else 0.0
+                t_reduce = t_sync
+                if profile:
+                    print(
+                        f"moe_host_reduce_profile layer={self.layer_id} batch={x.shape[0]} cpu_sync={host_sync_time:.4f}s host_reduce={host_reduce_time:.4f}s h2d={host_h2d_time:.4f}s",
+                        flush=True,
+                    )
+            if profile:
+                print(
+                    f"moe_profile layer={self.layer_id} batch={x.shape[0]} submit={t_submit - t0:.4f}s shared={t_shared - t_submit:.4f}s sync={t_sync - t_shared:.4f}s reduce={t_reduce - t_sync:.4f}s",
+                    flush=True,
+                )
         elif self.routed_experts_device == "cpu":
             self.cpu_backend.submit_forward(x, indices, weights)
             shared = self.shared_experts(x)
-            y = self.cpu_backend.sync_forward(x)
+            if self._should_use_cpu_host_reduce(x):
+                y, _host_sync_time, _host_reduce_time, _host_h2d_time = self._cpu_host_reduce(x)
+            else:
+                y = self.cpu_backend.sync_forward(x)
         else:
             y = torch.zeros_like(x, dtype=torch.float32)
             counts = torch.bincount(indices.flatten(), minlength=self.n_routed_experts).tolist()
@@ -799,8 +1572,17 @@ class MoE(nn.Module):
                 idx, top = torch.where(indices == i)
                 y[idx] += expert(x[idx], weights[idx, top, None])
             shared = self.shared_experts(x)
-        if world_size > 1 and not (self.routed_experts_device == "cpu" and self.async_allreduce_enabled):
-            reduce_dtype = x.dtype
+        if world_size > 1 and not (
+            self.routed_experts_device == "cpu"
+            and (
+                (self.async_allreduce_enabled and not used_gpu_prefill_moe and not used_remote_only)
+                or self._should_use_cpu_host_reduce(x)
+                or self._should_use_in_process_cpu_server(x)
+                or self._should_use_external_cpu_server(x)
+                or self._should_use_rank0_cpu_server(x)
+            )
+        ):
+            reduce_dtype = torch.float16 if self.reduce_fp16_enabled else x.dtype
             y_reduce = y.to(reduce_dtype)
             dist.all_reduce(y_reduce)
             y = y_reduce.to(torch.float32)
@@ -833,10 +1615,25 @@ class Block(nn.Module):
             self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc))
             self.hc_attn_scale = nn.Parameter(torch.empty(3))
             self.hc_ffn_scale = nn.Parameter(torch.empty(3))
-        self.hc_int8_enabled = os.getenv("DEEPSEEK_HC_INT8", "0").lower() in {"1", "true", "yes"}
+        self.hc_int8_enabled = _env_enabled("DEEPSEEK_HC_INT8")
+        self.hc_pre_cuda_enabled = _env_enabled("DEEPSEEK_HC_PRE_CUDA")
+        self.hc_post_cuda_enabled = _env_enabled("DEEPSEEK_HC_POST_CUDA")
+        self.hc_fp16_mode = os.getenv("DEEPSEEK_HC_FP16", "0").lower()
         self._hc_int8_ready = False
-        self._hc_cuda_ext = load_wo_a_cuda_ext() if self.hc_int8_enabled else None
+        self._hc_cuda_ext = load_cuda_kernel() if self.hc_int8_enabled or self.hc_pre_cuda_enabled or self.hc_post_cuda_enabled else None
         self._hc_cuda_enabled = self._hc_cuda_ext is not None
+        self._hc_pre_cuda_available = self._hc_cuda_enabled and hasattr(self._hc_cuda_ext, "hc_split_pre_forward")
+        self._hc_post_cuda_available = self._hc_cuda_enabled and hasattr(self._hc_cuda_ext, "hc_post_forward")
+        self.layer_profile_enabled = _env_enabled("DEEPSEEK_LAYER_PROFILE")
+        self.prefetch_moe_before_ffn = _env_enabled("DEEPSEEK_GPU_PREFILL_MOE_PREFETCH_BEFORE_FFN")
+
+    def prefetch_gpu_prefill_moe(self, device: torch.device, token_count: int) -> None:
+        self.ffn.prefetch_gpu_prefill_moe(device, token_count)
+
+    def release_gpu_prefill_moe_cache(self) -> None:
+        backend = getattr(self.ffn, "gpu_prefill_backend", None)
+        if backend is not None:
+            backend.release_cache()
 
     def _ensure_hc_int8(self):
         if self._hc_int8_ready:
@@ -866,36 +1663,96 @@ class Block(nn.Module):
             return y.to(torch.float32)
         return soft_bf16_weight_gemm_int8(x, weight_q[0], weight_s[0]).to(torch.float32)
 
+    def _hc_linear_fp16(self, x: torch.Tensor, hc_fn: torch.Tensor) -> torch.Tensor:
+        weight_name = "hc_attn_fp16_weight" if hc_fn is self.hc_attn_fn else "hc_ffn_fp16_weight"
+        weight = getattr(self, weight_name, None)
+        if weight is None or weight.device != hc_fn.device:
+            weight = hc_fn.detach().to(dtype=torch.float16)
+            self.register_buffer(weight_name, weight, persistent=False)
+        return F.linear(x.to(torch.float16), weight).to(torch.float32)
+
+    def _hc_should_use_fp16(self, kind: str, x: torch.Tensor, hc_fn: torch.Tensor) -> bool:
+        if not x.is_cuda or not hc_fn.is_cuda:
+            return False
+        return self.hc_fp16_mode in {"1", "true", "yes", "all", kind}
+
     def hc_pre(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         shape, dtype = x.size(), x.dtype
         x = x.flatten(2).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
+        kind = "attn" if hc_fn is self.hc_attn_fn else "ffn"
         if self.hc_int8_enabled:
-            kind = "attn" if hc_fn is self.hc_attn_fn else "ffn"
             mixes = self._hc_linear_int8(x, kind) * rsqrt
+        elif self._hc_should_use_fp16(kind, x, hc_fn):
+            mixes = self._hc_linear_fp16(x, hc_fn) * rsqrt
         else:
             mixes = F.linear(x, hc_fn) * rsqrt
+        if self.hc_pre_cuda_enabled and self._hc_pre_cuda_available and x.is_cuda and x.size(0) == 1 and x.size(1) == 1 and self.hc_mult == 4:
+            y, _pre, post, comb = self._hc_cuda_ext.hc_split_pre_forward(
+                mixes.contiguous(),
+                x.view(shape).contiguous(),
+                hc_scale.contiguous(),
+                hc_base.contiguous(),
+                self.hc_mult,
+                self.hc_sinkhorn_iters,
+                self.hc_eps,
+            )
+            return y.to(dtype), post, comb
         pre, post, comb = hc_split_sinkhorn(mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps)
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
         return y.to(dtype), post, comb
 
     def hc_post(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
-        # x: [b,s,d], residual: [b,s,hc,d], post: [b,s,hc], comb: [b,s,hc,hc], y: [b,s,hc,d]
+        if self.hc_post_cuda_enabled and self._hc_post_cuda_available and x.is_cuda and x.size(0) == 1 and x.size(1) == 1 and residual.size(2) == 4:
+            return self._hc_cuda_ext.hc_post_forward(
+                x.contiguous(),
+                residual.contiguous(),
+                post.contiguous(),
+                comb.contiguous(),
+            )
         y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
         return y.type_as(x)
 
-    def forward(self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor]) -> torch.Tensor:
+    def _profile_sync(self):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        return time.perf_counter()
+
+    def forward(self, x: torch.Tensor, start_pos: int, input_ids: Optional[torch.Tensor], prefetch_next: Optional[nn.Module] = None) -> torch.Tensor:
+        profile = self.layer_profile_enabled
+        t0 = self._profile_sync() if profile else 0.0
         residual = x
         x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+        t_hc_attn_pre = self._profile_sync() if profile else 0.0
         x = self.attn_norm(x)
         x = self.attn(x, start_pos)
+        t_attn = self._profile_sync() if profile else 0.0
         x = self.hc_post(x, residual, post, comb)
+        t_hc_attn_post = self._profile_sync() if profile else 0.0
 
         residual = x
         x, post, comb = self.hc_pre(x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+        t_hc_ffn_pre = self._profile_sync() if profile else 0.0
         x = self.ffn_norm(x)
+        if self.prefetch_moe_before_ffn and prefetch_next is not None and input_ids is not None:
+            prefetch_next.prefetch_gpu_prefill_moe(x.device, input_ids.numel())
         x = self.ffn(x, input_ids)
+        if not self.prefetch_moe_before_ffn and prefetch_next is not None and input_ids is not None:
+            prefetch_next.prefetch_gpu_prefill_moe(x.device, input_ids.numel())
+        t_moe = self._profile_sync() if profile else 0.0
         x = self.hc_post(x, residual, post, comb)
+        t_hc_ffn_post = self._profile_sync() if profile else 0.0
+        if profile:
+            print(
+                f"layer_profile layer={self.layer_id} pos={start_pos} batch={x.shape[0]} "
+                f"hc_attn_pre={t_hc_attn_pre - t0:.4f}s "
+                f"attn={t_attn - t_hc_attn_pre:.4f}s "
+                f"hc_attn_post={t_hc_attn_post - t_attn:.4f}s "
+                f"hc_ffn_pre={t_hc_ffn_pre - t_hc_attn_post:.4f}s "
+                f"moe={t_moe - t_hc_ffn_pre:.4f}s "
+                f"hc_ffn_post={t_hc_ffn_post - t_moe:.4f}s",
+                flush=True,
+            )
         return x
 
 
@@ -908,11 +1765,23 @@ class ParallelHead(nn.Module):
         self.norm_eps = norm_eps
         self.hc_eps = hc_eps
         self.part_vocab_size = (vocab_size // world_size)
+        self.hc_fp16_enabled = _env_enabled("DEEPSEEK_HEAD_HC_FP16")
+        self.lm_head_fp16_enabled = _env_enabled("DEEPSEEK_LM_HEAD_FP16")
         # lm_head in the checkpoint is stored in bf16, while the parameter here is stored in fp32 for easier computation of logits later.
         self.weight = nn.Parameter(torch.empty(self.part_vocab_size, self.dim, dtype=torch.float32))
 
+    def _lm_head_fp16_weight(self) -> torch.Tensor:
+        weight = getattr(self, "lm_head_fp16_weight", None)
+        if weight is None or weight.device != self.weight.device:
+            weight = self.weight.detach().to(dtype=torch.float16)
+            self.register_buffer("lm_head_fp16_weight", weight, persistent=False)
+        return weight
+
     def get_logits(self, x):
-        return F.linear(x[:, -1].float(), self.weight)
+        x = x[:, -1]
+        if self.lm_head_fp16_enabled and x.is_cuda and self.weight.is_cuda:
+            return F.linear(x.to(torch.float16), self._lm_head_fp16_weight()).to(torch.float32)
+        return F.linear(x.float(), self.weight)
 
     def forward(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, norm: RMSNorm):
         # x: [b,s,hc,d]
@@ -924,11 +1793,37 @@ class ParallelHead(nn.Module):
             logits = torch.cat(all_logits, dim=-1)
         return logits
 
+    def next_token(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
+        x = self.hc_head(x, hc_fn, hc_scale, hc_base)
+        logits = self.get_logits(norm(x))
+        values, indices = logits.max(dim=-1)
+        if world_size > 1:
+            all_values = [torch.empty_like(values) for _ in range(world_size)]
+            all_indices = [torch.empty_like(indices) for _ in range(world_size)]
+            dist.all_gather(all_values, values)
+            dist.all_gather(all_indices, indices)
+            values = torch.stack(all_values, dim=0)
+            indices = torch.stack(all_indices, dim=0)
+            best_rank = values.argmax(dim=0)
+            next_token = indices.gather(0, best_rank.unsqueeze(0)).squeeze(0)
+            return next_token + best_rank.to(next_token.dtype) * self.part_vocab_size
+        return indices
+
+    def _hc_linear_fp16(self, x: torch.Tensor, hc_fn: torch.Tensor) -> torch.Tensor:
+        weight = getattr(self, "hc_fp16_weight", None)
+        if weight is None or weight.device != hc_fn.device:
+            weight = hc_fn.detach().to(dtype=torch.float16)
+            self.register_buffer("hc_fp16_weight", weight, persistent=False)
+        return F.linear(x.to(torch.float16), weight).to(torch.float32)
+
     def hc_head(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         shape, dtype = x.size(), x.dtype
         x = x.flatten(2).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(x, hc_fn) * rsqrt
+        if self.hc_fp16_enabled and x.is_cuda and hc_fn.is_cuda:
+            mixes = self._hc_linear_fp16(x, hc_fn) * rsqrt
+        else:
+            mixes = F.linear(x, hc_fn) * rsqrt
         pre = torch.sigmoid(mixes * hc_scale + hc_base) + self.hc_eps
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
         return y.to(dtype)
@@ -938,8 +1833,12 @@ class MTPBlock(Block):
 
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__(layer_id, args)
-        self.e_proj = Linear(args.dim, args.dim)
-        self.h_proj = Linear(args.dim, args.dim)
+        self.e_proj = Linear(args.dim, args.dim, dtype=torch.int8 if args.mtp_int8 else None)
+        self.h_proj = Linear(args.dim, args.dim, dtype=torch.int8 if args.mtp_int8 else None)
+        if args.preload_mtp_e_proj_int8:
+            self.e_proj.enable_online_int8()
+        if args.preload_mtp_h_proj_int8:
+            self.h_proj.enable_online_int8()
         self.enorm = RMSNorm(args.dim, args.norm_eps)
         self.hnorm = RMSNorm(args.dim, args.norm_eps)
         self.norm = RMSNorm(args.dim, args.norm_eps)
@@ -1006,14 +1905,55 @@ class Transformer(nn.Module):
             backend = getattr(layer.ffn, "cpu_backend", None)
             if backend is not None:
                 backend.prepare_int8_weights()
+        if (
+            _env_enabled("DEEPSEEK_CPU_MOE_INPROC_SERVER")
+            and rank == 0
+            and world_size > 1
+            and len(self.layers) > 0
+        ):
+            backends = []
+            template_ffn = None
+            for layer in self.layers:
+                ffn = getattr(layer, "ffn", None)
+                backend = getattr(ffn, "cpu_backend", None) if ffn is not None else None
+                if backend is None:
+                    raise RuntimeError(f"layer {layer.layer_id} missing cpu_backend; in-process CPU MoE server requires routed-experts-device=cpu")
+                backends.append(backend)
+                if template_ffn is None:
+                    template_ffn = ffn
+            if template_ffn is None:
+                return
+            shm_name = start_in_process_cpu_moe_server(
+                backends=backends,
+                dim=template_ffn.dim,
+                topk=template_ffn.n_activated_experts,
+                inter_dim=backends[0]._inter_dim,
+                n_routed_experts=template_ffn.n_routed_experts,
+                swiglu_limit=backends[0]._swiglu_limit,
+                shm_name=os.getenv("DEEPSEEK_CPU_MOE_SERVER_SHM"),
+                use_v2=True,
+            )
+            os.environ["DEEPSEEK_CPU_MOE_SERVER_SHM"] = shm_name
+            print(f"deepseek inproc cpu moe server started shm={shm_name}", flush=True)
+
+    def release_gpu_prefill_moe_cache(self) -> None:
+        for layer in self.layers:
+            layer.release_gpu_prefill_moe_cache()
+        for layer in self.mtp:
+            layer.release_gpu_prefill_moe_cache()
 
     @torch.inference_mode()
-    def forward(self, input_ids: torch.Tensor, start_pos: int = 0):
+    def forward(self, input_ids: torch.Tensor, start_pos: int = 0, return_next_token: bool = False):
         h = self.embed(input_ids)
         # Expand to hc_mult copies for Hyper-Connections
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
-        for layer in self.layers:
-            h = layer(h, start_pos, input_ids)
+        if self.layers:
+            self.layers[0].prefetch_gpu_prefill_moe(h.device, input_ids.numel())
+        for layer_idx, layer in enumerate(self.layers):
+            prefetch_next = self.layers[layer_idx + 1] if layer_idx + 1 < len(self.layers) else None
+            h = layer(h, start_pos, input_ids, prefetch_next=prefetch_next)
+        if return_next_token:
+            return self.head.next_token(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
         logits = self.head(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.norm)
         return logits
 

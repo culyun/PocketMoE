@@ -31,6 +31,24 @@
 #    machine.
 #    Enable: DEEPSEEK_BENCH_GOVERNOR_PIN=1 (requires passwordless sudo for
 #    `tee /sys/.../scaling_governor` and the intel_pstate knobs).
+# 5. Fused attention decode prefuse kernels (Plan B-小-v2). Two CUDA opaque
+#    ops collapse the per-layer attention front-end (model.py:798-812):
+#      - fused_q_rmsnorm_rope_inplace: per-head rsqrt(mean(square)+eps) +
+#        complex rotary on the trailing rope dims of q in one launch.
+#      - fused_kv_rope_actquant_inplace: kv_norm + complex rotary +
+#        block-FP8 (e4m3fn, ue8m0 scale) inplace simulation in one launch.
+#    Replaces ~16 PyTorch dispatches per layer with 2 kernel launches; with
+#    43 layers that is ~600 dispatches/step trimmed from the eager loop.
+#    short_short decode TPS 1.962 -> 2.099 (+7.0%); long_long decode TPS
+#    1.750 -> 1.828 (+4.5%, governor pinned). short_short greedy output is
+#    bit-identical to baseline. long_long greedy diverges in wording around
+#    token ~10 because the q rsqrt path runs in fp32 here vs bf16 in the
+#    reference (max abs diff 1.56e-2, mean 9.9e-4 -- inside bf16 ULP
+#    envelope). Treated as accepted bf16 numerical variance.
+#    Code: cuda_kernel_impl.cu (kernels), cuda_kernel.cpp (pybind),
+#    model.py:Attention.forward (call sites + freqs cache).
+#    Enable: DEEPSEEK_FUSED_ATTN_PREFUSE=1 (default off until shipped).
+#    Validate kernels alone: python test_fused_attn_prefuse.py
 #
 # Tried but NOT adopted (rationale documented so we do not retry blindly):
 # - pmaddubsw sign-trick rewrite of dot_i8_avx2 / dot_i8_avx2_pair.
@@ -188,6 +206,7 @@ export_best_env() {
   export DEEPSEEK_CPU_DECODE_INLINE_THRESHOLD="${DEEPSEEK_CPU_DECODE_INLINE_THRESHOLD:-1}"
   export DEEPSEEK_CPU_TOPK_PERSISTENT="${DEEPSEEK_CPU_TOPK_PERSISTENT:-1}"
   export DEEPSEEK_PD_DECODE_OMP_THREADS="${DEEPSEEK_PD_DECODE_OMP_THREADS:-12}"
+  export DEEPSEEK_FUSED_ATTN_PREFUSE="${DEEPSEEK_FUSED_ATTN_PREFUSE:-1}"
 
   # Phase-aware attention INT8 (matches the verified best path).
   for module in WQ_A WQ_B WKV WO_A WO_B INDEXER_WQ_B; do

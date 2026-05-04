@@ -1,6 +1,8 @@
+import ctypes
 import os
 import json
 import sys
+import time
 from argparse import ArgumentParser
 from typing import List
 
@@ -8,8 +10,8 @@ import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
 from safetensors import safe_open
-from safetensors.torch import load_model
 
+from cpu_moe_shared_weights import SharedCPUMoEWeightArena
 from model import (
     Transformer,
     ModelArgs,
@@ -19,10 +21,53 @@ from model import (
     RowParallelLinear,
     Attention,
 )
+from kernel import soft_fp8_blockfp8_weight_dequant
 current_dir = os.path.dirname(os.path.abspath(__file__))
 encoding_dir = os.path.join(current_dir, '../encoding')
 sys.path.insert(0, os.path.abspath(encoding_dir))
 from encoding_dsv4 import encode_messages, parse_message_from_completion_text
+
+
+def _enable_numa_interleave() -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    mask = ctypes.c_ulong(0b11)
+    ret = libc.syscall(238, 3, ctypes.byref(mask), ctypes.c_ulong(64))
+    if ret != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+
+
+def _bind_shared_cpu_moe_weights(model: Transformer, root_dir: str, args: ModelArgs, world_size: int, rank: int) -> SharedCPUMoEWeightArena:
+    precreated = os.getenv("DEEPSEEK_CPU_MOE_SHARED_WEIGHT_PRECREATED", "0").lower() in {"1", "true", "yes"}
+    arena = SharedCPUMoEWeightArena(
+        root_dir=root_dir,
+        rank=rank,
+        world_size=world_size,
+        n_layers=args.n_layers,
+        n_routed_experts=args.n_routed_experts,
+        dim=args.dim,
+        moe_inter_dim=args.moe_inter_dim,
+        create=not precreated,
+    )
+    for layer in model.layers:
+        moe = layer.ffn
+        for expert_id in range(moe.experts_start_idx, moe.experts_end_idx):
+            expert = moe.experts[expert_id]
+            if expert is None:
+                continue
+            expert.w1.set_int8_storage(
+                arena.tensor(layer.layer_id, expert_id, "w1.weight"),
+                arena.tensor(layer.layer_id, expert_id, "w1.scale"),
+            )
+            expert.w2.set_int8_storage(
+                arena.tensor(layer.layer_id, expert_id, "w2.weight"),
+                arena.tensor(layer.layer_id, expert_id, "w2.scale"),
+            )
+            expert.w3.set_int8_storage(
+                arena.tensor(layer.layer_id, expert_id, "w3.weight"),
+                arena.tensor(layer.layer_id, expert_id, "w3.scale"),
+            )
+    return arena
 
 
 def _cpu_affinity_for_rank(local_rank: int, world_size: int) -> list[int] | None:
@@ -60,6 +105,29 @@ def _full_tensor_name(module_name: str, param_name: str) -> str:
     return f"{module_name}.{param_name}" if module_name else param_name
 
 
+def _expert_idx_from_name(name: str) -> int | None:
+    if "experts." not in name or "shared_experts" in name:
+        return None
+    parts = name.split('.')
+    try:
+        return int(parts[parts.index("experts") + 1])
+    except (ValueError, IndexError):
+        return None
+
+
+def _module_owns_expert(module, expert_idx: int) -> bool:
+    return getattr(module, "experts_start_idx", 0) <= expert_idx < getattr(module, "experts_end_idx", 0)
+
+
+def _is_replicated_c4_indexer_param(name: str, module) -> bool:
+    return getattr(module, "replicated_c4_indexer", False) and (
+        name.endswith("indexer.wq_b.weight")
+        or name.endswith("indexer.weights_proj.weight")
+        or name.endswith("indexer.wq_b.scale")
+        or name.endswith("indexer.weights_proj.scale")
+    )
+
+
 def _is_column_parallel(module) -> bool:
     return isinstance(module, (ParallelEmbedding, ParallelHead, ColumnParallelLinear))
 
@@ -76,10 +144,13 @@ def _shard_tensor_for_rank(name: str, tensor: torch.Tensor, module, world_size: 
         local_experts = module.n_local_experts if hasattr(module, 'n_local_experts') else None
         if local_experts is None:
             return tensor
-        start = rank * local_experts
-        end = start + local_experts
+        start = getattr(module, 'experts_start_idx', rank * local_experts)
+        end = getattr(module, 'experts_end_idx', start + local_experts)
         if expert_idx < start or expert_idx >= end:
             return None
+        return tensor
+
+    if _is_replicated_c4_indexer_param(name, module):
         return tensor
 
     if _is_column_parallel(module):
@@ -112,6 +183,131 @@ def _shard_tensor_for_rank(name: str, tensor: torch.Tensor, module, world_size: 
     return tensor
 
 
+def _dequant_int8_weight(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return (weight.to(torch.float32) * scale.to(torch.float32).unsqueeze(1)).contiguous()
+
+
+def _dequant_fp4_to_bf16(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    assert weight.dtype in {torch.int8, torch.float4_e2m1fn_x2}, f"Expected packed FP4 storage, got {weight.dtype}"
+    raw = weight.view(torch.uint8)
+    FP4_TABLE = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                               0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], dtype=torch.float32, device=weight.device)
+    low = raw & 0x0F
+    high = (raw >> 4) & 0x0F
+    unpacked = torch.stack([FP4_TABLE[low.long()], FP4_TABLE[high.long()]], dim=-1).flatten(1)
+    scale_f = scale.float().repeat_interleave(32, dim=1)
+    return (unpacked * scale_f).to(torch.bfloat16)
+
+
+def _quantize_int8_per_row(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    weight_f = weight.float().contiguous()
+    row_scale = weight_f.abs().amax(dim=1).clamp_min(1e-6) / 127.0
+    weight_q = torch.clamp(torch.round(weight_f / row_scale.unsqueeze(1)), -127, 127).to(torch.int8).contiguous()
+    return weight_q, row_scale.contiguous()
+
+
+def _copy_scale_tensor(key: str, state_dict: dict[str, torch.Tensor], module, scale: torch.Tensor) -> None:
+    scale_key = f"{key[:-7]}.scale" if key.endswith(".weight") else "scale"
+    scale_target = state_dict.get(scale_key)
+    if scale_target is not None:
+        if scale.shape != scale_target.shape:
+            raise ValueError(f"Scale shape mismatch for {scale_key}: got {tuple(scale.shape)}, expected {tuple(scale_target.shape)}")
+        scale_target.copy_(scale.to(device=scale_target.device, dtype=scale_target.dtype))
+        return
+
+    module_scale = getattr(module, "scale", None)
+    if module_scale is None:
+        raise ValueError(f"Missing scale target for {key}")
+    if scale.shape != module_scale.shape:
+        raise ValueError(f"Scale shape mismatch for {scale_key}: got {tuple(scale.shape)}, expected {tuple(module_scale.shape)}")
+    module_scale.copy_(scale.to(device=module_scale.device, dtype=module_scale.dtype))
+
+
+def _copy_int8_weight_and_scale(
+    key: str,
+    state_dict: dict[str, torch.Tensor],
+    module,
+    target: torch.Tensor,
+    weight_q: torch.Tensor,
+    weight_s: torch.Tensor,
+) -> None:
+    if weight_q.shape != target.shape:
+        raise ValueError(f"Shape mismatch for {key}: got {tuple(weight_q.shape)}, expected {tuple(target.shape)}")
+    target.copy_(weight_q.to(device=target.device, dtype=target.dtype))
+    _copy_scale_tensor(key, state_dict, module, weight_s)
+
+
+def _is_packed_fp4_source(tensor: torch.Tensor, scale: torch.Tensor | None, target: torch.Tensor) -> bool:
+    return (
+        tensor.ndim == 2
+        and scale is not None
+        and scale.ndim == 2
+        and target.dtype == torch.int8
+        and tensor.shape[0] == target.shape[0]
+        and tensor.shape[1] * 2 == target.shape[1]
+    )
+
+
+def _convert_fp4_to_int8(weight: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    bf16_weight = _dequant_fp4_to_bf16(weight, scale)
+    return _quantize_int8_per_row(bf16_weight)
+
+
+def _cuda_quant_device() -> torch.device | None:
+    if not torch.cuda.is_available():
+        return None
+    return torch.device("cuda", torch.cuda.current_device())
+
+
+def _quantize_fp8_block_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    weight_f = weight.float().contiguous()
+    rows, cols = weight_f.shape
+    block = 128
+    padded_rows = ((rows + block - 1) // block) * block
+    padded_cols = ((cols + block - 1) // block) * block
+    padded = torch.zeros((padded_rows, padded_cols), dtype=torch.float32, device=weight_f.device)
+    padded[:rows, :cols] = weight_f
+    row_blocks = padded_rows // block
+    col_blocks = padded_cols // block
+    blocks = padded.view(row_blocks, block, col_blocks, block).permute(0, 2, 1, 3)
+    scales = blocks.abs().amax(dim=(2, 3)).clamp_min(1e-6) / 448.0
+    scales = torch.pow(2.0, torch.ceil(torch.log2(scales)))
+    quant = torch.clamp(blocks / scales[:, :, None, None], -448.0, 448.0).to(torch.float8_e4m3fn)
+    quant = quant.permute(0, 2, 1, 3).reshape(padded_rows, padded_cols)[:rows, :cols].contiguous()
+    return quant, scales.contiguous()
+
+
+def _copy_float_weight_to_target(
+    key: str,
+    state_dict: dict[str, torch.Tensor],
+    module,
+    target: torch.Tensor,
+    weight: torch.Tensor,
+) -> None:
+    if target.dtype == torch.float8_e4m3fn:
+        weight_q, weight_s = _quantize_fp8_block_weight(weight)
+        if weight_q.shape != target.shape:
+            raise ValueError(f"Shape mismatch for {key}: got {tuple(weight_q.shape)}, expected {tuple(target.shape)}")
+        target.copy_(weight_q.to(device=target.device, dtype=target.dtype))
+        _copy_scale_tensor(key, state_dict, module, weight_s)
+        return
+
+    if weight.shape != target.shape:
+        raise ValueError(f"Shape mismatch for {key}: got {tuple(weight.shape)}, expected {tuple(target.shape)}")
+    target.copy_(weight.to(device=target.device, dtype=target.dtype))
+
+
+def _copy_quantized_weight_to_target(key: str, state_dict: dict[str, torch.Tensor], module, target: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> None:
+    if key.endswith("wo_a.weight") and hasattr(module, "n_local_groups") and hasattr(module, "o_lora_rank"):
+        n_local_groups = module.n_local_groups
+        o_lora_rank = module.o_lora_rank
+        tensor = _dequant_int8_weight(weight, scale).view(n_local_groups * o_lora_rank, -1)
+    else:
+        tensor = _dequant_int8_weight(weight, scale)
+    _copy_float_weight_to_target(key, state_dict, module, target, tensor)
+
+
+
 def load_original_hf_model(model: Transformer, ckpt_path: str, world_size: int, rank: int) -> None:
     state_dict = model.state_dict()
     name_to_module = dict(model.named_modules())
@@ -124,45 +320,169 @@ def load_original_hf_model(model: Transformer, ckpt_path: str, world_size: int, 
     for key, file_name in weight_map.items():
         file_to_keys.setdefault(file_name, []).append(key)
 
-    for file_name, keys in file_to_keys.items():
+    total_files = len(file_to_keys)
+    for file_idx, (file_name, keys) in enumerate(file_to_keys.items(), 1):
+        print(f"load shard {file_idx}/{total_files}: {file_name}", flush=True)
         file_path = os.path.join(ckpt_path, file_name)
         with safe_open(file_path, framework="pt", device="cpu") as f:
+            file_tensor_keys = set(f.keys())
+
+            def get_tensor_for_key(tensor_key: str) -> torch.Tensor | None:
+                if tensor_key in file_tensor_keys:
+                    return f.get_tensor(tensor_key)
+                tensor_file = weight_map.get(tensor_key)
+                if tensor_file is None:
+                    return None
+                with safe_open(os.path.join(ckpt_path, tensor_file), framework="pt", device="cpu") as other_f:
+                    return other_f.get_tensor(tensor_key)
+
             for key in keys:
+                if key in loaded:
+                    continue
+                if key.endswith(".scale") and f"{key[:-6]}.weight" in state_dict:
+                    continue
                 if key not in state_dict:
                     continue
                 module_name, _, _ = key.rpartition('.')
                 module = name_to_module.get(module_name)
                 if module is None:
                     continue
+                expert_idx = _expert_idx_from_name(key)
+                if expert_idx is not None:
+                    parts = key.split('.')
+                    owner_module = name_to_module.get('.'.join(parts[:parts.index("experts")]))
+                    if owner_module is None or not _module_owns_expert(owner_module, expert_idx):
+                        loaded.add(key)
+                        scale_key = f"{key[:-7]}.scale" if key.endswith(".weight") else None
+                        if scale_key is not None:
+                            loaded.add(scale_key)
+                        continue
 
                 target = state_dict[key]
+                tensor = f.get_tensor(key)
+                scale_key = f"{key[:-7]}.scale"
+                scale_tensor = get_tensor_for_key(scale_key) if key.endswith(".weight") else None
 
-                if key.endswith("wo_a.weight"):
-                    scale_key = key.replace("weight", "scale")
-                    weight = _shard_tensor_for_rank(key, f.get_tensor(key), module, world_size, rank)
-                    scale = _shard_tensor_for_rank(scale_key, f.get_tensor(scale_key), module, world_size, rank)
+                if key.endswith(".weight") and tensor.dtype == torch.int8 and target.dtype != torch.int8 and not (
+                    scale_tensor is not None and scale_tensor.ndim == 2 and tensor.ndim == 2
+                ):
+                    if hasattr(module, "set_preloaded_wo_a_int8") and key.endswith("wo_a.weight") and getattr(module, "wo_a_int8_enabled", False):
+                        weight = _shard_tensor_for_rank(key, tensor, module, world_size, rank)
+                        scale = _shard_tensor_for_rank(scale_key, scale_tensor, module, world_size, rank)
+                        if weight is None or scale is None:
+                            continue
+                        module.set_preloaded_wo_a_int8(weight, scale)
+                        loaded.add(key)
+                        loaded.add(scale_key)
+                        continue
+                    if hasattr(module, "enable_online_int8") and getattr(module, "online_int8_enabled", False):
+                        weight = _shard_tensor_for_rank(key, tensor, module, world_size, rank)
+                        scale = _shard_tensor_for_rank(scale_key, scale_tensor, module, world_size, rank)
+                        if weight is None or scale is None:
+                            continue
+                        module.set_preloaded_int8(weight, scale)
+                        loaded.add(key)
+                        loaded.add(scale_key)
+                        continue
+                    weight = _shard_tensor_for_rank(key, tensor, module, world_size, rank)
+                    scale = _shard_tensor_for_rank(scale_key, scale_tensor, module, world_size, rank)
                     if weight is None or scale is None:
                         continue
-                    tensor = weight.unflatten(0, (-1, 128)).unflatten(-1, (-1, 128)).float()
-                    tensor = (tensor * scale[:, None, :, None].float()).flatten(2, 3).flatten(0, 1)
-                    if tensor.shape != target.shape:
-                        raise ValueError(f"Shape mismatch for {key}: got {tuple(tensor.shape)}, expected {tuple(target.shape)}")
-                    target.copy_(tensor.to(device=target.device, dtype=target.dtype))
+                    _copy_quantized_weight_to_target(key, state_dict, module, target, weight, scale)
                     loaded.add(key)
+                    loaded.add(scale_key)
                     continue
 
-                tensor = f.get_tensor(key)
+                if key.endswith(".weight") and _is_packed_fp4_source(tensor, scale_tensor, target):
+                    weight = _shard_tensor_for_rank(key, tensor, module, world_size, rank)
+                    scale = _shard_tensor_for_rank(scale_key, scale_tensor, module, world_size, rank)
+                    if weight is None or scale is None:
+                        continue
+                    quant_device = _cuda_quant_device()
+                    if quant_device is not None:
+                        weight = weight.to(device=quant_device, non_blocking=True)
+                        scale = scale.to(device=quant_device, non_blocking=True)
+                    w_q, w_s = _convert_fp4_to_int8(weight, scale)
+                    _copy_int8_weight_and_scale(key, state_dict, module, target, w_q, w_s)
+                    loaded.add(key)
+                    loaded.add(scale_key)
+                    continue
+
+                if key.endswith("wo_a.weight") and tensor.dtype == torch.float8_e4m3fn and target.dtype != torch.int8:
+                    weight = _shard_tensor_for_rank(key, tensor, module, world_size, rank)
+                    scale = _shard_tensor_for_rank(scale_key, scale_tensor, module, world_size, rank)
+                    if weight is None or scale is None:
+                        continue
+                    wo_a_bf16 = soft_fp8_blockfp8_weight_dequant(weight, scale)
+                    if wo_a_bf16.shape != target.shape:
+                        wo_a_bf16 = wo_a_bf16.unflatten(0, (-1, 128)).unflatten(-1, (-1, 128))
+                        wo_a_bf16 = wo_a_bf16.flatten(2, 3).flatten(0, 1)
+                    if hasattr(module, "set_preloaded_wo_a_int8") and getattr(module, "wo_a_int8_enabled", False):
+                        wo_a_bf16_f = wo_a_bf16.float()
+                        row_scale = wo_a_bf16_f.abs().amax(dim=1).clamp_min(1e-6) / 127.0
+                        wo_a_q = torch.clamp(torch.round(wo_a_bf16_f / row_scale.unsqueeze(1)), -127, 127).to(torch.int8).contiguous()
+                        wo_a_s = row_scale.float().contiguous()
+                        module.set_preloaded_wo_a_int8(wo_a_q, wo_a_s)
+                    else:
+                        if wo_a_bf16.shape != target.shape:
+                            raise ValueError(f"Shape mismatch for {key}: got {tuple(wo_a_bf16.shape)}, expected {tuple(target.shape)}")
+                        target.copy_(wo_a_bf16.to(device=target.device, dtype=target.dtype))
+                    loaded.add(key)
+                    loaded.add(scale_key)
+                    continue
+
+                if key.endswith("wo_a.weight") and tensor.dtype == torch.int8 and target.dtype == torch.bfloat16:
+                    weight = _shard_tensor_for_rank(key, tensor, module, world_size, rank)
+                    scale = _shard_tensor_for_rank(scale_key, scale_tensor, module, world_size, rank)
+                    if weight is None or scale is None:
+                        continue
+                    wo_a_bf16 = _dequant_int8_weight(weight, scale)
+                    if wo_a_bf16.shape != target.shape:
+                        wo_a_bf16 = wo_a_bf16.view(-1, target.shape[1])
+                    if wo_a_bf16.shape != target.shape:
+                        raise ValueError(f"Shape mismatch for {key}: got {tuple(wo_a_bf16.shape)}, expected {tuple(target.shape)}")
+                    target.copy_(wo_a_bf16.to(device=target.device, dtype=target.dtype))
+                    loaded.add(key)
+                    loaded.add(scale_key)
+                    continue
+
+                if key.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn and target.dtype == torch.int8:
+                    weight = _shard_tensor_for_rank(key, tensor, module, world_size, rank)
+                    scale = _shard_tensor_for_rank(scale_key, scale_tensor, module, world_size, rank)
+                    if weight is None or scale is None:
+                        continue
+                    w_bf16 = soft_fp8_blockfp8_weight_dequant(weight, scale).float()
+                    w_q, w_s = _quantize_int8_per_row(w_bf16)
+                    _copy_int8_weight_and_scale(key, state_dict, module, target, w_q, w_s)
+                    loaded.add(key)
+                    loaded.add(scale_key)
+                    continue
+
+                if target.dtype == torch.float4_e2m1fn_x2:
+                    weight = _shard_tensor_for_rank(key, tensor, module, world_size, rank)
+                    if weight is None:
+                        continue
+                    target.view(torch.uint8).copy_(weight.view(torch.uint8).to(device=target.device))
+                    loaded.add(key)
+                    if scale_tensor is not None:
+                        scale = _shard_tensor_for_rank(scale_key, scale_tensor, module, world_size, rank)
+                        if scale is not None:
+                            _copy_scale_tensor(key, state_dict, module, scale)
+                            loaded.add(scale_key)
+                    continue
+
                 tensor = _shard_tensor_for_rank(key, tensor, module, world_size, rank)
                 if tensor is None:
                     continue
                 if tensor.shape != target.shape:
                     raise ValueError(f"Shape mismatch for {key}: got {tuple(tensor.shape)}, expected {tuple(target.shape)}")
-
-                if target.dtype == torch.float4_e2m1fn_x2:
-                    target.view(torch.uint8).copy_(tensor.view(torch.uint8).to(device=target.device))
-                else:
-                    target.copy_(tensor.to(device=target.device, dtype=target.dtype))
+                target.copy_(tensor.to(device=target.device, dtype=target.dtype))
                 loaded.add(key)
+                if scale_tensor is not None and scale_key not in loaded:
+                    scale = _shard_tensor_for_rank(scale_key, scale_tensor, module, world_size, rank)
+                    if scale is not None:
+                        _copy_scale_tensor(key, state_dict, module, scale)
+                        loaded.add(scale_key)
 
     loaded.update({"mtp.0.embed.weight", "mtp.0.head.weight"})
     missing = sorted(set(state_dict.keys()) - loaded)
@@ -183,7 +503,8 @@ def generate(
     prompt_tokens: List[List[int]],
     max_new_tokens: int,
     eos_id: int,
-    temperature: float = 1.0
+    temperature: float = 1.0,
+    phase_callback=None,
 ) -> List[List[int]]:
     prompt_lens = [len(t) for t in prompt_tokens]
     assert max(prompt_lens) <= model.max_seq_len, f"Prompt length exceeds model maximum sequence length (max_seq_len={model.max_seq_len})"
@@ -191,15 +512,92 @@ def generate(
     tokens = torch.full((len(prompt_tokens), total_len), -1, dtype=torch.long)
     for i, t in enumerate(prompt_tokens):
         tokens[i, :len(t)] = torch.tensor(t, dtype=torch.long)
+
+    # Optional torch.profiler tracing of a single decode step. Triggered by
+    # DEEPSEEK_DECODE_PROFILE_DIR=<dir>; DEEPSEEK_DECODE_PROFILE_STEP picks
+    # which decode step (1-indexed; default 2 to skip warmup) to capture.
+    decode_profile_dir = os.environ.get("DEEPSEEK_DECODE_PROFILE_DIR", "")
+    decode_profile_step = int(os.environ.get("DEEPSEEK_DECODE_PROFILE_STEP", "2") or "2")
+    decode_profile_rank = int(os.environ.get("DEEPSEEK_DECODE_PROFILE_RANK", "0") or "0")
+    decode_step_idx = 0
+    profiler_active = None  # holds the torch.profiler context manager when sampling.
     prev_pos = 0
     finished = torch.tensor([False] * len(prompt_tokens))
     prompt_mask = tokens != -1
+    prefill_time = 0.0
+    decode_time = 0.0
+    prefill_tokens = 0
+    decode_tokens = 0
     for cur_pos in range(min(prompt_lens), total_len):
-        logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+        phase = "prefill" if prev_pos == 0 else "decode"
+        if phase_callback is not None:
+            phase_callback(phase)
+        # Bump decode index up-front so profiler enable/disable logic is uniform.
+        if phase == "decode":
+            decode_step_idx += 1
+        # Optionally start torch.profiler around the chosen decode step.
+        rank_for_profile = dist.get_rank() if dist.is_initialized() else 0
+        capture_this = (
+            decode_profile_dir
+            and phase == "decode"
+            and decode_step_idx == decode_profile_step
+            and rank_for_profile == decode_profile_rank
+        )
+        if capture_this:
+            os.makedirs(decode_profile_dir, exist_ok=True)
+            torch.cuda.synchronize()
+            profiler_active = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=False,
+                with_stack=False,
+            )
+            profiler_active.__enter__()
+        step_start = time.perf_counter()
+        if temperature > 0:
+            logits = model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
+        else:
+            next_token = model.forward(tokens[:, prev_pos:cur_pos], prev_pos, return_next_token=True)
+            logits = None
+        step_time = time.perf_counter() - step_start
+        if capture_this and profiler_active is not None:
+            torch.cuda.synchronize()
+            profiler_active.__exit__(None, None, None)
+            trace_path = os.path.join(
+                decode_profile_dir,
+                f"decode_step{decode_step_idx}_rank{rank_for_profile}.json",
+            )
+            try:
+                profiler_active.export_chrome_trace(trace_path)
+                print(f"decode profile trace exported: {trace_path}", flush=True)
+            except Exception as exc:
+                print(f"decode profile export failed: {exc}", flush=True)
+            try:
+                summary = profiler_active.key_averages().table(
+                    sort_by="cuda_time_total", row_limit=20
+                )
+                summary_path = os.path.join(
+                    decode_profile_dir,
+                    f"decode_step{decode_step_idx}_rank{rank_for_profile}.summary.txt",
+                )
+                with open(summary_path, "w") as f:
+                    f.write(summary)
+            except Exception as exc:
+                print(f"decode profile summary failed: {exc}", flush=True)
+            profiler_active = None
+        generated_this_step = int((~prompt_mask[:, cur_pos]).sum().item())
+        if prev_pos == 0:
+            prefill_time += step_time
+            prefill_tokens += generated_this_step
+            if cur_pos + 1 < total_len and hasattr(model, "release_gpu_prefill_moe_cache"):
+                model.release_gpu_prefill_moe_cache()
+        else:
+            decode_time += step_time
+            decode_tokens += generated_this_step
         if temperature > 0:
             next_token = sample(logits, temperature)
-        else:
-            next_token = logits.argmax(dim=-1)
         next_token = torch.where(prompt_mask[:, cur_pos], tokens[:, cur_pos], next_token)
         tokens[:, cur_pos] = next_token
         finished |= torch.logical_and(~prompt_mask[:, cur_pos], next_token == eos_id)
@@ -213,7 +611,7 @@ def generate(
             toks = toks[:toks.index(eos_id)]
         toks.append(eos_id)
         completion_tokens.append(toks)
-    return completion_tokens
+    return completion_tokens, prefill_time, decode_time, prefill_tokens, decode_tokens
 
 
 def main(
@@ -224,6 +622,8 @@ def main(
     max_new_tokens: int = 100,
     temperature: float = 1.0,
     routed_experts_device: str = "gpu",
+    pd_mode: str = "off",
+    pd_prefill_chunk_tokens: int = 0,
 ) -> None:
     world_size = int(os.getenv("WORLD_SIZE", "1"))
     rank = int(os.getenv("RANK", "0"))
@@ -237,13 +637,33 @@ def main(
     torch.cuda.memory._set_allocator_settings("expandable_segments:True")
     torch.set_default_dtype(torch.bfloat16)
     if routed_experts_device == "cpu":
-        import cpu_routed_backend
-        affinity_cpus = _cpu_affinity_for_rank(local_rank, world_size)
+        omp_threads_env = os.getenv("DEEPSEEK_CPU_OMP_THREADS")
+        omp_threads = int(omp_threads_env) if omp_threads_env else None
+        use_affinity = os.getenv("DEEPSEEK_CPU_AFFINITY", "1").lower() not in {"0", "false", "no"}
+        rank0_server = os.getenv("DEEPSEEK_CPU_MOE_RANK0_SERVER", "0").lower() in {"1", "true", "yes"}
+        inproc_server = os.getenv("DEEPSEEK_CPU_MOE_INPROC_SERVER", "0").lower() in {"1", "true", "yes"}
+        centralized_cpu_server = rank0_server or inproc_server
+        server_omp_threads_env = os.getenv("DEEPSEEK_CPU_MOE_SERVER_OMP_THREADS")
+        nonserver_omp_threads = int(os.getenv("DEEPSEEK_CPU_MOE_NONSERVER_OMP_THREADS", "1"))
+        affinity_cpus = None if (centralized_cpu_server and rank == 0) else (_cpu_affinity_for_rank(local_rank, world_size) if use_affinity else None)
         if affinity_cpus is not None:
             os.sched_setaffinity(0, affinity_cpus)
-            cpu_routed_backend.configure_cpu_routed_runtime(omp_threads=max(len(affinity_cpus), 1))
+            cpu_threads = omp_threads or max(len(affinity_cpus), 1)
         else:
-            cpu_routed_backend.configure_cpu_routed_runtime(omp_threads=max((os.cpu_count() or 1) // world_size, 1))
+            if centralized_cpu_server and rank == 0:
+                cpu_threads = omp_threads or int(server_omp_threads_env or "22")
+            elif inproc_server:
+                cpu_threads = omp_threads or max(nonserver_omp_threads, 1)
+            else:
+                cpu_threads = omp_threads or max((os.cpu_count() or 1) // world_size, 1)
+        os.environ["OMP_NUM_THREADS"] = str(cpu_threads)
+        os.environ.setdefault("OMP_DYNAMIC", "FALSE")
+        if centralized_cpu_server and rank == 0:
+            os.environ.setdefault("OMP_PROC_BIND", "spread")
+        else:
+            os.environ.setdefault("OMP_PROC_BIND", "close")
+        import cpu_routed_backend
+        cpu_routed_backend.configure_cpu_routed_runtime(omp_threads=cpu_threads)
         torch.set_num_threads(1)
     else:
         torch.set_num_threads(8)
@@ -255,23 +675,50 @@ def main(
     if interactive:
         args.max_batch_size = 1
     print(args)
+    shared_cpu_moe_arena = None
+    init_start = time.perf_counter()
     with torch.device("cuda"):
         model = Transformer(args)
+    if routed_experts_device == "cpu" and SharedCPUMoEWeightArena.enabled():
+        if os.getenv("DEEPSEEK_CPU_MOE_SHARED_WEIGHT_NUMA_INTERLEAVE", "0").lower() in {"1", "true", "yes"}:
+            _enable_numa_interleave()
+        shared_root_dir = SharedCPUMoEWeightArena.root_dir_from_env()
+        if not shared_root_dir:
+            raise RuntimeError("DEEPSEEK_CPU_MOE_SHARED_WEIGHTS=1 requires DEEPSEEK_CPU_MOE_SHARED_WEIGHT_DIR")
+        shared_cpu_moe_arena = _bind_shared_cpu_moe_weights(model, shared_root_dir, args, world_size, rank)
     tokenizer = AutoTokenizer.from_pretrained(ckpt_path)
+    print(f"init time: {time.perf_counter() - init_start:.3f}s", flush=True)
     print("load model")
-    mp_ckpt_paths = [
-        os.path.join(ckpt_path, f"model-{rank + 1:05d}-of-{world_size:05d}.safetensors"),
-        os.path.join(ckpt_path, f"model{rank}-mp{world_size}.safetensors"),
-    ]
-    mp_ckpt_path = next((path for path in mp_ckpt_paths if os.path.exists(path)), None)
-    if mp_ckpt_path is not None:
-        load_model(model, mp_ckpt_path, strict=False)
-    else:
-        load_original_hf_model(model, ckpt_path, world_size, rank)
+    load_start = time.perf_counter()
+    load_original_hf_model(model, ckpt_path, world_size, rank)
     if routed_experts_device == "cpu":
         model.prepare_cpu_expert_int8()
+        if shared_cpu_moe_arena is not None:
+            shared_cpu_moe_arena.mark_ready()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    print(f"load time: {time.perf_counter() - load_start:.3f}s", flush=True)
     torch.set_default_device("cuda")
     print("I'm DeepSeek 👋")
+
+    pd_scheduler_obj = None
+    if pd_mode == "scheduler":
+        from pd_scheduler import PDScheduler
+        pd_scheduler_obj = PDScheduler()
+
+    def _run_generate(prompt_token_lists):
+        if pd_scheduler_obj is None:
+            return generate(model, prompt_token_lists, max_new_tokens, tokenizer.eos_token_id, temperature)
+        from pd_scheduler import run_single_request
+        return run_single_request(
+            generate,
+            model,
+            prompt_token_lists,
+            max_new_tokens,
+            tokenizer.eos_token_id,
+            temperature,
+            scheduler=pd_scheduler_obj,
+        )
 
     if interactive:
         messages = []
@@ -293,15 +740,23 @@ def main(
                 continue
             messages.append({"role": "user", "content": prompt})
             prompt_tokens = tokenizer.encode(encode_messages(messages, thinking_mode="chat"))
-            completion_tokens = generate(model, [prompt_tokens], max_new_tokens, tokenizer.eos_token_id, temperature)
+            completion_tokens, prefill_time, decode_time, _prefill_tokens, _decode_tokens = _run_generate([prompt_tokens])
             completion = tokenizer.decode(completion_tokens[0])
             print(completion)
             messages.append(parse_message_from_completion_text(completion, thinking_mode="chat"))
     else:
         with open(input_file) as f:
-            prompts = f.read().split("\n\n")
+            text = f.read().strip()
+            prompts = text.split("\n\n") if "\n\n" in text else [text]
         prompt_tokens = [tokenizer.encode(encode_messages([{"role": "user", "content": prompt}], thinking_mode="chat")) for prompt in prompts]
-        completion_tokens = generate(model, prompt_tokens, max_new_tokens, tokenizer.eos_token_id, temperature)
+        gen_start = time.perf_counter()
+        completion_tokens, prefill_time, decode_time, prefill_tokens, decode_tokens = _run_generate(prompt_tokens)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        gen_time = time.perf_counter() - gen_start
+        gen_tokens = sum(len(tokens) for tokens in completion_tokens)
+        print(f"generate time: {gen_time:.3f}s, tokens: {gen_tokens}, tokens/s: {gen_tokens / max(gen_time, 1e-9):.3f}", flush=True)
+        print(f"prefill time: {prefill_time:.3f}s, prefill tokens: {prefill_tokens}, decode time: {decode_time:.3f}s, decode tokens: {decode_tokens}, decode tokens/s: {decode_tokens / max(decode_time, 1e-9):.3f}", flush=True)
         completions = tokenizer.batch_decode(completion_tokens)
         for prompt, completion in zip(prompts, completions):
             print("Prompt:", prompt)
@@ -310,6 +765,8 @@ def main(
 
     if world_size > 1:
         dist.destroy_process_group()
+    if shared_cpu_moe_arena is not None:
+        shared_cpu_moe_arena.close(unlink=True)
 
 
 if __name__ == "__main__":
@@ -321,6 +778,8 @@ if __name__ == "__main__":
     parser.add_argument("--max-new-tokens", type=int, default=300)
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--routed-experts-device", type=str, choices=["gpu", "cpu"], default="gpu")
+    parser.add_argument("--pd-mode", type=str, choices=["off", "scheduler"], default="off")
+    parser.add_argument("--pd-prefill-chunk-tokens", type=int, default=0)
     args = parser.parse_args()
     assert args.input_file or args.interactive, "Either input-file or interactive mode must be specified"
-    main(args.ckpt_path, args.config, args.input_file, args.interactive, args.max_new_tokens, args.temperature, args.routed_experts_device)
+    main(args.ckpt_path, args.config, args.input_file, args.interactive, args.max_new_tokens, args.temperature, args.routed_experts_device, args.pd_mode, args.pd_prefill_chunk_tokens)

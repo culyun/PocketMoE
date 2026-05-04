@@ -1,168 +1,167 @@
+import json
 import os
 import shutil
 from argparse import ArgumentParser
-from glob import glob
-from tqdm import tqdm, trange
 
 import torch
 from safetensors.torch import safe_open, save_file
+from tqdm import tqdm
 
 
 FP4_TABLE = torch.tensor([
     0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-    0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0
+    0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ], dtype=torch.float32)
 
 
-def cast_e2m1fn_to_e4m3fn(x: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Casts a tensor from e2m1fn to e4m3fn losslessly.
-    """
-    assert x.dtype == torch.int8
-    assert x.ndim == 2
-    out_dim, in_dim = x.size()
-    in_dim *= 2
-    fp8_block_size = 128
+def dequant_e2m1fn(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    assert weight.dtype == torch.int8
+    assert weight.ndim == 2
+    out_dim, packed_in_dim = weight.shape
+    in_dim = packed_in_dim * 2
     fp4_block_size = 32
-    assert in_dim % fp8_block_size == 0 and out_dim % fp8_block_size == 0
-    assert scale.size(0) == out_dim and scale.size(1) == in_dim // fp4_block_size
+    assert scale.shape == (out_dim, in_dim // fp4_block_size)
 
-    x = x.view(torch.uint8)
-    low  = x & 0x0F
-    high = (x >> 4) & 0x0F
-    x = torch.stack([FP4_TABLE[low.long()], FP4_TABLE[high.long()]], dim=-1).flatten(2)
-
-    # max_fp4 (6.0) * MAX_OFFSET must fit in e4m3fn (max 448)
-    # 6.0 * 2^6 = 384 < 448; 6.0 * 2^7 = 768 > 448; so MAX_OFFSET_BITS = 6
-    MAX_OFFSET_BITS = 6
-
-    bOut = out_dim // fp8_block_size
-    bIn = in_dim // fp8_block_size
-    # bOut, bIn, 128, 128
-    x = x.view(bOut, fp8_block_size, bIn, fp8_block_size).transpose(1, 2)
-    # bOut, bIn, 128*4
-    scale = scale.float().view(bOut, fp8_block_size, bIn, -1).transpose(1, 2).flatten(2)
-    ## bOut, bIn, 1
-    scale_max_offset_bits = scale.amax(dim=-1, keepdim=True) / (2**MAX_OFFSET_BITS)
-    # bOut, bIn, 128*4
-    offset = scale / scale_max_offset_bits
-    # bOut, bIn, 128, 128
-    offset = offset.unflatten(-1, (fp8_block_size, -1)).repeat_interleave(fp4_block_size, dim=-1)
-    x = (x * offset).transpose(1, 2).reshape(out_dim, in_dim)
-    return x.to(torch.float8_e4m3fn), scale_max_offset_bits.squeeze(-1).to(torch.float8_e8m0fnu)
+    raw = weight.view(torch.uint8)
+    low = raw & 0x0F
+    high = (raw >> 4) & 0x0F
+    weight = torch.stack([FP4_TABLE[low.long()], FP4_TABLE[high.long()]], dim=-1).flatten(1)
+    scale = scale.float().repeat_interleave(fp4_block_size, dim=1)
+    return weight * scale
 
 
-mapping = {
-    "embed_tokens": ("embed", 0),
-    "input_layernorm": ("attn_norm", None),
-    "post_attention_layernorm": ("ffn_norm", None),
-    "q_proj": ("wq", 0),
-    "q_a_proj": ("wq_a", None),
-    "q_a_layernorm": ("q_norm", None),
-    "q_b_proj": ("wq_b", 0),
-    "kv_a_proj_with_mqa": ("wkv_a", None),
-    "kv_a_layernorm": ("kv_norm", None),
-    "kv_b_proj": ("wkv_b", 0),
-    "o_proj": ("wo", 1),
-    "gate_proj": ("w1", 0),
-    "down_proj": ("w2", 1),
-    "up_proj": ("w3", 0),
-    "lm_head": ("head", 0),
-
-    "embed": ("embed", 0),
-    "wq_b": ("wq_b", 0),
-    "wo_a": ("wo_a", 0),
-    "wo_b": ("wo_b", 1),
-    "head": ("head", 0),
-    "attn_sink": ("attn_sink", 0),
-    "weights_proj": ("weights_proj", 0),
-}
+def dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    assert weight.dtype == torch.float8_e4m3fn
+    scale = scale.float().repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+    scale = scale[:weight.shape[0], :weight.shape[1]]
+    return weight.float() * scale
 
 
-def main(hf_ckpt_path, save_path, n_experts, mp, expert_dtype):
-    """
-    Converts and saves model checkpoint files into a specified format.
+def quantize_int8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    weight = weight.float().contiguous()
+    scale = weight.abs().amax(dim=1).clamp_min(1e-6) / 127.0
+    weight = torch.clamp(torch.round(weight / scale.unsqueeze(1)), -127, 127).to(torch.int8)
+    return weight.contiguous(), scale.float().contiguous()
 
-    Args:
-        hf_ckpt_path (str): Path to the directory containing the input checkpoint files.
-        save_path (str): Path to the directory where the converted checkpoint files will be saved.
-        n_experts (int): Total number of experts in the model.
-        mp (int): Model parallelism factor.
-        
-    Returns:
-        None
-    """
-    torch.set_num_threads(8)
-    n_local_experts = n_experts // mp
-    state_dicts = [{} for _ in range(mp)]
 
-    for file_path in tqdm(glob(os.path.join(hf_ckpt_path, "*.safetensors"))):
-        with safe_open(file_path, framework="pt", device="cpu") as f:
-            for name in f.keys():
-                param: torch.Tensor = f.get_tensor(name)
-                if name.startswith("model."):
-                    name = name[len("model."):]
-                if name.startswith("mtp.") and ("emb" in name or name.endswith("head.weight")):
-                    continue
-                name = name.replace("self_attn", "attn")
-                name = name.replace("mlp", "ffn")
-                name = name.replace("weight_scale_inv", "scale")
-                name = name.replace("e_score_correction_bias", "bias")
-                if any(x in name for x in ["hc", "attn_sink", "tie2eid", "ape"]):    # without .weight
-                    key = name.split(".")[-1]
-                else:
-                    key = name.split(".")[-2]
-                if key in mapping:
-                    new_key, dim = mapping[key]
-                else:
-                    new_key, dim = key, None
-                name = name.replace(key, new_key)
-                for i in range(mp):
-                    new_param = param
-                    if "experts" in name and "shared_experts" not in name:
-                        idx = int(name.split(".")[-3])
-                        if idx < i * n_local_experts or idx >= (i + 1) * n_local_experts:
-                            continue
-                    elif dim is not None:
-                        assert param.size(dim) % mp == 0, f"Dimension {dim} must be divisible by {mp}"
-                        shard_size = param.size(dim) // mp
-                        new_param = param.narrow(dim, i * shard_size, shard_size).contiguous()
-                    state_dicts[i][name] = new_param
+def convert_routed_expert(weight: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if scale.ndim == 1:
+        return weight.contiguous(), scale.float().contiguous()
+    return quantize_int8_weight(dequant_e2m1fn(weight, scale))
 
+
+# Modelslim's V4-Flash W8A8 policy (from lab_practice/deepseek_v4/deepseek_w8a8.yaml):
+#
+# INCLUDE (quantize to INT8):
+#   *attn* except wo_a, wo_b, compressor.wgate, compressor.wkv,
+#           indexer.weights_proj, indexer.compressor.wgate, indexer.compressor.wkv
+#   *ffn*  except gate
+#
+# So quantized: wq_a, wq_b, wkv, experts.w1/w2/w3, shared_experts.w1/w2/w3
+# NOT quantized: wo_a, wo_b, gate, lm_head, embed, compressor.*, indexer.specials
+#
+
+_ATTN_QUANTIZED_PROJECTIONS = (".wq_a.", ".wq_b.", ".wkv.")
+_ATTN_EXCLUDED_PROJECTIONS = (".wo_a.", ".wo_b.",
+                              ".compressor.wgate.", ".compressor.wkv.",
+                              ".indexer.weights_proj.",
+                              ".indexer.compressor.wgate.", ".indexer.compressor.wkv.")
+_FFN_EXCLUDED = (".gate.",)
+
+
+def should_convert_int8(name: str, tensor: torch.Tensor) -> bool:
+    if not name.endswith(".weight"):
+        return False
+
+    # Routed experts: INT8 in → INT8 out (already quantized upstream)
+    if "ffn.experts." in name and "shared_experts" not in name:
+        return tensor.dtype == torch.int8
+
+    # Shared experts w1/w2/w3: FP8 → INT8
+    if "ffn.shared_experts." in name:
+        if any(ex in name for ex in _FFN_EXCLUDED):
+            return False
+        return tensor.dtype == torch.float8_e4m3fn
+
+    # Attention: only wq_a, wq_b, wkv → INT8; wo_a, wo_b, compressor, indexer specials excluded
+    if ".attn." in name:
+        if any(exc in name for exc in _ATTN_EXCLUDED_PROJECTIONS):
+            return False
+        if any(proj in name for proj in _ATTN_QUANTIZED_PROJECTIONS):
+            return tensor.dtype == torch.float8_e4m3fn
+        return False
+
+    return False
+
+
+def convert_weight(name: str, weight: torch.Tensor, scale: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if "ffn.experts." in name and "shared_experts" not in name:
+        return convert_routed_expert(weight, scale)
+    return quantize_int8_weight(dequant_fp8(weight, scale))
+
+
+def copy_auxiliary_files(hf_ckpt_path: str, save_path: str) -> None:
+    for file_name in [
+        "config.json",
+        "configuration.json",
+        "generation_config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ]:
+        src = os.path.join(hf_ckpt_path, file_name)
+        dst = os.path.join(save_path, file_name)
+        if os.path.exists(src):
+            shutil.copyfile(src, dst)
+
+
+def convert(hf_ckpt_path: str, save_path: str) -> None:
+    index_path = os.path.join(hf_ckpt_path, "model.safetensors.index.json")
+    with open(index_path) as f:
+        index_data = json.load(f)
+
+    weight_map = index_data["weight_map"]
+    file_names = sorted(dict.fromkeys(weight_map.values()))
     os.makedirs(save_path, exist_ok=True)
 
-    for i in trange(mp):
-        names = list(state_dicts[i].keys())
-        for name in names:
-            if name.endswith("wo_a.weight"):
-                weight = state_dicts[i][name]
-                scale = state_dicts[i].pop(name.replace("weight", "scale"))
-                weight = weight.unflatten(0, (-1, 128)).unflatten(-1, (-1, 128)).float() * scale[:, None, :, None].float()
-                state_dicts[i][name] = weight.flatten(2, 3).flatten(0, 1).bfloat16()
-            elif "experts" in name and state_dicts[i][name].dtype == torch.int8:
-                if expert_dtype == "fp8":
-                    scale_name = name.replace("weight", "scale")
-                    weight = state_dicts[i].pop(name)
-                    scale = state_dicts[i].pop(scale_name)
-                    state_dicts[i][name], state_dicts[i][scale_name] = cast_e2m1fn_to_e4m3fn(weight, scale)
-                else:
-                    state_dicts[i][name] = state_dicts[i][name].view(torch.float4_e2m1fn_x2)
-        save_file(state_dicts[i], os.path.join(save_path, f"model-{i + 1:05d}-of-{mp:05d}.safetensors"))
+    total_size = 0
+    for file_name in tqdm(file_names):
+        src = os.path.join(hf_ckpt_path, file_name)
+        dst = os.path.join(save_path, file_name)
+        state_dict = {}
+        consumed = set()
 
-    for file in ["tokenizer.json", "tokenizer_config.json"]:
-        old_file_path = os.path.join(hf_ckpt_path, file)
-        new_file_path = os.path.join(save_path, file)
-        if os.path.exists(old_file_path):
-            shutil.copyfile(old_file_path, new_file_path)
+        with safe_open(src, framework="pt", device="cpu") as f:
+            for name in f.keys():
+                if name in consumed:
+                    continue
+
+                tensor = f.get_tensor(name)
+                if should_convert_int8(name, tensor):
+                    scale_name = name.replace(".weight", ".scale")
+                    scale = f.get_tensor(scale_name)
+                    tensor, scale = convert_weight(name, tensor, scale)
+                    state_dict[name] = tensor
+                    state_dict[scale_name] = scale
+                    consumed.add(scale_name)
+                elif name.endswith(".scale") and name.replace(".scale", ".weight") in consumed:
+                    continue
+                else:
+                    state_dict[name] = tensor
+
+        save_file(state_dict, dst)
+        total_size += sum(t.numel() * t.element_size() for t in state_dict.values())
+
+    index_data["metadata"] = {"total_size": total_size}
+    with open(os.path.join(save_path, "model.safetensors.index.json"), "w") as f:
+        json.dump(index_data, f, indent=2)
+        f.write("\n")
+
+    copy_auxiliary_files(hf_ckpt_path, save_path)
 
 
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--hf-ckpt-path", type=str, required=True)
     parser.add_argument("--save-path", type=str, required=True)
-    parser.add_argument("--n-experts", type=int, required=True)
-    parser.add_argument("--model-parallel", type=int, required=True)
-    parser.add_argument("--expert-dtype", type=str, choices=["fp8", "fp4"], required=False, default=None)
     args = parser.parse_args()
-    assert args.n_experts % args.model_parallel == 0, "Number of experts must be divisible by model parallelism"
-    main(args.hf_ckpt_path, args.save_path, args.n_experts, args.model_parallel, args.expert_dtype)
+    convert(args.hf_ckpt_path, args.save_path)

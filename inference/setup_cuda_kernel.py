@@ -8,14 +8,15 @@ ROOT = Path(__file__).resolve().parent
 os.chdir(ROOT)
 
 setup(
-    name="wo_a_cuda_ext",
+    name="cuda_kernel",
     ext_modules=[
         CUDAExtension(
-            name="wo_a_cuda_ext",
+            name="cuda_kernel",
             sources=[
-                str(ROOT / "wo_a_cuda_ext.cpp"),
-                str(ROOT / "wo_a_cuda_kernel.cu"),
+                str(ROOT / "cuda_kernel.cpp"),
+                str(ROOT / "cuda_kernel_impl.cu"),
             ],
+            libraries=["cublas"],
             extra_compile_args={
                 "cxx": ["-O3"],
                 "nvcc": ["-O3", "--use_fast_math", "-lineinfo"],
