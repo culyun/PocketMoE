@@ -49,6 +49,27 @@
 #    model.py:Attention.forward (call sites + freqs cache).
 #    Enable: DEEPSEEK_FUSED_ATTN_PREFUSE=1 (default off until shipped).
 #    Validate kernels alone: python test_fused_attn_prefuse.py
+# 6. Async CPU MoE / shared-expert overlap (Plan A-overlap).
+#    DEEPSEEK_CPU_DECODE_INLINE_THRESHOLD default flipped 1 -> 0 so that
+#    submit_forward dispatches OMP work to the worker thread (default
+#    ThreadPoolExecutor) instead of running it inline on the calling thread.
+#    The Python flow then immediately calls self.shared_experts(x), which
+#    launches its INT8 GEMMs on the GPU while OMP grinds the routed experts
+#    on CPU. The async_allreduce path already issues sync_forward on the
+#    side-stream, so this just unblocks the submit -> shared sequence.
+#    DEEPSEEK_BENCH_GOVERNOR_PIN=1, all four cases:
+#      short_short  2.099 -> 2.424 TPS  (+15.5%)
+#      short_long   1.800 -> 2.466 TPS  (+37.0%)
+#      long_short   1.720 -> 2.366 TPS  (+37.6%)
+#      long_long    2.057 -> 2.378 TPS  (+15.4%)
+#    Sustained over 3 long_long runs ({2.417, 2.370, 2.392}, mean 2.393,
+#    sigma <1%). Greedy outputs are well-formed Chinese summaries (slightly
+#    different wording from baseline because submit_forward now starts on
+#    a different stream timing, but content is consistent).
+#    Disable: DEEPSEEK_CPU_DECODE_INLINE_THRESHOLD=1 (revert to inline).
+#    Persistent worker (DEEPSEEK_CPU_PERSISTENT_WORKER=1) was tested
+#    too — 2.276 TPS, slightly slower than the executor path because of the
+#    extra condition-variable handshake; left at default off.
 #
 # Tried but NOT adopted (rationale documented so we do not retry blindly):
 # - pmaddubsw sign-trick rewrite of dot_i8_avx2 / dot_i8_avx2_pair.
@@ -106,16 +127,21 @@
 #
 #
 # Reference numbers (4x RTX 2080 Ti, /tmp/dsv4_long_input_single.txt ~2k tokens,
-# arena ON + thread_local kernel + OMP=12 + fused attn prefuse,
+# arena ON + thread_local kernel + OMP=12 + fused attn prefuse + async overlap,
 # generate.py max_new=64 unless noted):
 #   schedutil governor (default):
-#     long/long  decode 1.63-1.85 TPS (high run-to-run jitter)
-#   performance governor (DEEPSEEK_BENCH_GOVERNOR_PIN=1):
+#     long/long  decode 1.63-1.85 TPS (high run-to-run jitter, pre-overlap)
+#   performance governor (DEEPSEEK_BENCH_GOVERNOR_PIN=1) WITH async overlap:
+#     short/short  prefill 2.07s   decode 2.42 TPS  (7 decoded tokens)
+#     short/long   prefill 2.18s   decode 2.47 TPS  (9 decoded tokens)
+#     long/short   prefill 11.33s  decode 2.37 TPS  (7 decoded tokens)
+#     long/long    prefill 11.36s  decode 2.38 TPS  (63 decoded tokens, sustained)
+#   performance governor pre-overlap (kept for delta tracking):
 #     long/long  decode 2.03-2.10 TPS  (steady)
-#   short/short  prefill 5.62s   decode 2.10 TPS  (7 decoded tokens)
-#   short/long   prefill 3.63s   decode 1.80 TPS  (9 decoded tokens, pre-prefuse)
-#   long/short   prefill 13.02s  decode 1.72 TPS  (7 decoded tokens, pre-prefuse)
-#   long/long    prefill 14.5s   decode 2.06 TPS  (63 decoded tokens, sustained)
+#     short/short  prefill 5.62s   decode 2.10 TPS  (7 decoded tokens)
+#     short/long   prefill 3.63s   decode 1.80 TPS  (9 decoded tokens)
+#     long/short   prefill 13.02s  decode 1.72 TPS  (7 decoded tokens)
+#     long/long    prefill 14.5s   decode 2.06 TPS  (63 decoded tokens)
 set -eo pipefail
 
 ROOT="/mnt/data1/dsv4_inference/inference"
@@ -245,7 +271,7 @@ export_best_env() {
   export DEEPSEEK_FLASHINFER_STYLE_ATTN_CUDA=1
   export DEEPSEEK_FUSED_C4_INDEXER_CUDA=1
   export DEEPSEEK_HC_PRE_CUDA=1
-  export DEEPSEEK_CPU_DECODE_INLINE_THRESHOLD="${DEEPSEEK_CPU_DECODE_INLINE_THRESHOLD:-1}"
+  export DEEPSEEK_CPU_DECODE_INLINE_THRESHOLD="${DEEPSEEK_CPU_DECODE_INLINE_THRESHOLD:-0}"
   export DEEPSEEK_CPU_TOPK_PERSISTENT="${DEEPSEEK_CPU_TOPK_PERSISTENT:-1}"
   export DEEPSEEK_PD_DECODE_OMP_THREADS="${DEEPSEEK_PD_DECODE_OMP_THREADS:-12}"
   export DEEPSEEK_FUSED_ATTN_PREFUSE="${DEEPSEEK_FUSED_ATTN_PREFUSE:-1}"
