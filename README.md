@@ -246,6 +246,10 @@ Troubleshooting:
 - [ ] Try speculative decoding with a pruned draft model.
 - [ ] Try 1M context support.
 
+## Friendly links
+
+- [linux.do](https://linux.do/)
+
 ## Acknowledgement
 
 This project builds on DeepSeek-V4-Flash model assets and the surrounding open-source PyTorch, CUDA, safetensors, and transformers ecosystem. The service/runtime organization and performance scripts in this repository are engineering work for deploying and benchmarking the standalone inference path.

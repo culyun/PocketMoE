@@ -247,6 +247,10 @@ PYTHONPATH=$PWD python tests/test_encoding_dsv4.py
 - [ ] 尝试使用裁剪模型做投机推理。
 - [ ] 尝试 1M 上下文支持。
 
+## 友情链接
+
+- [linux.do](https://linux.do/)
+
 ## Acknowledgement
 
 本项目基于 DeepSeek-V4-Flash 模型资产，以及 PyTorch、CUDA、safetensors、transformers 等开源生态。仓库中的服务化组织、运行时整理和性能脚本主要用于部署、验证和 benchmark standalone inference 路径。
