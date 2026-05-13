@@ -25,6 +25,7 @@ setup(
         "src",
         "src.cli",
         "src.encoding",
+        "src.gguf",
         "src.kernels",
         "src.moe",
         "src.runtime",

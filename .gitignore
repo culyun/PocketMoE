@@ -253,3 +253,5 @@ outputs/
 # Local runtime artifacts
 .tmp/
 checkpoints/
+*.gguf
+gguf_hfd/
