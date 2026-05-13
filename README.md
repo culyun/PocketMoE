@@ -44,8 +44,9 @@ Best currently validated path:
 
 - Routed MoE expert weights live on CPU.
 - Decode uses active routed-expert H2D staging and GPU MoE compute.
-- Cross-layer MoE prefetch predicts the next layer's local experts and overlaps their H2D staging with current-layer work.
-- Shared experts use INT8 GPU kernels.
+- Decode keeps cross-layer MoE prefetch disabled by default because the latest long-prompt A/B is faster without it.
+- Shared experts use paired INT8 GPU kernels and the PD shared-expert FP16 path.
+- Sparse attention, C4 indexer, custom MoE finalize, async all-reduce, and HC pre/post CUDA kernels are enabled in the optimized FP4 resident path.
 - Logical PD scheduler is enabled.
 - OpenAI service uses the same default optimized environment as the best scheduler script.
 
@@ -54,8 +55,8 @@ Representative benchmark results on this machine:
 | Scenario | Prompt / prefill tokens | Decode tokens | Prefill | Decode TPS | Notes |
 | --- | ---: | ---: | ---: | ---: | --- |
 | Maximum validated context | 65,536 | 2 | 257.45s (~255 tok/s) | n/a | OpenAI path, content check returned `OK`. |
-| Long prompt decode | 2,148 | 63 | 7.85s (~274 tok/s) | 2.66 tok/s | 2K prompt, pre-cross-layer-prefetch reference. |
-| Current decode best | 29 | 127 | ~1.7-3.2s observed | 3.16 tok/s mean | OpenAI path, K10/local-limit2 cross-layer prefetch, 3 fresh runs: 3.135/3.168/3.170 tok/s. |
+| Long prompt decode | 2,148 | 63 | 6.69s (~321 tok/s after warmup) | 3.49 tok/s mean | FP4 resident OpenAI path, `scripts/run_fp4_resident_best.sh`, 3 fresh runs: 3.464/3.500/3.507 tok/s. |
+| Short prompt decode | 29 | 127 | ~1.7-3.2s observed | 3.16 tok/s mean | Earlier OpenAI short-prompt reference; short prefill timing is noisier than the long-prompt case. |
 
 The runtime has validated 65,536-token prompts on this 4 x RTX 2080 Ti machine. The server script keeps `MAX_MODEL_LEN=4096` by default for normal serving; set `MAX_MODEL_LEN=65536` explicitly when testing the maximum context path. Short prefill numbers are noisy on this machine, so compare decode TPS and long-prompt cases when evaluating optimization changes.
 
@@ -91,6 +92,11 @@ Useful runtime environment variables:
 | `MASTER_PORT` | script-specific | Torch distributed rendezvous port. |
 | `NPROC_PER_NODE` | `4` | Number of local ranks / GPUs. |
 | `DSV4_TMP_DIR` | `.tmp` | Temporary benchmark and generated prompt directory. |
+| `CKPT_FORMAT` | `auto` | Checkpoint format passed to the server: `auto`, `safetensors`, or `gguf`. |
+| `TOKENIZER_PATH` | unset | Required for GGUF checkpoints; optional tokenizer override for other formats. |
+| `PARTITION_POLICY` | `legacy` | Runtime placement policy: `legacy`, `baseline_4gpu`, or `layer_pp_4gpu`. |
+| `SERVING_PROFILE` | `safe1` | Serving admission profile: `safe1`, `latency2`, or `throughput4`. |
+| `DEEPSEEK_GPU_MOE_CROSS_LAYER_PREFETCH` | `0` | Cross-layer decode MoE prefetch; default is off for the current long-prompt best path. |
 
 ## How to run
 
@@ -163,7 +169,19 @@ NPROC_PER_NODE=4 \
 bash scripts/run_openai_server.sh
 ```
 
-### 6. Call the API
+### 6. Optional GGUF Q2 layer-pipeline run
+
+The runtime can also load the IQ2/Q2 GGUF checkpoint path used during development. Keep the GGUF file outside git, provide the tokenizer directory separately, and launch the layer-pipeline script:
+
+```bash
+CKPT_PATH=/path/to/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf \
+TOKENIZER_PATH=/path/to/DeepSeek-V4-Flash-tokenizer \
+bash scripts/run_gguf_q2_layer_pp.sh
+```
+
+The OpenAI server path also accepts `--ckpt-format gguf --tokenizer-path /path/to/tokenizer` when launched manually.
+
+### 7. Call the API
 
 Health check:
 
