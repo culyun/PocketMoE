@@ -298,6 +298,20 @@ Troubleshooting:
 - [ ] Try speculative decoding with a pruned draft model.
 - [ ] Try 1M context support.
 
+## License
+
+This repository's code is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
+
+Permitted uses include personal use, academic research, education, non-commercial benchmarking, and non-commercial deployment.
+Commercial use is not permitted without separate written permission from the copyright holder, including but not limited to:
+
+- selling hosted inference services based on this code;
+- selling packaged deployments or appliances;
+- selling hardware/software bundles using this code;
+- using this code in paid consulting deliverables or commercial products.
+
+Model weights, tokenizer files, and third-party dependencies are governed by their respective licenses. This repository's code license does not grant any additional rights to DeepSeek model assets or other third-party materials.
+
 ## Friendly links
 
 - [linux.do](https://linux.do/)

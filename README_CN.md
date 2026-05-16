@@ -299,6 +299,20 @@ PYTHONPATH=$PWD python tests/test_encoding_dsv4.py
 - [ ] 尝试使用裁剪模型做投机推理。
 - [ ] 尝试 1M 上下文支持。
 
+## License
+
+本仓库代码采用 [PolyForm Noncommercial License 1.0.0](LICENSE)。
+
+允许个人使用、学术研究、教学、非商业评测和非商业部署。
+未经版权所有者另行书面授权，不允许商业使用，包括但不限于：
+
+- 基于本代码销售托管推理服务；
+- 销售打包部署方案或一体机；
+- 将本代码用于硬件/软件捆绑销售；
+- 将本代码用于付费咨询交付物或商业产品。
+
+模型权重、tokenizer 文件和第三方依赖遵循其各自许可证。本仓库代码许可证不会授予 DeepSeek 模型资产或其它第三方材料的额外权利。
+
 ## 友情链接
 
 - [linux.do](https://linux.do/)
