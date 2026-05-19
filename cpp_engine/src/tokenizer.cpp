@@ -2,7 +2,9 @@
 
 #include "json_lite.hpp"
 
+#include <algorithm>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
@@ -37,6 +39,45 @@ std::string replace_all(std::string s, const std::string& from, const std::strin
     return s;
 }
 
+std::string utf8_codepoint(uint32_t cp) {
+    std::string out;
+    if (cp <= 0x7f) {
+        out.push_back(static_cast<char>(cp));
+    } else if (cp <= 0x7ff) {
+        out.push_back(static_cast<char>(0xc0 | (cp >> 6)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    } else {
+        out.push_back(static_cast<char>(0xe0 | (cp >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+    }
+    return out;
+}
+
+std::vector<std::string> byte_alphabet() {
+    std::vector<uint32_t> bs;
+    for (uint32_t c = '!'; c <= '~'; ++c) bs.push_back(c);
+    for (uint32_t c = 0xA1; c <= 0xAC; ++c) bs.push_back(c);
+    for (uint32_t c = 0xAE; c <= 0xFF; ++c) bs.push_back(c);
+    std::vector<uint32_t> cs = bs;
+    uint32_t n = 0;
+    for (uint32_t b = 0; b < 256; ++b) {
+        if (std::find(bs.begin(), bs.end(), b) == bs.end()) {
+            bs.push_back(b);
+            cs.push_back(256 + n++);
+        }
+    }
+    std::vector<std::string> out(256);
+    for (size_t i = 0; i < bs.size(); ++i) out[bs[i]] = utf8_codepoint(cs[i]);
+    return out;
+}
+
+std::pair<std::string, std::string> split_merge(const std::string& merge) {
+    const size_t pos = merge.find(' ');
+    if (pos == std::string::npos) throw std::runtime_error("bad BPE merge: " + merge);
+    return {merge.substr(0, pos), merge.substr(pos + 1)};
+}
+
 }  // namespace
 
 Tokenizer::Tokenizer(const std::string& ckpt_dir) {
@@ -45,14 +86,26 @@ Tokenizer::Tokenizer(const std::string& ckpt_dir) {
     const JsonObject& model = object_get(root, "model")->object();
     const JsonObject& vocab = object_get(model, "vocab")->object();
     for (const auto& [tok, id_value] : vocab) {
-        set_token(id_to_token_, json_u64(id_value), tok);
+        const uint64_t id = json_u64(id_value);
+        set_token(id_to_token_, id, tok);
+        token_to_id_[tok] = static_cast<int>(id);
+    }
+    if (const JsonValue* merges = object_get(model, "merges")) {
+        int rank = 0;
+        for (const JsonValue& item : merges->array()) {
+            merge_rank_[split_merge(item.string())] = rank++;
+        }
     }
     if (const JsonValue* added = object_get(root, "added_tokens")) {
         for (const JsonValue& item : added->array()) {
             const JsonObject& obj = item.object();
             const JsonValue* id = object_get(obj, "id");
             const JsonValue* content = object_get(obj, "content");
-            if (id != nullptr && content != nullptr) set_token(id_to_token_, json_u64(*id), content->string());
+            if (id != nullptr && content != nullptr) {
+                const uint64_t token_id = json_u64(*id);
+                set_token(id_to_token_, token_id, content->string());
+                token_to_id_[content->string()] = static_cast<int>(token_id);
+            }
         }
     }
 }
@@ -69,6 +122,35 @@ std::string Tokenizer::decode_piece(int id) const {
     s = replace_all(s, "▁", " ");
     s = replace_all(s, "Ċ", "\n");
     return s;
+}
+
+std::vector<int> Tokenizer::encode_basic(const std::string& text, bool add_bos) const {
+    static const std::vector<std::string> bytes = byte_alphabet();
+    std::vector<int> ids;
+    if (add_bos) ids.push_back(0);
+    std::vector<std::string> pieces;
+    pieces.reserve(text.size());
+    for (unsigned char c : text) pieces.push_back(bytes[c]);
+    while (pieces.size() > 1) {
+        int best_rank = std::numeric_limits<int>::max();
+        size_t best_pos = pieces.size();
+        for (size_t i = 0; i + 1 < pieces.size(); ++i) {
+            auto it = merge_rank_.find({pieces[i], pieces[i + 1]});
+            if (it != merge_rank_.end() && it->second < best_rank) {
+                best_rank = it->second;
+                best_pos = i;
+            }
+        }
+        if (best_pos == pieces.size()) break;
+        pieces[best_pos] += pieces[best_pos + 1];
+        pieces.erase(pieces.begin() + static_cast<long>(best_pos + 1));
+    }
+    for (const auto& piece : pieces) {
+        auto it = token_to_id_.find(piece);
+        if (it == token_to_id_.end()) throw std::runtime_error("BPE piece missing from vocab: " + piece);
+        ids.push_back(it->second);
+    }
+    return ids;
 }
 
 }  // namespace dsv4

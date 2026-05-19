@@ -15,6 +15,7 @@ struct Args {
     std::string model;
     std::string ckpt;
     std::string inspect_tensor;
+    std::string prompt;
     int smoke_layers = 1;
     int forward_token = -1;
     int max_new_tokens = 1;
@@ -60,6 +61,9 @@ Args parse_args(int argc, char** argv) {
             args.smoke_forward = true;
             args.generate_token = true;
             args.forward_token = std::stoi(argv[++i]);
+        } else if (arg == "--prompt" && i + 1 < argc) {
+            args.smoke_forward = true;
+            args.prompt = argv[++i];
         } else if (arg == "--tokens" && i + 1 < argc) {
             ++i;
         } else if (arg == "--max-new-tokens" && i + 1 < argc) {
@@ -111,9 +115,18 @@ int main(int argc, char** argv) {
                 print_safe_tensor(*info, *shard_name);
             }
             if (args.smoke_forward) {
+                dsv4::Tokenizer tokenizer(args.ckpt);
+                if (!args.prompt.empty()) {
+                    auto ids = tokenizer.encode_basic(args.prompt, true);
+                    if (ids.empty()) throw std::runtime_error("prompt encoded to no tokens");
+                    args.forward_token = ids.back();
+                    std::cout << "prompt_tokens=" << ids.size()
+                              << " last_token=" << args.forward_token
+                              << " last_text=" << tokenizer.decode_piece(args.forward_token) << "\n";
+                }
                 if (args.generate_token) {
-                    dsv4::Tokenizer tokenizer(args.ckpt);
                     int token = args.forward_token;
+                    if (token < 0) throw std::runtime_error("--generate-token or --prompt is required for generation");
                     for (int step = 0; step < args.max_new_tokens; ++step) {
                         dsv4::ForwardSmokeResult result = dsv4::run_safetensors_token_forward(args.ckpt, token, args.smoke_layers);
                         std::cout << "generate_step=" << step
