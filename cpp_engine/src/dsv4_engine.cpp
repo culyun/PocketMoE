@@ -139,7 +139,7 @@ ForwardSmokeResult run_safetensors_layer_loop_smoke(const std::string& ckpt_dir,
     const int dim = static_cast<int>(embed->shape[1]);
     const int attn_mid = 8192;
     const int inter = static_cast<int>(first_w1.pair.rows);
-    const int head_rows = 128;
+    const int head_rows = static_cast<int>(head->shape[0]);
 
     uint16_t* d_embed = nullptr;
     uint16_t* d_attn_gamma = nullptr;
@@ -256,8 +256,17 @@ ForwardSmokeResult run_safetensors_layer_loop_smoke(const std::string& ckpt_dir,
     std::vector<float> logits(head_rows);
     check_cuda(cudaMemcpy(logits.data(), d_logits, logits.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy logits");
     float checksum = 0.0f;
-    for (float v : logits) checksum += v;
-    if (!std::isfinite(checksum)) throw std::runtime_error("non-finite smoke checksum");
+    int top_token = 0;
+    float top_logit = -INFINITY;
+    for (int i = 0; i < head_rows; ++i) {
+        const float v = logits[i];
+        checksum += v;
+        if (v > top_logit) {
+            top_logit = v;
+            top_token = i;
+        }
+    }
+    if (!std::isfinite(checksum) || !std::isfinite(top_logit)) throw std::runtime_error("non-finite smoke logits");
 
     cudaFree(d_embed);
     cudaFree(d_attn_gamma);
@@ -286,7 +295,7 @@ ForwardSmokeResult run_safetensors_layer_loop_smoke(const std::string& ckpt_dir,
     cudaFree(d_resid2);
     cudaFree(d_logits);
 
-    return ForwardSmokeResult{token, dim, inter, head_rows, layer_count, checksum};
+    return ForwardSmokeResult{token, dim, inter, head_rows, layer_count, top_token, top_logit, checksum};
 }
 
 }  // namespace dsv4

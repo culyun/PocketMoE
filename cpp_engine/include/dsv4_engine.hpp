@@ -25,6 +25,8 @@ struct ForwardSmokeResult {
     int inter = 0;
     int logits = 0;
     int layers = 0;
+    int top_token = 0;
+    float top_logit = 0.0f;
     float checksum = 0.0f;
 };
 

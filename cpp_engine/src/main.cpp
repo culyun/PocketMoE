@@ -106,6 +106,8 @@ int main(int argc, char** argv) {
                           << " dim=" << result.dim
                           << " inter=" << result.inter
                           << " logits=" << result.logits
+                          << " top_token=" << result.top_token
+                          << " top_logit=" << result.top_logit
                           << " checksum=" << result.checksum << "\n";
             }
             if (!args.dump_config && args.inspect_tensor.empty() && !args.inspect && !args.smoke_forward) {
