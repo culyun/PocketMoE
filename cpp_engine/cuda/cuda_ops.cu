@@ -112,6 +112,58 @@ __global__ void single_token_sparse_attention_kernel(
     for (int i = threadIdx.x; i < head_dim; i += blockDim.x) y[head * head_dim + i] = kv[i] * token_weight;
 }
 
+__global__ void cached_single_token_attention_kernel(
+    const float* q,
+    const float* kv_cache,
+    const float* attn_sink,
+    float* y,
+    int head_dim,
+    int cache_len,
+    float scale) {
+    const int head = blockIdx.x;
+    __shared__ float logits[256];
+    __shared__ float denom;
+    __shared__ float max_logit;
+    float local_max = attn_sink == nullptr ? -INFINITY : attn_sink[head];
+    for (int t = threadIdx.x; t < cache_len; t += blockDim.x) {
+        const float* kv = kv_cache + static_cast<size_t>(t) * head_dim;
+        float dot = 0.0f;
+        for (int i = 0; i < head_dim; ++i) dot += q[head * head_dim + i] * kv[i];
+        const float logit = dot * scale;
+        logits[t] = logit;
+        local_max = fmaxf(local_max, logit);
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = local_max;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) max_logit = partial[0];
+    __syncthreads();
+
+    float local_denom = 0.0f;
+    for (int t = threadIdx.x; t < cache_len; t += blockDim.x) local_denom += expf(logits[t] - max_logit);
+    partial[threadIdx.x] = local_denom;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) denom = partial[0] + (attn_sink == nullptr ? 0.0f : expf(attn_sink[head] - max_logit));
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float out = 0.0f;
+        for (int t = 0; t < cache_len; ++t) {
+            const float w = expf(logits[t] - max_logit) / denom;
+            out += w * kv_cache[static_cast<size_t>(t) * head_dim + i];
+        }
+        y[head * head_dim + i] = out;
+    }
+}
+
 }  // namespace
 
 bool cuda_runtime_available() {
@@ -159,6 +211,22 @@ bool single_token_sparse_attention_cuda(
     if (d_q == nullptr || d_kv == nullptr || d_y == nullptr || heads <= 0 || head_dim <= 0) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     single_token_sparse_attention_kernel<<<heads, 256, 0, cuda_stream>>>(d_q, d_kv, d_attn_sink, d_y, head_dim, scale);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool cached_single_token_attention_cuda(
+    const float* d_q,
+    const float* d_kv_cache,
+    const float* d_attn_sink,
+    float* d_y,
+    int heads,
+    int head_dim,
+    int cache_len,
+    float scale,
+    void* stream) {
+    if (d_q == nullptr || d_kv_cache == nullptr || d_y == nullptr || heads <= 0 || head_dim <= 0 || cache_len <= 0 || cache_len > 256) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    cached_single_token_attention_kernel<<<heads, 256, 0, cuda_stream>>>(d_q, d_kv_cache, d_attn_sink, d_y, head_dim, cache_len, scale);
     return cudaGetLastError() == cudaSuccess;
 }
 

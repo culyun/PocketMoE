@@ -94,6 +94,17 @@ bool single_token_sparse_attention_cuda(
     float scale,
     void* stream = nullptr);
 
+bool cached_single_token_attention_cuda(
+    const float* d_q,
+    const float* d_kv_cache,
+    const float* d_attn_sink,
+    float* d_y,
+    int heads,
+    int head_dim,
+    int cache_len,
+    float scale,
+    void* stream = nullptr);
+
 bool head_rmsnorm_rope_cuda(
     float* d_x,
     int heads,

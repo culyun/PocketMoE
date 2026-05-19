@@ -10,6 +10,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace dsv4 {
@@ -57,6 +58,7 @@ struct AttentionSmokeDims {
     int attn_mid = 0;
     int rope_dim = 0;
     int position = 0;
+    int layer_id = 0;
     float rope_theta = 0.0f;
 };
 
@@ -77,6 +79,8 @@ bool run_single_token_attention_smoke(
     const uint8_t* d_wo_b,
     const uint8_t* d_wo_b_scale,
     const float* d_attn_sink,
+    float* d_kv_cache,
+    int cache_len,
     float* d_attn_norm,
     float* d_q_a,
     float* d_q_norm,
@@ -94,7 +98,10 @@ bool run_single_token_attention_smoke(
     if (!fp8_e4m3_e8m0_matvec_cuda(d_attn_norm, d_wkv, d_wkv_scale, d_kv_a, dims.kv_dim, dims.dim)) return false;
     if (!rmsnorm_bf16_gamma_cuda(d_kv_a, d_kv_gamma, d_kv_norm, dims.kv_dim, 1e-6f)) return false;
     if (!head_rmsnorm_rope_cuda(d_kv_norm, 1, dims.head_dim, dims.rope_dim, dims.position, dims.rope_theta, false, 0.0f)) return false;
-    if (!single_token_sparse_attention_cuda(d_q, d_kv_norm, d_attn_sink, d_attn_value, dims.heads, dims.head_dim, 1.0f / std::sqrt(static_cast<float>(dims.head_dim)))) return false;
+    if (d_kv_cache != nullptr) {
+        if (cudaMemcpy(d_kv_cache + static_cast<size_t>(dims.position) * dims.head_dim, d_kv_norm, static_cast<size_t>(dims.head_dim) * sizeof(float), cudaMemcpyDeviceToDevice) != cudaSuccess) return false;
+        if (!cached_single_token_attention_cuda(d_q, d_kv_cache, d_attn_sink, d_attn_value, dims.heads, dims.head_dim, cache_len, 1.0f / std::sqrt(static_cast<float>(dims.head_dim)))) return false;
+    } else if (!single_token_sparse_attention_cuda(d_q, d_kv_norm, d_attn_sink, d_attn_value, dims.heads, dims.head_dim, 1.0f / std::sqrt(static_cast<float>(dims.head_dim)))) return false;
     if (!head_rmsnorm_rope_cuda(d_attn_value, dims.heads, dims.head_dim, dims.rope_dim, dims.position, dims.rope_theta, true, 0.0f)) return false;
     for (int g = 0; g < dims.groups; ++g) {
         const float* group_x = d_attn_value + static_cast<size_t>(g) * dims.group_dim;
@@ -192,6 +199,19 @@ struct SafeForwardContext {
         head = require_tensor(head_shard, "head.weight");
     }
 
+    ~SafeForwardContext() {
+        for (auto& [_, ptr] : kv_cache) cudaFree(ptr);
+    }
+
+    float* kv_cache_for_layer(int layer_id, int max_tokens, int head_dim) {
+        auto it = kv_cache.find(layer_id);
+        if (it != kv_cache.end()) return it->second;
+        float* ptr = nullptr;
+        check_cuda(cudaMalloc(&ptr, static_cast<size_t>(max_tokens) * head_dim * sizeof(float)), "cudaMalloc kv cache");
+        kv_cache[layer_id] = ptr;
+        return ptr;
+    }
+
     std::string ckpt_dir;
     SafeTensorsIndex index;
     ModelConfig config;
@@ -199,6 +219,8 @@ struct SafeForwardContext {
     SafeTensorsShard head_shard;
     const SafeTensorInfo* embed = nullptr;
     const SafeTensorInfo* head = nullptr;
+    int kv_cache_tokens = 0;
+    std::unordered_map<int, float*> kv_cache;
 };
 
 }  // namespace
@@ -222,6 +244,7 @@ ForwardSmokeResult run_safetensors_token_forward(const std::string& ckpt_dir, in
 ForwardSmokeResult run_safetensors_prompt_forward(const std::string& ckpt_dir, const std::vector<int>& tokens, int layer_count) {
     if (tokens.empty()) throw std::runtime_error("prompt has no tokens");
     SafeForwardContext ctx(ckpt_dir);
+    ctx.kv_cache_tokens = static_cast<int>(std::min<size_t>(tokens.size(), 256));
     ForwardSmokeResult result;
     for (size_t i = 0; i < tokens.size(); ++i) {
         result = run_safetensors_token_forward_impl(ctx, tokens[i], layer_count, static_cast<int>(i));
@@ -357,6 +380,9 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
 
     for (int li = 0; li < layer_count; ++li) {
         const std::string prefix = "layers." + std::to_string(li) + ".";
+        attn_dims.layer_id = li;
+        float* d_layer_kv_cache = ctx.kv_cache_tokens > 0 ? ctx.kv_cache_for_layer(li, ctx.kv_cache_tokens, attn_dims.head_dim) : nullptr;
+        const int layer_cache_len = d_layer_kv_cache == nullptr ? 0 : std::min(position + 1, ctx.kv_cache_tokens);
         SafeTensorsShard attn_norm_shard(index.shard_path(*index.shard_for_tensor(prefix + "attn_norm.weight")));
         SafeTensorsShard qkv_shard(index.shard_path(*index.shard_for_tensor(prefix + "attn.wq_a.weight")));
         SafeTensorsShard wo_a_shard(index.shard_path(*index.shard_for_tensor(prefix + "attn.wo_a.weight")));
@@ -411,6 +437,8 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
                 d_wo_b,
                 d_wo_b_scale,
                 d_attn_sink,
+                d_layer_kv_cache,
+                layer_cache_len,
                 d_attn_norm,
                 d_q_a,
                 d_q_norm,

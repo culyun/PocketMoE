@@ -134,6 +134,61 @@ void test_head_rmsnorm_rope_kernel() {
     }
 }
 
+void test_cached_attention_kernel() {
+    constexpr int heads = 2;
+    constexpr int head_dim = 3;
+    constexpr int cache_len = 3;
+    const float scale = 0.25f;
+    std::vector<float> q = {0.25f, -0.5f, 0.75f, -1.0f, 0.5f, 0.125f};
+    std::vector<float> kv = {
+        0.5f, -0.25f, 0.75f,
+        -0.125f, 0.625f, 1.0f,
+        0.875f, -0.5f, 0.25f,
+    };
+    std::vector<float> sink = {0.0f, -0.25f};
+    std::vector<float> ref(q.size());
+    for (int h = 0; h < heads; ++h) {
+        std::vector<float> logits(cache_len);
+        float max_logit = sink[h];
+        for (int t = 0; t < cache_len; ++t) {
+            float dot = 0.0f;
+            for (int i = 0; i < head_dim; ++i) dot += q[h * head_dim + i] * kv[t * head_dim + i];
+            logits[t] = dot * scale;
+            max_logit = std::max(max_logit, logits[t]);
+        }
+        float denom = std::exp(sink[h] - max_logit);
+        for (float logit : logits) denom += std::exp(logit - max_logit);
+        for (int i = 0; i < head_dim; ++i) {
+            float out = 0.0f;
+            for (int t = 0; t < cache_len; ++t) out += std::exp(logits[t] - max_logit) / denom * kv[t * head_dim + i];
+            ref[h * head_dim + i] = out;
+        }
+    }
+
+    float* d_q = nullptr;
+    float* d_kv = nullptr;
+    float* d_sink = nullptr;
+    float* d_y = nullptr;
+    check_cuda(cudaMalloc(&d_q, q.size() * sizeof(float)), "cudaMalloc cached q");
+    check_cuda(cudaMalloc(&d_kv, kv.size() * sizeof(float)), "cudaMalloc cached kv");
+    check_cuda(cudaMalloc(&d_sink, sink.size() * sizeof(float)), "cudaMalloc cached sink");
+    check_cuda(cudaMalloc(&d_y, q.size() * sizeof(float)), "cudaMalloc cached y");
+    check_cuda(cudaMemcpy(d_q, q.data(), q.size() * sizeof(float), cudaMemcpyHostToDevice), "copy cached q");
+    check_cuda(cudaMemcpy(d_kv, kv.data(), kv.size() * sizeof(float), cudaMemcpyHostToDevice), "copy cached kv");
+    check_cuda(cudaMemcpy(d_sink, sink.data(), sink.size() * sizeof(float), cudaMemcpyHostToDevice), "copy cached sink");
+    if (!dsv4::cached_single_token_attention_cuda(d_q, d_kv, d_sink, d_y, heads, head_dim, cache_len, scale)) throw std::runtime_error("cached attention launch failed");
+    check_cuda(cudaDeviceSynchronize(), "sync cached attention");
+    std::vector<float> got(q.size());
+    check_cuda(cudaMemcpy(got.data(), d_y, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy cached y");
+    cudaFree(d_q);
+    cudaFree(d_kv);
+    cudaFree(d_sink);
+    cudaFree(d_y);
+    for (size_t i = 0; i < got.size(); ++i) {
+        if (std::fabs(got[i] - ref[i]) > 1e-6f) throw std::runtime_error("cached attention mismatch");
+    }
+}
+
 void test_single_token_attention_kernel() {
     constexpr int heads = 3;
     constexpr int head_dim = 4;
@@ -189,6 +244,7 @@ int main(int argc, char** argv) {
         }
         test_head_rmsnorm_rope_kernel();
         test_single_token_attention_kernel();
+        test_cached_attention_kernel();
         Args args = parse_args(argc, argv);
         if (args.ckpt.empty()) throw std::runtime_error("--ckpt is required");
         dsv4::SafeTensorsIndex index(args.ckpt);
