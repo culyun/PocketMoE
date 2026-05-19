@@ -15,6 +15,7 @@ add_library(dsv4_cpp_core STATIC
     src/json_lite.cpp
     src/gguf_reader.cpp
     src/safetensors_reader.cpp
+    src/safetensors_model.cpp
     src/model_config.cpp
     src/tensor.cpp
     src/dsv4_engine.cpp
@@ -50,6 +51,10 @@ set_target_properties(test_gguf_reader PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMA
 add_executable(test_safetensors_reader tests/test_safetensors_reader.cpp)
 target_link_libraries(test_safetensors_reader PRIVATE dsv4_cpp_core)
 set_target_properties(test_safetensors_reader PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_safetensors_model tests/test_safetensors_model.cpp)
+target_link_libraries(test_safetensors_model PRIVATE dsv4_cpp_core)
+set_target_properties(test_safetensors_model PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_quant_gemm tests/test_quant_gemm.cpp)
 target_link_libraries(test_quant_gemm PRIVATE dsv4_cpp_core)
