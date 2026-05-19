@@ -157,6 +157,8 @@ struct AttentionSmokeDims {
     int rope_dim = 0;
     int position = 0;
     int layer_id = 0;
+    int window_size = 128;
+    int cache_write_slot = 0;
     float rope_theta = 0.0f;
 };
 
@@ -197,7 +199,7 @@ bool run_single_token_attention_smoke(
     if (!rmsnorm_bf16_gamma_cuda(d_kv_a, d_kv_gamma, d_kv_norm, dims.kv_dim, 1e-6f)) return false;
     if (!head_rmsnorm_rope_cuda(d_kv_norm, 1, dims.head_dim, dims.rope_dim, dims.position, dims.rope_theta, false, 0.0f)) return false;
     if (d_kv_cache != nullptr) {
-        if (cudaMemcpy(d_kv_cache + static_cast<size_t>(dims.position) * dims.head_dim, d_kv_norm, static_cast<size_t>(dims.head_dim) * sizeof(float), cudaMemcpyDeviceToDevice) != cudaSuccess) return false;
+        if (cudaMemcpy(d_kv_cache + static_cast<size_t>(dims.cache_write_slot) * dims.head_dim, d_kv_norm, static_cast<size_t>(dims.head_dim) * sizeof(float), cudaMemcpyDeviceToDevice) != cudaSuccess) return false;
         if (!cached_single_token_attention_cuda(d_q, d_kv_cache, d_attn_sink, d_attn_value, dims.heads, dims.head_dim, cache_len, 1.0f / std::sqrt(static_cast<float>(dims.head_dim)))) return false;
     } else if (!single_token_sparse_attention_cuda(d_q, d_kv_norm, d_attn_sink, d_attn_value, dims.heads, dims.head_dim, 1.0f / std::sqrt(static_cast<float>(dims.head_dim)))) return false;
     if (!head_rmsnorm_rope_cuda(d_attn_value, dims.heads, dims.head_dim, dims.rope_dim, dims.position, dims.rope_theta, true, 0.0f)) return false;
@@ -307,6 +309,14 @@ struct SafeForwardContext {
         for (auto& [_, ptr] : kv_cache) cudaFree(ptr);
     }
 
+    std::vector<float>& compressor_state_for_layer(int layer_id, int ratio, int head_dim) {
+        auto it = compressor_state.find(layer_id);
+        if (it != compressor_state.end()) return it->second;
+        auto& state = compressor_state[layer_id];
+        state.assign(static_cast<size_t>(ratio) * head_dim, 0.0f);
+        return state;
+    }
+
     int kv_cache_capacity_for_layer(int layer_id) const {
         const int window = static_cast<int>(config.window_size == 0 ? 128 : config.window_size);
         uint64_t ratio = 0;
@@ -340,6 +350,7 @@ struct SafeForwardContext {
     const SafeTensorInfo* hc_head_base = nullptr;
     int kv_cache_tokens = 0;
     std::unordered_map<int, float*> kv_cache;
+    std::unordered_map<int, std::vector<float>> compressor_state;
 };
 
 }  // namespace
@@ -419,6 +430,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     attn_dims.attn_mid = attn_dims.group_rank * attn_dims.groups;
     attn_dims.rope_dim = static_cast<int>(config.rope_dim);
     attn_dims.position = position;
+    attn_dims.window_size = static_cast<int>(config.window_size == 0 ? 128 : config.window_size);
     attn_dims.rope_theta = static_cast<float>(config.compress_rope_theta > 0.0 ? config.compress_rope_theta : config.rope_theta);
     if (attn_dims.q_a_dim <= 0 || attn_dims.heads <= 0 || attn_dims.head_dim <= 0 || attn_dims.kv_dim <= 0 || attn_dims.groups <= 0 || attn_dims.group_rank <= 0 || attn_dims.rope_dim <= 0 || attn_dims.rope_theta <= 0.0f) {
         throw std::runtime_error("invalid attention dimensions in config");
@@ -528,8 +540,9 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     for (int li = 0; li < layer_count; ++li) {
         const std::string prefix = "layers." + std::to_string(li) + ".";
         attn_dims.layer_id = li;
+        attn_dims.cache_write_slot = position % attn_dims.window_size;
         float* d_layer_kv_cache = ctx.kv_cache_tokens > 0 ? ctx.kv_cache_for_layer(li, attn_dims.head_dim) : nullptr;
-        const int layer_cache_len = d_layer_kv_cache == nullptr ? 0 : std::min(position + 1, std::min(ctx.kv_cache_tokens, static_cast<int>(ctx.config.window_size == 0 ? 128 : ctx.config.window_size)));
+        const int layer_cache_len = d_layer_kv_cache == nullptr ? 0 : std::min(position + 1, attn_dims.window_size);
         SafeTensorsShard attn_norm_shard(index.shard_path(*index.shard_for_tensor(prefix + "attn_norm.weight")));
         SafeTensorsShard qkv_shard(index.shard_path(*index.shard_for_tensor(prefix + "attn.wq_a.weight")));
         SafeTensorsShard wo_a_shard(index.shard_path(*index.shard_for_tensor(prefix + "attn.wo_a.weight")));
@@ -610,6 +623,25 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
                 d_attn_mid,
                 d_attn_out)) {
             throw std::runtime_error("single-token attention smoke launch failed");
+        }
+        uint64_t compress_ratio = static_cast<size_t>(li) < ctx.config.compress_ratios.size() ? ctx.config.compress_ratios[static_cast<size_t>(li)] : 0;
+        if (d_layer_kv_cache != nullptr && compress_ratio > 0 && compress_ratio <= 256) {
+            std::vector<float>& state = ctx.compressor_state_for_layer(li, static_cast<int>(compress_ratio), attn_dims.head_dim);
+            std::vector<float> kv_host(attn_dims.head_dim);
+            check_cuda(cudaMemcpy(kv_host.data(), d_kv_norm, static_cast<size_t>(attn_dims.head_dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy kv for compressor");
+            const int offset = position % static_cast<int>(compress_ratio);
+            std::copy(kv_host.begin(), kv_host.end(), state.begin() + static_cast<size_t>(offset) * attn_dims.head_dim);
+            if ((position + 1) % static_cast<int>(compress_ratio) == 0) {
+                std::vector<float> pooled(attn_dims.head_dim, 0.0f);
+                for (int t = 0; t < static_cast<int>(compress_ratio); ++t) {
+                    for (int d = 0; d < attn_dims.head_dim; ++d) pooled[d] += state[static_cast<size_t>(t) * attn_dims.head_dim + d];
+                }
+                for (float& v : pooled) v /= static_cast<float>(compress_ratio);
+                const int compressed_slot = attn_dims.window_size + position / static_cast<int>(compress_ratio);
+                if (compressed_slot < ctx.kv_cache_capacity_for_layer(li)) {
+                    check_cuda(cudaMemcpy(d_layer_kv_cache + static_cast<size_t>(compressed_slot) * attn_dims.head_dim, pooled.data(), static_cast<size_t>(attn_dims.head_dim) * sizeof(float), cudaMemcpyHostToDevice), "copy compressed kv");
+                }
+            }
         }
         check_cuda(cudaMemcpy(host_x.data(), d_attn_out, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy attn out host");
         h4 = hc_post_cpu(host_x, h4, attn_hc, dim);
