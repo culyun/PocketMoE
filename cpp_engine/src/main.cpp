@@ -119,17 +119,18 @@ int main(int argc, char** argv) {
             }
             if (args.smoke_forward) {
                 dsv4::Tokenizer tokenizer(args.ckpt);
+                std::vector<int> prompt_ids;
                 if (!args.prompt.empty()) {
-                    auto ids = tokenizer.encode_basic(args.prompt, true);
-                    if (ids.empty()) throw std::runtime_error("prompt encoded to no tokens");
-                    args.forward_token = ids.back();
-                    args.position = static_cast<int>(ids.size()) - 1;
-                    std::cout << "prompt_tokens=" << ids.size()
+                    prompt_ids = tokenizer.encode_basic(args.prompt, true);
+                    if (prompt_ids.empty()) throw std::runtime_error("prompt encoded to no tokens");
+                    args.forward_token = prompt_ids.back();
+                    args.position = static_cast<int>(prompt_ids.size()) - 1;
+                    std::cout << "prompt_tokens=" << prompt_ids.size()
                               << " last_token=" << args.forward_token
                               << " position=" << args.position
                               << " last_text=" << tokenizer.decode_piece(args.forward_token) << "\n";
                     if (!args.generate_token) {
-                        dsv4::ForwardSmokeResult result = dsv4::run_safetensors_prompt_forward(args.ckpt, ids, args.smoke_layers);
+                        dsv4::ForwardSmokeResult result = dsv4::run_safetensors_prompt_forward(args.ckpt, prompt_ids, args.smoke_layers);
                         std::cout << "smoke_forward=1 token=" << result.token
                                   << " layers=" << result.layers
                                   << " dim=" << result.dim
@@ -142,10 +143,13 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (args.generate_token) {
-                    int token = args.forward_token;
-                    if (token < 0) throw std::runtime_error("--generate-token or --prompt is required for generation");
-                    for (int step = 0; step < args.max_new_tokens; ++step) {
-                        dsv4::ForwardSmokeResult result = dsv4::run_safetensors_token_forward_at_position(args.ckpt, token, args.smoke_layers, args.position + step);
+                    if (prompt_ids.empty()) {
+                        if (args.forward_token < 0) throw std::runtime_error("--generate-token or --prompt is required for generation");
+                        prompt_ids.push_back(args.forward_token);
+                    }
+                    auto results = dsv4::run_safetensors_generate_tokens(args.ckpt, prompt_ids, args.smoke_layers, args.max_new_tokens);
+                    for (size_t step = 0; step < results.size(); ++step) {
+                        const dsv4::ForwardSmokeResult& result = results[step];
                         std::cout << "generate_step=" << step
                                   << " token=" << result.token
                                   << " token_text=" << tokenizer.decode_piece(result.token)
@@ -153,7 +157,6 @@ int main(int argc, char** argv) {
                                   << " top_text=" << tokenizer.decode_piece(result.top_token)
                                   << " top_logit=" << result.top_logit
                                   << " checksum=" << result.checksum << "\n";
-                        token = result.top_token;
                     }
                 } else {
                     dsv4::ForwardSmokeResult result = args.forward_token >= 0

@@ -252,6 +252,27 @@ ForwardSmokeResult run_safetensors_prompt_forward(const std::string& ckpt_dir, c
     return result;
 }
 
+std::vector<ForwardSmokeResult> run_safetensors_generate_tokens(const std::string& ckpt_dir, const std::vector<int>& seed_tokens, int layer_count, int max_new_tokens) {
+    if (seed_tokens.empty()) throw std::runtime_error("generation seed has no tokens");
+    if (max_new_tokens <= 0) return {};
+    SafeForwardContext ctx(ckpt_dir);
+    ctx.kv_cache_tokens = static_cast<int>(std::min<size_t>(seed_tokens.size() + static_cast<size_t>(max_new_tokens), 256));
+    ForwardSmokeResult result;
+    for (size_t i = 0; i < seed_tokens.size(); ++i) {
+        result = run_safetensors_token_forward_impl(ctx, seed_tokens[i], layer_count, static_cast<int>(i));
+    }
+    std::vector<ForwardSmokeResult> out;
+    out.reserve(static_cast<size_t>(max_new_tokens));
+    int token = result.top_token;
+    int position = static_cast<int>(seed_tokens.size());
+    for (int step = 0; step < max_new_tokens; ++step) {
+        result = run_safetensors_token_forward_impl(ctx, token, layer_count, position + step);
+        out.push_back(result);
+        token = result.top_token;
+    }
+    return out;
+}
+
 ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, int token, int layer_count, int position) {
     if (!cuda_runtime_available()) throw std::runtime_error("CUDA runtime is not available");
     SafeTensorsIndex& index = ctx.index;
