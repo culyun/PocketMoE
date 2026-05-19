@@ -151,12 +151,17 @@ int main(int argc, char** argv) {
                               << " position=" << args.position
                               << " last_text=" << tokenizer.decode_piece(args.forward_token) << "\n";
                     if (!args.generate_token) {
-                        dsv4::ForwardSmokeResult result = dsv4::run_safetensors_prompt_forward(args.ckpt, prompt_ids, args.smoke_layers);
+                        dsv4::ForwardSmokeOptions opts;
+                        opts.tp_world = args.tp_world;
+                        opts.tp_rank = args.tp_rank;
+                        dsv4::ForwardSmokeResult result = dsv4::run_safetensors_prompt_forward_with_options(args.ckpt, prompt_ids, args.smoke_layers, opts);
                         std::cout << "smoke_forward=1 token=" << result.token
                                   << " layers=" << result.layers
                                   << " dim=" << result.dim
                                   << " inter=" << result.inter
                                   << " logits=" << result.logits
+                                  << " tp_world=" << args.tp_world
+                                  << " tp_rank=" << args.tp_rank
                                   << " top_token=" << result.top_token
                                   << " top_logit=" << result.top_logit
                                   << " checksum=" << result.checksum << "\n";

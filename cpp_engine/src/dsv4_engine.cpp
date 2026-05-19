@@ -460,6 +460,7 @@ struct SafeForwardContext {
     const SafeTensorInfo* hc_head_scale = nullptr;
     const SafeTensorInfo* hc_head_base = nullptr;
     int kv_cache_tokens = 0;
+    ForwardSmokeOptions options;
     std::unordered_map<int, float*> kv_cache;
     std::unordered_map<int, float*> indexer_kv_cache;
     std::unordered_map<int, std::vector<float>> compressor_kv_state;
@@ -487,8 +488,13 @@ ForwardSmokeResult run_safetensors_token_forward(const std::string& ckpt_dir, in
 }
 
 ForwardSmokeResult run_safetensors_prompt_forward(const std::string& ckpt_dir, const std::vector<int>& tokens, int layer_count) {
+    return run_safetensors_prompt_forward_with_options(ckpt_dir, tokens, layer_count, ForwardSmokeOptions{});
+}
+
+ForwardSmokeResult run_safetensors_prompt_forward_with_options(const std::string& ckpt_dir, const std::vector<int>& tokens, int layer_count, const ForwardSmokeOptions& options) {
     if (tokens.empty()) throw std::runtime_error("prompt has no tokens");
     SafeForwardContext ctx(ckpt_dir);
+    ctx.options = options;
     ctx.kv_cache_tokens = static_cast<int>(std::min<size_t>(tokens.size(), 256));
     ForwardSmokeResult result;
     for (size_t i = 0; i < tokens.size(); ++i) {
@@ -554,6 +560,12 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     attn_dims.group_dim = attn_dims.q_dim / attn_dims.groups;
     const int inter = static_cast<int>(first_w1.pair.rows);
     const int head_rows = static_cast<int>(head->shape[0]);
+    const int tp_world = std::max(1, ctx.options.tp_world);
+    const int tp_rank = std::max(0, ctx.options.tp_rank);
+    if (tp_rank >= tp_world) throw std::runtime_error("invalid TP rank in forward options");
+    if (head_rows % tp_world != 0) throw std::runtime_error("head vocab rows must divide TP world");
+    const int local_head_rows = head_rows / tp_world;
+    const int local_head_start = tp_rank * local_head_rows;
 
     uint16_t* d_embed = nullptr;
     uint16_t* d_attn_gamma = nullptr;
@@ -626,7 +638,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     check_cuda(cudaMalloc(&d_s2, first_w2.s->nbytes), "cudaMalloc s2");
     check_cuda(cudaMalloc(&d_w3, static_cast<size_t>(inter) * dim), "cudaMalloc w3");
     check_cuda(cudaMalloc(&d_s3, first_w3.s->nbytes), "cudaMalloc s3");
-    check_cuda(cudaMalloc(&d_head, static_cast<size_t>(head_rows) * dim * sizeof(uint16_t)), "cudaMalloc head");
+    check_cuda(cudaMalloc(&d_head, static_cast<size_t>(local_head_rows) * dim * sizeof(uint16_t)), "cudaMalloc head");
     check_cuda(cudaMalloc(&d_final_norm_gamma, static_cast<size_t>(dim) * sizeof(uint16_t)), "cudaMalloc final norm gamma");
     check_cuda(cudaMalloc(&d_x, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc x");
     check_cuda(cudaMalloc(&d_attn_norm, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc attn norm");
@@ -650,10 +662,11 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     check_cuda(cudaMalloc(&d_hidden, static_cast<size_t>(inter) * sizeof(float)), "cudaMalloc hidden");
     check_cuda(cudaMalloc(&d_moe, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc moe");
     check_cuda(cudaMalloc(&d_resid2, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc resid2");
-    check_cuda(cudaMalloc(&d_logits, static_cast<size_t>(head_rows) * sizeof(float)), "cudaMalloc logits");
+    check_cuda(cudaMalloc(&d_logits, static_cast<size_t>(local_head_rows) * sizeof(float)), "cudaMalloc logits");
 
     check_cuda(cudaMemcpy(d_embed, embed_data, static_cast<size_t>(dim) * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy embed");
-    check_cuda(cudaMemcpy(d_head, ctx.head_shard.tensor_data(*head), static_cast<size_t>(head_rows) * dim * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy head");
+    const auto* head_data = reinterpret_cast<const uint16_t*>(ctx.head_shard.tensor_data(*head)) + static_cast<size_t>(local_head_start) * dim;
+    check_cuda(cudaMemcpy(d_head, head_data, static_cast<size_t>(local_head_rows) * dim * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy head");
     check_cuda(cudaMemcpy(d_final_norm_gamma, ctx.final_norm_shard.tensor_data(*ctx.final_norm), ctx.final_norm->nbytes, cudaMemcpyHostToDevice), "copy final norm gamma");
     if (!bf16_row_to_float_cuda(d_embed, d_x, 0, dim)) throw std::runtime_error("embed launch failed");
     const bool debug_forward = debug_forward_enabled();
@@ -971,20 +984,20 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         dim);
     check_cuda(cudaMemcpy(d_x, host_x.data(), static_cast<size_t>(dim) * sizeof(float), cudaMemcpyHostToDevice), "copy hc head");
     if (!rmsnorm_bf16_gamma_cuda(d_x, d_final_norm_gamma, d_resid1, dim, 1e-6f)) throw std::runtime_error("final norm launch failed");
-    if (!bf16_matvec_cuda(d_resid1, d_head, d_logits, head_rows, dim)) throw std::runtime_error("head launch failed");
+    if (!bf16_matvec_cuda(d_resid1, d_head, d_logits, local_head_rows, dim)) throw std::runtime_error("head launch failed");
     check_cuda(cudaDeviceSynchronize(), "sync kernels");
 
-    std::vector<float> logits(head_rows);
+    std::vector<float> logits(local_head_rows);
     check_cuda(cudaMemcpy(logits.data(), d_logits, logits.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy logits");
     float checksum = 0.0f;
-    int top_token = 0;
+    int top_token = local_head_start;
     float top_logit = -INFINITY;
-    for (int i = 0; i < head_rows; ++i) {
+    for (int i = 0; i < local_head_rows; ++i) {
         const float v = logits[i];
         checksum += v;
         if (v > top_logit) {
             top_logit = v;
-            top_token = i;
+            top_token = local_head_start + i;
         }
     }
     if (!std::isfinite(checksum) || !std::isfinite(top_logit)) throw std::runtime_error("non-finite smoke logits");
@@ -1041,7 +1054,12 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
 }
 
 ForwardSmokeResult run_safetensors_token_forward_at_position(const std::string& ckpt_dir, int token, int layer_count, int position) {
+    return run_safetensors_token_forward_with_options(ckpt_dir, token, layer_count, position, ForwardSmokeOptions{});
+}
+
+ForwardSmokeResult run_safetensors_token_forward_with_options(const std::string& ckpt_dir, int token, int layer_count, int position, const ForwardSmokeOptions& options) {
     SafeForwardContext ctx(ckpt_dir);
+    ctx.options = options;
     return run_safetensors_token_forward_impl(ctx, token, layer_count, position);
 }
 
