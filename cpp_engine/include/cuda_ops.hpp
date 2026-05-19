@@ -139,6 +139,12 @@ bool indexer_select_topk_cuda(
     int offset,
     void* stream = nullptr);
 
+bool fp8_act_quant_dequant_cuda(
+    float* d_x,
+    int cols,
+    int block_size,
+    void* stream = nullptr);
+
 bool head_rmsnorm_rope_cuda(
     float* d_x,
     int heads,

@@ -178,6 +178,31 @@ __device__ float bf16_to_float_device(uint16_t bits) {
     return __uint_as_float(value);
 }
 
+__device__ float round_pow2_device(float x) {
+    return exp2f(roundf(log2f(x)));
+}
+
+__device__ float fp8_e4m3_quant_dequant(float v, float scale) {
+    float q = fminf(448.0f, fmaxf(-448.0f, nearbyintf(v / scale)));
+    return q * scale;
+}
+
+__global__ void fp8_act_quant_dequant_kernel(float* x, int cols, int block_size) {
+    const int block = blockIdx.x;
+    const int start = block * block_size;
+    float max_abs = 0.0f;
+    for (int i = threadIdx.x; i < block_size; i += blockDim.x) max_abs = fmaxf(max_abs, fabsf(x[start + i]));
+    __shared__ float partial[256];
+    partial[threadIdx.x] = max_abs;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    const float scale = round_pow2_device(fmaxf(partial[0], 1e-4f) / 448.0f);
+    for (int i = threadIdx.x; i < block_size; i += blockDim.x) x[start + i] = fp8_e4m3_quant_dequant(x[start + i], scale);
+}
+
 __global__ void indexed_cached_single_token_attention_kernel(
     const float* q,
     const float* kv_cache,
@@ -393,6 +418,13 @@ bool indexer_select_topk_cuda(
     if (compressed_count <= 0 || compressed_count > 640 || keep <= 0 || keep > compressed_count || heads <= 0 || head_dim <= 0 || dim <= 0) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     indexer_select_topk_kernel<<<1, 640, 0, cuda_stream>>>(d_index_q, d_index_kv, d_weight_proj_bf16, d_x, d_out_indices, compressed_count, keep, heads, head_dim, dim, offset);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool fp8_act_quant_dequant_cuda(float* d_x, int cols, int block_size, void* stream) {
+    if (d_x == nullptr || cols <= 0 || block_size <= 0 || (cols % block_size) != 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    fp8_act_quant_dequant_kernel<<<cols / block_size, 256, 0, cuda_stream>>>(d_x, cols, block_size);
     return cudaGetLastError() == cudaSuccess;
 }
 

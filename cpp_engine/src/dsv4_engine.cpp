@@ -7,6 +7,8 @@
 #include <cmath>
 #include <cuda_runtime.h>
 #include <cstring>
+#include <cstdlib>
+#include <iostream>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -38,6 +40,20 @@ float bf16_to_float(uint16_t bits) {
     float out;
     std::memcpy(&out, &value, sizeof(out));
     return out;
+}
+
+float round_to_bf16(float value) {
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    bits += 0x7fff + ((bits >> 16) & 1);
+    bits &= 0xffff0000u;
+    float out;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+void round_vector_to_bf16(std::vector<float>& values) {
+    for (float& v : values) v = round_to_bf16(v);
 }
 
 struct RoutedExpert {
@@ -116,7 +132,7 @@ std::vector<float> hc_post_cpu(const std::vector<float>& x, const std::vector<fl
     for (int m = 0; m < hc; ++m) {
         for (int d = 0; d < dim; ++d) {
             float v = pre.post[m] * x[d];
-            for (int j = 0; j < hc; ++j) v += pre.comb[m * hc + j] * residual[static_cast<size_t>(j) * dim + d];
+            for (int j = 0; j < hc; ++j) v += pre.comb[j * hc + m] * residual[static_cast<size_t>(j) * dim + d];
             out[static_cast<size_t>(m) * dim + d] = v;
         }
     }
@@ -160,6 +176,29 @@ std::vector<float> rmsnorm_cpu(const std::vector<float>& x, const uint16_t* gamm
     std::vector<float> y(x.size());
     for (size_t i = 0; i < x.size(); ++i) y[i] = x[i] * inv * bf16_to_float(gamma[i]);
     return y;
+}
+
+bool debug_forward_enabled() {
+    const char* env = std::getenv("DSV4_CPP_DEBUG_FORWARD");
+    return env != nullptr && std::string(env) != "0";
+}
+
+void print_summary(const std::string& name, const std::vector<float>& x) {
+    double sum = 0.0;
+    double sum_sq = 0.0;
+    for (float v : x) {
+        sum += v;
+        sum_sq += static_cast<double>(v) * v;
+    }
+    const double mean = x.empty() ? 0.0 : sum / static_cast<double>(x.size());
+    const double rms = x.empty() ? 0.0 : std::sqrt(sum_sq / static_cast<double>(x.size()));
+    const float first = x.empty() ? 0.0f : x.front();
+    const float last = x.empty() ? 0.0f : x.back();
+    std::cout << "CPP " << name << " sum=" << static_cast<float>(sum)
+              << " mean=" << static_cast<float>(mean)
+              << " rms=" << static_cast<float>(rms)
+              << " first=" << first
+              << " last=" << last << "\n";
 }
 
 struct AttentionSmokeDims {
@@ -219,6 +258,7 @@ bool run_single_token_attention_smoke(
     if (!fp8_e4m3_e8m0_matvec_cuda(d_attn_norm, d_wkv, d_wkv_scale, d_kv_a, dims.kv_dim, dims.dim)) return false;
     if (!rmsnorm_bf16_gamma_cuda(d_kv_a, d_kv_gamma, d_kv_norm, dims.kv_dim, 1e-6f)) return false;
     if (!head_rmsnorm_rope_cuda(d_kv_norm, 1, dims.head_dim, dims.rope_dim, dims.position, dims.rope_theta, false, 0.0f)) return false;
+    if (!fp8_act_quant_dequant_cuda(d_kv_norm, dims.head_dim - dims.rope_dim, 64)) return false;
     if (d_kv_cache != nullptr) {
         if (cudaMemcpy(d_kv_cache + static_cast<size_t>(dims.cache_write_slot) * dims.head_dim, d_kv_norm, static_cast<size_t>(dims.head_dim) * sizeof(float), cudaMemcpyDeviceToDevice) != cudaSuccess) return false;
         if (d_kv_indices != nullptr && index_count > 0) {
@@ -616,6 +656,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     check_cuda(cudaMemcpy(d_head, ctx.head_shard.tensor_data(*head), static_cast<size_t>(head_rows) * dim * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy head");
     check_cuda(cudaMemcpy(d_final_norm_gamma, ctx.final_norm_shard.tensor_data(*ctx.final_norm), ctx.final_norm->nbytes, cudaMemcpyHostToDevice), "copy final norm gamma");
     if (!bf16_row_to_float_cuda(d_embed, d_x, 0, dim)) throw std::runtime_error("embed launch failed");
+    const bool debug_forward = debug_forward_enabled();
     std::vector<float> h4(static_cast<size_t>(4) * dim);
     std::vector<float> host_x(dim);
     check_cuda(cudaMemcpy(host_x.data(), d_x, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy embed host");
@@ -860,13 +901,17 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
             throw std::runtime_error("single-token attention smoke launch failed");
         }
         check_cuda(cudaMemcpy(host_x.data(), d_attn_out, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy attn out host");
+        if (debug_forward) print_summary("layer=" + std::to_string(li) + ".attn_out", host_x);
         h4 = hc_post_cpu(host_x, h4, attn_hc, dim);
+        round_vector_to_bf16(h4);
+        if (debug_forward) print_summary("layer=" + std::to_string(li) + ".attn_post", h4);
         const HcPreResult ffn_hc = hc_pre_cpu(
             h4,
             reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_ffn_fn)),
             reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_ffn_scale)),
             reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_ffn_base)),
             dim);
+        if (debug_forward) print_summary("layer=" + std::to_string(li) + ".ffn_hc_pre", ffn_hc.x);
         check_cuda(cudaMemcpy(d_resid1, ffn_hc.x.data(), static_cast<size_t>(dim) * sizeof(float), cudaMemcpyHostToDevice), "copy hc ffn pre");
         if (!rmsnorm_bf16_gamma_cuda(d_resid1, d_ffn_gamma, d_ffn_norm, dim, 1e-6f)) throw std::runtime_error("ffn norm launch failed");
         std::vector<float> ffn_norm_host(dim);
@@ -911,9 +956,13 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
             if (!vector_accum_cuda(d_resid2, d_moe, dim, 1.0f)) throw std::runtime_error("shared accum failed");
         }
         check_cuda(cudaMemcpy(host_x.data(), d_moe, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy moe host");
+        if (debug_forward) print_summary("layer=" + std::to_string(li) + ".moe_out", host_x);
         h4 = hc_post_cpu(host_x, h4, ffn_hc, dim);
+        round_vector_to_bf16(h4);
+        if (debug_forward) print_summary("layer=" + std::to_string(li), h4);
     }
 
+    if (debug_forward) print_summary("final_h", h4);
     host_x = hc_head_cpu(
         h4,
         reinterpret_cast<const float*>(ctx.hc_head_shard.tensor_data(*ctx.hc_head_fn)),
