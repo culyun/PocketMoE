@@ -121,6 +121,10 @@ ForwardSmokeResult run_safetensors_min_layer_smoke(const std::string& ckpt_dir) 
 }
 
 ForwardSmokeResult run_safetensors_layer_loop_smoke(const std::string& ckpt_dir, int layer_count) {
+    return run_safetensors_token_forward(ckpt_dir, 1234, layer_count);
+}
+
+ForwardSmokeResult run_safetensors_token_forward(const std::string& ckpt_dir, int token, int layer_count) {
     if (!cuda_runtime_available()) throw std::runtime_error("CUDA runtime is not available");
     SafeTensorsIndex index(ckpt_dir);
     ModelConfig config = ModelConfig::from_hf_config(ckpt_dir);
@@ -135,7 +139,7 @@ ForwardSmokeResult run_safetensors_layer_loop_smoke(const std::string& ckpt_dir,
     Fp4Handle first_w2 = open_fp4(index, "layers.0.ffn.experts.0.w2.weight");
     Fp4Handle first_w3 = open_fp4(index, "layers.0.ffn.experts.0.w3.weight");
 
-    const int token = 1234;
+    if (token < 0 || token >= static_cast<int>(embed->shape[0])) throw std::runtime_error("token id out of range");
     const int dim = static_cast<int>(embed->shape[1]);
     const int q_a_dim = 1024;
     const int q_dim = 32768;
