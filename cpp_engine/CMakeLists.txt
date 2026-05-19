@@ -68,3 +68,7 @@ set_target_properties(test_fp4_matvec PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAK
 add_executable(test_fp8_matvec tests/test_fp8_matvec.cpp)
 target_link_libraries(test_fp8_matvec PRIVATE dsv4_cpp_core)
 set_target_properties(test_fp8_matvec PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_rmsnorm tests/test_rmsnorm.cpp)
+target_link_libraries(test_rmsnorm PRIVATE dsv4_cpp_core)
+set_target_properties(test_rmsnorm PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)

@@ -33,4 +33,12 @@ bool fp8_e4m3_e8m0_matvec_cuda(
     int cols,
     void* stream = nullptr);
 
+bool rmsnorm_bf16_gamma_cuda(
+    const float* d_x,
+    const uint16_t* d_gamma_bf16,
+    float* d_y,
+    int cols,
+    float eps,
+    void* stream = nullptr);
+
 }  // namespace dsv4
