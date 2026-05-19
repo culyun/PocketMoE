@@ -2,6 +2,7 @@
 #include "dsv4_engine.hpp"
 #include "model_config.hpp"
 #include "safetensors_reader.hpp"
+#include "tokenizer.hpp"
 
 #include <iostream>
 #include <stdexcept>
@@ -111,12 +112,15 @@ int main(int argc, char** argv) {
             }
             if (args.smoke_forward) {
                 if (args.generate_token) {
+                    dsv4::Tokenizer tokenizer(args.ckpt);
                     int token = args.forward_token;
                     for (int step = 0; step < args.max_new_tokens; ++step) {
                         dsv4::ForwardSmokeResult result = dsv4::run_safetensors_token_forward(args.ckpt, token, args.smoke_layers);
                         std::cout << "generate_step=" << step
                                   << " token=" << result.token
+                                  << " token_text=" << tokenizer.decode_piece(result.token)
                                   << " top_token=" << result.top_token
+                                  << " top_text=" << tokenizer.decode_piece(result.top_token)
                                   << " top_logit=" << result.top_logit
                                   << " checksum=" << result.checksum << "\n";
                         token = result.top_token;

@@ -17,6 +17,7 @@ add_library(dsv4_cpp_core STATIC
     src/safetensors_reader.cpp
     src/safetensors_model.cpp
     src/model_config.cpp
+    src/tokenizer.cpp
     src/tensor.cpp
     src/dsv4_engine.cpp
     src/sampler.cpp
@@ -85,6 +86,10 @@ set_target_properties(test_moe_single_expert PROPERTIES RUNTIME_OUTPUT_DIRECTORY
 add_executable(test_embedding_head tests/test_embedding_head.cpp)
 target_link_libraries(test_embedding_head PRIVATE dsv4_cpp_core)
 set_target_properties(test_embedding_head PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_tokenizer tests/test_tokenizer.cpp)
+target_link_libraries(test_tokenizer PRIVATE dsv4_cpp_core)
+set_target_properties(test_tokenizer PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_min_layer_smoke tests/test_min_layer_smoke.cpp)
 target_link_libraries(test_min_layer_smoke PRIVATE dsv4_cpp_core)
