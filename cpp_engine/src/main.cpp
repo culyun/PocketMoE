@@ -121,7 +121,7 @@ int main(int argc, char** argv) {
                 dsv4::Tokenizer tokenizer(args.ckpt);
                 std::vector<int> prompt_ids;
                 if (!args.prompt.empty()) {
-                    prompt_ids = tokenizer.encode_basic(args.prompt, true);
+                    prompt_ids = tokenizer.encode_basic(args.prompt, false);
                     if (prompt_ids.empty()) throw std::runtime_error("prompt encoded to no tokens");
                     args.forward_token = prompt_ids.back();
                     args.position = static_cast<int>(prompt_ids.size()) - 1;

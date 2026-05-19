@@ -194,9 +194,11 @@ struct SafeForwardContext {
           index(dir),
           config(ModelConfig::from_hf_config(dir)),
           embed_shard(index.shard_path(require_shard_name(index, "embed.weight"))),
-          head_shard(index.shard_path(require_shard_name(index, "head.weight"))) {
+          head_shard(index.shard_path(require_shard_name(index, "head.weight"))),
+          final_norm_shard(index.shard_path(require_shard_name(index, "norm.weight"))) {
         embed = require_tensor(embed_shard, "embed.weight");
         head = require_tensor(head_shard, "head.weight");
+        final_norm = require_tensor(final_norm_shard, "norm.weight");
     }
 
     ~SafeForwardContext() {
@@ -217,8 +219,10 @@ struct SafeForwardContext {
     ModelConfig config;
     SafeTensorsShard embed_shard;
     SafeTensorsShard head_shard;
+    SafeTensorsShard final_norm_shard;
     const SafeTensorInfo* embed = nullptr;
     const SafeTensorInfo* head = nullptr;
+    const SafeTensorInfo* final_norm = nullptr;
     int kv_cache_tokens = 0;
     std::unordered_map<int, float*> kv_cache;
 };
@@ -333,6 +337,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     uint8_t* d_w3 = nullptr;
     uint8_t* d_s3 = nullptr;
     uint16_t* d_head = nullptr;
+    uint16_t* d_final_norm_gamma = nullptr;
     float* d_x = nullptr;
     float* d_attn_norm = nullptr;
     float* d_q_a = nullptr;
@@ -369,13 +374,14 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     check_cuda(cudaMalloc(&d_wo_b_scale, static_cast<size_t>(dim / 128) * (attn_dims.attn_mid / 128)), "cudaMalloc wo_b scale");
     check_cuda(cudaMalloc(&d_attn_sink, static_cast<size_t>(attn_dims.heads) * sizeof(float)), "cudaMalloc attn sink");
     check_cuda(cudaMalloc(&d_ffn_gamma, static_cast<size_t>(dim) * sizeof(uint16_t)), "cudaMalloc ffn gamma");
-    check_cuda(cudaMalloc(&d_w1, first_w1.w->nbytes), "cudaMalloc w1");
+    check_cuda(cudaMalloc(&d_w1, static_cast<size_t>(inter) * dim), "cudaMalloc w1");
     check_cuda(cudaMalloc(&d_s1, first_w1.s->nbytes), "cudaMalloc s1");
-    check_cuda(cudaMalloc(&d_w2, first_w2.w->nbytes), "cudaMalloc w2");
+    check_cuda(cudaMalloc(&d_w2, static_cast<size_t>(dim) * inter), "cudaMalloc w2");
     check_cuda(cudaMalloc(&d_s2, first_w2.s->nbytes), "cudaMalloc s2");
-    check_cuda(cudaMalloc(&d_w3, first_w3.w->nbytes), "cudaMalloc w3");
+    check_cuda(cudaMalloc(&d_w3, static_cast<size_t>(inter) * dim), "cudaMalloc w3");
     check_cuda(cudaMalloc(&d_s3, first_w3.s->nbytes), "cudaMalloc s3");
     check_cuda(cudaMalloc(&d_head, static_cast<size_t>(head_rows) * dim * sizeof(uint16_t)), "cudaMalloc head");
+    check_cuda(cudaMalloc(&d_final_norm_gamma, static_cast<size_t>(dim) * sizeof(uint16_t)), "cudaMalloc final norm gamma");
     check_cuda(cudaMalloc(&d_x, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc x");
     check_cuda(cudaMalloc(&d_attn_norm, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc attn norm");
     check_cuda(cudaMalloc(&d_q_a, static_cast<size_t>(attn_dims.q_a_dim) * sizeof(float)), "cudaMalloc q_a");
@@ -397,6 +403,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
 
     check_cuda(cudaMemcpy(d_embed, embed_data, static_cast<size_t>(dim) * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy embed");
     check_cuda(cudaMemcpy(d_head, ctx.head_shard.tensor_data(*head), static_cast<size_t>(head_rows) * dim * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy head");
+    check_cuda(cudaMemcpy(d_final_norm_gamma, ctx.final_norm_shard.tensor_data(*ctx.final_norm), ctx.final_norm->nbytes, cudaMemcpyHostToDevice), "copy final norm gamma");
     if (!bf16_row_to_float_cuda(d_embed, d_x, 0, dim)) throw std::runtime_error("embed launch failed");
 
     for (int li = 0; li < layer_count; ++li) {
@@ -494,11 +501,32 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
             if (!fp4_e2m1_e8m0_matvec_cuda(d_hidden, d_w2, d_s2, d_resid2, dim, inter)) throw std::runtime_error("w2 launch failed");
             if (!vector_accum_cuda(d_resid2, d_moe, dim, route.weight)) throw std::runtime_error("moe accum failed");
         }
+        {
+            SafeTensorsShard shared_shard(index.shard_path(*index.shard_for_tensor(prefix + "ffn.shared_experts.w1.weight")));
+            const auto* w1 = require_tensor(shared_shard, prefix + "ffn.shared_experts.w1.weight");
+            const auto* s1 = require_tensor(shared_shard, prefix + "ffn.shared_experts.w1.scale");
+            const auto* w2 = require_tensor(shared_shard, prefix + "ffn.shared_experts.w2.weight");
+            const auto* s2 = require_tensor(shared_shard, prefix + "ffn.shared_experts.w2.scale");
+            const auto* w3 = require_tensor(shared_shard, prefix + "ffn.shared_experts.w3.weight");
+            const auto* s3 = require_tensor(shared_shard, prefix + "ffn.shared_experts.w3.scale");
+            check_cuda(cudaMemcpy(d_w1, shared_shard.tensor_data(*w1), w1->nbytes, cudaMemcpyHostToDevice), "copy shared w1");
+            check_cuda(cudaMemcpy(d_s1, shared_shard.tensor_data(*s1), s1->nbytes, cudaMemcpyHostToDevice), "copy shared s1");
+            check_cuda(cudaMemcpy(d_w2, shared_shard.tensor_data(*w2), w2->nbytes, cudaMemcpyHostToDevice), "copy shared w2");
+            check_cuda(cudaMemcpy(d_s2, shared_shard.tensor_data(*s2), s2->nbytes, cudaMemcpyHostToDevice), "copy shared s2");
+            check_cuda(cudaMemcpy(d_w3, shared_shard.tensor_data(*w3), w3->nbytes, cudaMemcpyHostToDevice), "copy shared w3");
+            check_cuda(cudaMemcpy(d_s3, shared_shard.tensor_data(*s3), s3->nbytes, cudaMemcpyHostToDevice), "copy shared s3");
+            if (!fp8_e4m3_e8m0_matvec_cuda(d_ffn_norm, d_w1, d_s1, d_gate, inter, dim)) throw std::runtime_error("shared w1 launch failed");
+            if (!fp8_e4m3_e8m0_matvec_cuda(d_ffn_norm, d_w3, d_s3, d_up, inter, dim)) throw std::runtime_error("shared w3 launch failed");
+            if (!silu_mul_cuda(d_gate, d_up, d_hidden, inter)) throw std::runtime_error("shared silu launch failed");
+            if (!fp8_e4m3_e8m0_matvec_cuda(d_hidden, d_w2, d_s2, d_resid2, dim, inter)) throw std::runtime_error("shared w2 launch failed");
+            if (!vector_accum_cuda(d_resid2, d_moe, dim, 1.0f)) throw std::runtime_error("shared accum failed");
+        }
         if (!vector_add_cuda(d_resid1, d_moe, d_resid2, dim)) throw std::runtime_error("resid2 launch failed");
         check_cuda(cudaMemcpy(d_x, d_resid2, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToDevice), "advance residual");
     }
 
-    if (!bf16_matvec_cuda(d_x, d_head, d_logits, head_rows, dim)) throw std::runtime_error("head launch failed");
+    if (!rmsnorm_bf16_gamma_cuda(d_x, d_final_norm_gamma, d_resid1, dim, 1e-6f)) throw std::runtime_error("final norm launch failed");
+    if (!bf16_matvec_cuda(d_resid1, d_head, d_logits, head_rows, dim)) throw std::runtime_error("head launch failed");
     check_cuda(cudaDeviceSynchronize(), "sync kernels");
 
     std::vector<float> logits(head_rows);
@@ -539,6 +567,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     cudaFree(d_w3);
     cudaFree(d_s3);
     cudaFree(d_head);
+    cudaFree(d_final_norm_gamma);
     cudaFree(d_x);
     cudaFree(d_attn_norm);
     cudaFree(d_q_a);
