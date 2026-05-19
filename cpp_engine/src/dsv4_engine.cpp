@@ -539,6 +539,8 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     float* d_attn_out = nullptr;
     float* d_index_q = nullptr;
     float* d_indexer_kv = nullptr;
+    uint16_t* d_index_weight_proj = nullptr;
+    int* d_index_selected = nullptr;
     int* d_kv_indices = nullptr;
     float* d_resid1 = nullptr;
     float* d_ffn_norm = nullptr;
@@ -586,6 +588,8 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     check_cuda(cudaMalloc(&d_attn_out, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc attn out");
     check_cuda(cudaMalloc(&d_index_q, static_cast<size_t>(std::max<uint64_t>(1, config.index_n_heads * config.index_head_dim)) * sizeof(float)), "cudaMalloc index q");
     check_cuda(cudaMalloc(&d_indexer_kv, static_cast<size_t>(std::max<uint64_t>(1, config.index_head_dim)) * sizeof(float)), "cudaMalloc indexer kv tmp");
+    check_cuda(cudaMalloc(&d_index_weight_proj, static_cast<size_t>(std::max<uint64_t>(1, config.index_n_heads * config.dim)) * sizeof(uint16_t)), "cudaMalloc index weight proj");
+    check_cuda(cudaMalloc(&d_index_selected, 640 * sizeof(int)), "cudaMalloc index selected");
     check_cuda(cudaMalloc(&d_kv_indices, 640 * sizeof(int)), "cudaMalloc kv indices");
     check_cuda(cudaMalloc(&d_resid1, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc resid1");
     check_cuda(cudaMalloc(&d_ffn_norm, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc ffn norm");
@@ -781,33 +785,25 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
                 check_cuda(cudaMemcpy(d_s2, idx_shard.tensor_data(*idx_wq_b_scale), idx_wq_b_scale->nbytes, cudaMemcpyHostToDevice), "copy indexer wq_b scale");
                 if (!fp8_e4m3_e8m0_matvec_cuda(d_q_norm, d_w2, d_s2, d_index_q, idx_heads * idx_head_dim, attn_dims.q_a_dim)) throw std::runtime_error("indexer wq_b launch failed");
                 if (!head_rmsnorm_rope_cuda(d_index_q, idx_heads, idx_head_dim, attn_dims.rope_dim, position, attn_dims.rope_theta, false, 1e-6f)) throw std::runtime_error("indexer q rope launch failed");
-                std::vector<float> index_q(static_cast<size_t>(idx_heads) * idx_head_dim);
-                std::vector<float> index_weights(idx_heads);
-                std::vector<float> index_kv(static_cast<size_t>(compressed_ready) * idx_head_dim);
-                check_cuda(cudaMemcpy(index_q.data(), d_index_q, index_q.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy index q host");
-                check_cuda(cudaMemcpy(index_kv.data(), ctx.indexer_kv_cache_for_layer(li, idx_head_dim), index_kv.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy index kv host");
-                const auto* wproj = reinterpret_cast<const uint16_t*>(idx_shard.tensor_data(*idx_weights));
-                const float weight_scale = 1.0f / std::sqrt(static_cast<float>(idx_head_dim) * static_cast<float>(idx_heads));
-                for (int h = 0; h < idx_heads; ++h) {
-                    double dot = 0.0;
-                    for (int d = 0; d < dim; ++d) dot += static_cast<double>(bf16_to_float(wproj[static_cast<size_t>(h) * dim + d])) * attn_hc.x[d];
-                    index_weights[h] = static_cast<float>(dot) * weight_scale;
-                }
-                std::vector<float> scores(compressed_ready, 0.0f);
-                for (int c = 0; c < compressed_ready; ++c) {
-                    float score = 0.0f;
-                    for (int h = 0; h < idx_heads; ++h) {
-                        float dot = 0.0f;
-                        for (int d = 0; d < idx_head_dim; ++d) dot += index_q[static_cast<size_t>(h) * idx_head_dim + d] * index_kv[static_cast<size_t>(c) * idx_head_dim + d];
-                        score += std::max(0.0f, dot) * index_weights[h];
-                    }
-                    scores[c] = score;
-                }
-                std::vector<int> order(compressed_ready);
-                std::iota(order.begin(), order.end(), 0);
                 const int keep = std::min<int>(compressed_ready, std::max<uint64_t>(1, config.index_topk));
-                std::partial_sort(order.begin(), order.begin() + keep, order.end(), [&](int a, int b) { return scores[a] > scores[b]; });
-                for (int i = 0; i < keep; ++i) kv_indices.push_back(attn_dims.window_size + order[i]);
+                check_cuda(cudaMemcpy(d_index_weight_proj, idx_shard.tensor_data(*idx_weights), idx_weights->nbytes, cudaMemcpyHostToDevice), "copy indexer weights proj");
+                if (!indexer_select_topk_cuda(
+                        d_index_q,
+                        ctx.indexer_kv_cache_for_layer(li, idx_head_dim),
+                        d_index_weight_proj,
+                        d_x,
+                        d_index_selected,
+                        compressed_ready,
+                        keep,
+                        idx_heads,
+                        idx_head_dim,
+                        dim,
+                        attn_dims.window_size)) {
+                    throw std::runtime_error("indexer topk launch failed");
+                }
+                std::vector<int> selected(keep);
+                check_cuda(cudaMemcpy(selected.data(), d_index_selected, selected.size() * sizeof(int), cudaMemcpyDeviceToHost), "copy indexer selected");
+                kv_indices.insert(kv_indices.end(), selected.begin(), selected.end());
             } else {
                 for (int c = 0; c < compressed_ready; ++c) {
                     const int slot = attn_dims.window_size + c;
@@ -966,6 +962,8 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     cudaFree(d_attn_out);
     cudaFree(d_index_q);
     cudaFree(d_indexer_kv);
+    cudaFree(d_index_weight_proj);
+    cudaFree(d_index_selected);
     cudaFree(d_kv_indices);
     cudaFree(d_resid1);
     cudaFree(d_ffn_norm);

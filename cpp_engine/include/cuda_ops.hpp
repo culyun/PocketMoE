@@ -117,6 +117,20 @@ bool indexed_cached_single_token_attention_cuda(
     float scale,
     void* stream = nullptr);
 
+bool indexer_select_topk_cuda(
+    const float* d_index_q,
+    const float* d_index_kv,
+    const uint16_t* d_weight_proj_bf16,
+    const float* d_x,
+    int* d_out_indices,
+    int compressed_count,
+    int keep,
+    int heads,
+    int head_dim,
+    int dim,
+    int offset,
+    void* stream = nullptr);
+
 bool head_rmsnorm_rope_cuda(
     float* d_x,
     int heads,

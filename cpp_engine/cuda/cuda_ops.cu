@@ -164,6 +164,11 @@ __global__ void cached_single_token_attention_kernel(
     }
 }
 
+__device__ float bf16_to_float_device(uint16_t bits) {
+    uint32_t value = static_cast<uint32_t>(bits) << 16;
+    return __uint_as_float(value);
+}
+
 __global__ void indexed_cached_single_token_attention_kernel(
     const float* q,
     const float* kv_cache,
@@ -223,6 +228,52 @@ __global__ void indexed_cached_single_token_attention_kernel(
             }
         }
         y[head * head_dim + i] = out;
+    }
+}
+
+__global__ void indexer_select_topk_kernel(
+    const float* index_q,
+    const float* index_kv,
+    const uint16_t* weight_proj,
+    const float* x,
+    int* out_indices,
+    int compressed_count,
+    int keep,
+    int heads,
+    int head_dim,
+    int dim,
+    int offset) {
+    __shared__ float scores[640];
+    if (threadIdx.x < compressed_count) {
+        const int c = threadIdx.x;
+        float score = 0.0f;
+        const float scale = rsqrtf(static_cast<float>(heads * head_dim));
+        for (int h = 0; h < heads; ++h) {
+            float weight = 0.0f;
+            for (int d = 0; d < dim; ++d) weight += bf16_to_float_device(weight_proj[static_cast<size_t>(h) * dim + d]) * x[d];
+            weight *= scale;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; ++d) dot += index_q[static_cast<size_t>(h) * head_dim + d] * index_kv[static_cast<size_t>(c) * head_dim + d];
+            score += fmaxf(0.0f, dot) * weight;
+        }
+        scores[c] = score;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        bool selected[640];
+        for (int i = 0; i < compressed_count; ++i) selected[i] = false;
+        for (int k = 0; k < keep; ++k) {
+            int best = 0;
+            float best_score = -INFINITY;
+            for (int i = 0; i < compressed_count; ++i) {
+                if (!selected[i] && scores[i] > best_score) {
+                    best_score = scores[i];
+                    best = i;
+                }
+            }
+            selected[best] = true;
+            out_indices[k] = offset + best;
+        }
     }
 }
 
@@ -306,6 +357,26 @@ bool indexed_cached_single_token_attention_cuda(
     if (d_q == nullptr || d_kv_cache == nullptr || d_indices == nullptr || d_y == nullptr || heads <= 0 || head_dim <= 0 || index_count <= 0 || index_count > 640) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     indexed_cached_single_token_attention_kernel<<<heads, 256, 0, cuda_stream>>>(d_q, d_kv_cache, d_indices, d_attn_sink, d_y, head_dim, index_count, scale);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool indexer_select_topk_cuda(
+    const float* d_index_q,
+    const float* d_index_kv,
+    const uint16_t* d_weight_proj_bf16,
+    const float* d_x,
+    int* d_out_indices,
+    int compressed_count,
+    int keep,
+    int heads,
+    int head_dim,
+    int dim,
+    int offset,
+    void* stream) {
+    if (d_index_q == nullptr || d_index_kv == nullptr || d_weight_proj_bf16 == nullptr || d_x == nullptr || d_out_indices == nullptr) return false;
+    if (compressed_count <= 0 || compressed_count > 640 || keep <= 0 || keep > compressed_count || heads <= 0 || head_dim <= 0 || dim <= 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    indexer_select_topk_kernel<<<1, 640, 0, cuda_stream>>>(d_index_q, d_index_kv, d_weight_proj_bf16, d_x, d_out_indices, compressed_count, keep, heads, head_dim, dim, offset);
     return cudaGetLastError() == cudaSuccess;
 }
 
