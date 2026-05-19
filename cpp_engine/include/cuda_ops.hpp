@@ -41,4 +41,11 @@ bool rmsnorm_bf16_gamma_cuda(
     float eps,
     void* stream = nullptr);
 
+bool silu_mul_cuda(
+    const float* d_gate,
+    const float* d_up,
+    float* d_y,
+    int cols,
+    void* stream = nullptr);
+
 }  // namespace dsv4
