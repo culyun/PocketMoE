@@ -175,7 +175,35 @@ Fp4Handle open_fp4(const SafeTensorsIndex& index, const std::string& name) {
     return h;
 }
 
+const std::string& require_shard_name(const SafeTensorsIndex& index, const std::string& tensor) {
+    const std::string* shard = index.shard_for_tensor(tensor);
+    if (shard == nullptr) throw std::runtime_error("missing tensor in checkpoint index: " + tensor);
+    return *shard;
+}
+
+struct SafeForwardContext {
+    explicit SafeForwardContext(const std::string& dir)
+        : ckpt_dir(dir),
+          index(dir),
+          config(ModelConfig::from_hf_config(dir)),
+          embed_shard(index.shard_path(require_shard_name(index, "embed.weight"))),
+          head_shard(index.shard_path(require_shard_name(index, "head.weight"))) {
+        embed = require_tensor(embed_shard, "embed.weight");
+        head = require_tensor(head_shard, "head.weight");
+    }
+
+    std::string ckpt_dir;
+    SafeTensorsIndex index;
+    ModelConfig config;
+    SafeTensorsShard embed_shard;
+    SafeTensorsShard head_shard;
+    const SafeTensorInfo* embed = nullptr;
+    const SafeTensorInfo* head = nullptr;
+};
+
 }  // namespace
+
+ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, int token, int layer_count, int position);
 
 Dsv4Engine::Dsv4Engine(const std::string& model_path) : gguf_(model_path), config_(ModelConfig::from_gguf(gguf_)) {}
 
@@ -193,24 +221,23 @@ ForwardSmokeResult run_safetensors_token_forward(const std::string& ckpt_dir, in
 
 ForwardSmokeResult run_safetensors_prompt_forward(const std::string& ckpt_dir, const std::vector<int>& tokens, int layer_count) {
     if (tokens.empty()) throw std::runtime_error("prompt has no tokens");
+    SafeForwardContext ctx(ckpt_dir);
     ForwardSmokeResult result;
     for (size_t i = 0; i < tokens.size(); ++i) {
-        result = run_safetensors_token_forward_at_position(ckpt_dir, tokens[i], layer_count, static_cast<int>(i));
+        result = run_safetensors_token_forward_impl(ctx, tokens[i], layer_count, static_cast<int>(i));
     }
     return result;
 }
 
-ForwardSmokeResult run_safetensors_token_forward_at_position(const std::string& ckpt_dir, int token, int layer_count, int position) {
+ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, int token, int layer_count, int position) {
     if (!cuda_runtime_available()) throw std::runtime_error("CUDA runtime is not available");
-    SafeTensorsIndex index(ckpt_dir);
-    ModelConfig config = ModelConfig::from_hf_config(ckpt_dir);
+    SafeTensorsIndex& index = ctx.index;
+    ModelConfig& config = ctx.config;
     if (layer_count <= 0) layer_count = 1;
     if (config.n_layers > 0) layer_count = std::min(layer_count, static_cast<int>(config.n_layers));
 
-    SafeTensorsShard embed_shard(index.shard_path(*index.shard_for_tensor("embed.weight")));
-    SafeTensorsShard head_shard(index.shard_path(*index.shard_for_tensor("head.weight")));
-    const auto* embed = require_tensor(embed_shard, "embed.weight");
-    const auto* head = require_tensor(head_shard, "head.weight");
+    const auto* embed = ctx.embed;
+    const auto* head = ctx.head;
     Fp4Handle first_w1 = open_fp4(index, "layers.0.ffn.experts.0.w1.weight");
     Fp4Handle first_w2 = open_fp4(index, "layers.0.ffn.experts.0.w2.weight");
     Fp4Handle first_w3 = open_fp4(index, "layers.0.ffn.experts.0.w3.weight");
@@ -281,7 +308,7 @@ ForwardSmokeResult run_safetensors_token_forward_at_position(const std::string& 
     float* d_resid2 = nullptr;
     float* d_logits = nullptr;
 
-    const auto* embed_data = reinterpret_cast<const uint16_t*>(embed_shard.tensor_data(*embed)) + static_cast<size_t>(token) * dim;
+    const auto* embed_data = reinterpret_cast<const uint16_t*>(ctx.embed_shard.tensor_data(*embed)) + static_cast<size_t>(token) * dim;
     check_cuda(cudaMalloc(&d_embed, static_cast<size_t>(dim) * sizeof(uint16_t)), "cudaMalloc embed");
     check_cuda(cudaMalloc(&d_attn_gamma, static_cast<size_t>(dim) * sizeof(uint16_t)), "cudaMalloc attn gamma");
     check_cuda(cudaMalloc(&d_wq_a, static_cast<size_t>(attn_dims.q_a_dim) * dim), "cudaMalloc wq_a");
@@ -325,7 +352,7 @@ ForwardSmokeResult run_safetensors_token_forward_at_position(const std::string& 
     check_cuda(cudaMalloc(&d_logits, static_cast<size_t>(head_rows) * sizeof(float)), "cudaMalloc logits");
 
     check_cuda(cudaMemcpy(d_embed, embed_data, static_cast<size_t>(dim) * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy embed");
-    check_cuda(cudaMemcpy(d_head, head_shard.tensor_data(*head), static_cast<size_t>(head_rows) * dim * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy head");
+    check_cuda(cudaMemcpy(d_head, ctx.head_shard.tensor_data(*head), static_cast<size_t>(head_rows) * dim * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy head");
     if (!bf16_row_to_float_cuda(d_embed, d_x, 0, dim)) throw std::runtime_error("embed launch failed");
 
     for (int li = 0; li < layer_count; ++li) {
@@ -483,6 +510,11 @@ ForwardSmokeResult run_safetensors_token_forward_at_position(const std::string& 
     cudaFree(d_logits);
 
     return ForwardSmokeResult{token, dim, inter, head_rows, layer_count, top_token, top_logit, checksum};
+}
+
+ForwardSmokeResult run_safetensors_token_forward_at_position(const std::string& ckpt_dir, int token, int layer_count, int position) {
+    SafeForwardContext ctx(ckpt_dir);
+    return run_safetensors_token_forward_impl(ctx, token, layer_count, position);
 }
 
 }  // namespace dsv4
