@@ -21,6 +21,7 @@ add_library(dsv4_cpp_core STATIC
     src/dsv4_engine.cpp
     src/sampler.cpp
     cuda/cuda_ops.cu
+    cuda/bf16_ops.cu
     cuda/quant_gemm.cu
     cuda/fp4_ops.cu
     cuda/fp8_ops.cu
@@ -80,3 +81,7 @@ set_target_properties(test_attention_projection PROPERTIES RUNTIME_OUTPUT_DIRECT
 add_executable(test_moe_single_expert tests/test_moe_single_expert.cpp)
 target_link_libraries(test_moe_single_expert PRIVATE dsv4_cpp_core)
 set_target_properties(test_moe_single_expert PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_embedding_head tests/test_embedding_head.cpp)
+target_link_libraries(test_embedding_head PRIVATE dsv4_cpp_core)
+set_target_properties(test_embedding_head PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)

@@ -48,4 +48,19 @@ bool silu_mul_cuda(
     int cols,
     void* stream = nullptr);
 
+bool bf16_row_to_float_cuda(
+    const uint16_t* d_matrix_bf16,
+    float* d_y,
+    int row,
+    int cols,
+    void* stream = nullptr);
+
+bool bf16_matvec_cuda(
+    const float* d_x,
+    const uint16_t* d_w_bf16,
+    float* d_y,
+    int rows,
+    int cols,
+    void* stream = nullptr);
+
 }  // namespace dsv4
