@@ -307,11 +307,20 @@ struct SafeForwardContext {
         for (auto& [_, ptr] : kv_cache) cudaFree(ptr);
     }
 
-    float* kv_cache_for_layer(int layer_id, int max_tokens, int head_dim) {
+    int kv_cache_capacity_for_layer(int layer_id) const {
+        const int window = static_cast<int>(config.window_size == 0 ? 128 : config.window_size);
+        uint64_t ratio = 0;
+        if (layer_id >= 0 && static_cast<size_t>(layer_id) < config.compress_ratios.size()) ratio = config.compress_ratios[static_cast<size_t>(layer_id)];
+        const int compressed = ratio == 0 ? 0 : (kv_cache_tokens + static_cast<int>(ratio) - 1) / static_cast<int>(ratio);
+        return std::min(256, window + compressed);
+    }
+
+    float* kv_cache_for_layer(int layer_id, int head_dim) {
         auto it = kv_cache.find(layer_id);
         if (it != kv_cache.end()) return it->second;
         float* ptr = nullptr;
-        check_cuda(cudaMalloc(&ptr, static_cast<size_t>(max_tokens) * head_dim * sizeof(float)), "cudaMalloc kv cache");
+        const int capacity = kv_cache_capacity_for_layer(layer_id);
+        check_cuda(cudaMalloc(&ptr, static_cast<size_t>(capacity) * head_dim * sizeof(float)), "cudaMalloc kv cache");
         kv_cache[layer_id] = ptr;
         return ptr;
     }
@@ -519,8 +528,8 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     for (int li = 0; li < layer_count; ++li) {
         const std::string prefix = "layers." + std::to_string(li) + ".";
         attn_dims.layer_id = li;
-        float* d_layer_kv_cache = ctx.kv_cache_tokens > 0 ? ctx.kv_cache_for_layer(li, ctx.kv_cache_tokens, attn_dims.head_dim) : nullptr;
-        const int layer_cache_len = d_layer_kv_cache == nullptr ? 0 : std::min(position + 1, ctx.kv_cache_tokens);
+        float* d_layer_kv_cache = ctx.kv_cache_tokens > 0 ? ctx.kv_cache_for_layer(li, attn_dims.head_dim) : nullptr;
+        const int layer_cache_len = d_layer_kv_cache == nullptr ? 0 : std::min(position + 1, std::min(ctx.kv_cache_tokens, static_cast<int>(ctx.config.window_size == 0 ? 128 : ctx.config.window_size)));
         SafeTensorsShard attn_norm_shard(index.shard_path(*index.shard_for_tensor(prefix + "attn_norm.weight")));
         SafeTensorsShard qkv_shard(index.shard_path(*index.shard_for_tensor(prefix + "attn.wq_a.weight")));
         SafeTensorsShard wo_a_shard(index.shard_path(*index.shard_for_tensor(prefix + "attn.wo_a.weight")));
