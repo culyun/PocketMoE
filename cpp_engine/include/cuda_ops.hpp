@@ -70,4 +70,11 @@ bool vector_add_cuda(
     int cols,
     void* stream = nullptr);
 
+bool vector_accum_cuda(
+    const float* d_x,
+    float* d_y,
+    int cols,
+    float scale,
+    void* stream = nullptr);
+
 }  // namespace dsv4

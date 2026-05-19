@@ -17,6 +17,10 @@ __global__ void vector_add_kernel(const float* a, const float* b, float* y, int 
     for (int c = threadIdx.x; c < cols; c += blockDim.x) y[c] = a[c] + b[c];
 }
 
+__global__ void vector_accum_kernel(const float* x, float* y, int cols, float scale) {
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) y[c] += x[c] * scale;
+}
+
 }  // namespace
 
 bool cuda_runtime_available() {
@@ -35,6 +39,13 @@ bool vector_add_cuda(const float* d_a, const float* d_b, float* d_y, int cols, v
     if (d_a == nullptr || d_b == nullptr || d_y == nullptr || cols <= 0) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     vector_add_kernel<<<1, 256, 0, cuda_stream>>>(d_a, d_b, d_y, cols);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool vector_accum_cuda(const float* d_x, float* d_y, int cols, float scale, void* stream) {
+    if (d_x == nullptr || d_y == nullptr || cols <= 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    vector_accum_kernel<<<1, 256, 0, cuda_stream>>>(d_x, d_y, cols, scale);
     return cudaGetLastError() == cudaSuccess;
 }
 
