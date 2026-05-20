@@ -263,6 +263,30 @@ struct AttentionSmokeDims {
     float rope_theta = 0.0f;
 };
 
+AttentionSmokeDims make_attention_dims(const ModelConfig& config, int dim, int tp_world, int position) {
+    AttentionSmokeDims dims;
+    dims.dim = dim;
+    dims.q_a_dim = static_cast<int>(config.q_lora_rank);
+    const int global_heads = static_cast<int>(config.n_heads);
+    const int global_groups = static_cast<int>(config.o_groups);
+    if ((global_heads % tp_world) != 0 || (global_groups % tp_world) != 0) throw std::runtime_error("attention heads/groups must divide TP world");
+    dims.heads = global_heads / tp_world;
+    dims.head_dim = static_cast<int>(config.head_dim);
+    dims.q_dim = dims.heads * dims.head_dim;
+    dims.kv_dim = static_cast<int>(config.kv_heads * config.head_dim);
+    dims.groups = global_groups / tp_world;
+    dims.group_rank = static_cast<int>(config.o_lora_rank);
+    dims.attn_mid = dims.group_rank * dims.groups;
+    dims.rope_dim = static_cast<int>(config.rope_dim);
+    dims.position = position;
+    dims.window_size = static_cast<int>(config.window_size == 0 ? 128 : config.window_size);
+    if (dims.q_a_dim <= 0 || dims.heads <= 0 || dims.head_dim <= 0 || dims.kv_dim <= 0 || dims.groups <= 0 || dims.group_rank <= 0 || dims.rope_dim <= 0) throw std::runtime_error("invalid attention dimensions in config");
+    if (dims.q_dim % dims.groups != 0) throw std::runtime_error("attention q dim must be divisible by output groups");
+    if (dims.kv_dim != dims.head_dim) throw std::runtime_error("single-token attention expects one KV head");
+    dims.group_dim = dims.q_dim / dims.groups;
+    return dims;
+}
+
 bool run_single_token_attention_smoke(
     const AttentionSmokeDims& dims,
     const float* d_x,
@@ -848,6 +872,19 @@ struct SafeForwardContext {
         }
     }
 
+    void prepare_resident_device_caches(int layer_count, int tp_world, int tp_rank, int dim) {
+        if (layer_count <= 0) layer_count = static_cast<int>(config.n_layers);
+        layer_count = std::min(layer_count, static_cast<int>(config.n_layers));
+        const int world = std::max(1, tp_world);
+        const int rank = std::max(0, tp_rank);
+        AttentionSmokeDims dims = make_attention_dims(config, dim, world, 0);
+        for (int li = 0; li < layer_count; ++li) {
+            (void)attention_device_cache(li, world, rank, dims);
+            (void)shared_device_cache(li, world, rank, dim);
+            (void)gate_device_cache(li);
+        }
+    }
+
     DeviceFp4ActiveArena& active_fp4_arena(int layer_id, int tp_world, int tp_rank, int capacity, const DeviceFp4ExpertCache& sample) {
         const std::string key = std::to_string(layer_id) + ":" + std::to_string(tp_world) + ":" + std::to_string(tp_rank) + ":" + std::to_string(capacity);
         auto it = active_arena_cache.find(key);
@@ -1071,6 +1108,8 @@ GenerateSmokeResult run_safetensors_generate_tokens_timed_with_options(const std
     SafeForwardContext ctx(ckpt_dir);
     ctx.options = options;
     ctx.kv_cache_tokens = static_cast<int>(std::min<size_t>(seed_tokens.size() + static_cast<size_t>(max_new_tokens), 256));
+    const int dim = static_cast<int>(ctx.embed->shape[1]);
+    ctx.prepare_resident_device_caches(layer_count, options.tp_world, options.tp_rank, dim);
     const bool prepare_fp4_host = !options.skip_fp4_host_prepare && env_int_or_default("DSV4_CPP_PREPARE_FP4_HOST", 0) != 0;
     if (prepare_fp4_host) ctx.prepare_fp4_host_weights(layer_count, options.tp_world, options.tp_rank);
     const auto timed_t0 = Clock::now();
@@ -1132,28 +1171,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     const int tp_rank = std::max(0, ctx.options.tp_rank);
     if (tp_rank >= tp_world) throw std::runtime_error("invalid TP rank in forward options");
     const int dim = static_cast<int>(embed->shape[1]);
-    AttentionSmokeDims attn_dims;
-    attn_dims.dim = dim;
-    attn_dims.q_a_dim = static_cast<int>(config.q_lora_rank);
-    const int global_heads = static_cast<int>(config.n_heads);
-    const int global_groups = static_cast<int>(config.o_groups);
-    if ((global_heads % tp_world) != 0 || (global_groups % tp_world) != 0) throw std::runtime_error("attention heads/groups must divide TP world");
-    attn_dims.heads = global_heads / tp_world;
-    attn_dims.head_dim = static_cast<int>(config.head_dim);
-    attn_dims.q_dim = attn_dims.heads * attn_dims.head_dim;
-    attn_dims.kv_dim = static_cast<int>(config.kv_heads * config.head_dim);
-    attn_dims.groups = global_groups / tp_world;
-    attn_dims.group_rank = static_cast<int>(config.o_lora_rank);
-    attn_dims.attn_mid = attn_dims.group_rank * attn_dims.groups;
-    attn_dims.rope_dim = static_cast<int>(config.rope_dim);
-    attn_dims.position = position;
-    attn_dims.window_size = static_cast<int>(config.window_size == 0 ? 128 : config.window_size);
-    if (attn_dims.q_a_dim <= 0 || attn_dims.heads <= 0 || attn_dims.head_dim <= 0 || attn_dims.kv_dim <= 0 || attn_dims.groups <= 0 || attn_dims.group_rank <= 0 || attn_dims.rope_dim <= 0) {
-        throw std::runtime_error("invalid attention dimensions in config");
-    }
-    if (attn_dims.q_dim % attn_dims.groups != 0) throw std::runtime_error("attention q dim must be divisible by output groups");
-    if (attn_dims.kv_dim != attn_dims.head_dim) throw std::runtime_error("single-token attention expects one KV head");
-    attn_dims.group_dim = attn_dims.q_dim / attn_dims.groups;
+    AttentionSmokeDims attn_dims = make_attention_dims(config, dim, tp_world, position);
     const int inter = static_cast<int>(first_w1.pair.rows);
     const int head_rows = static_cast<int>(head->shape[0]);
     if (head_rows % tp_world != 0) throw std::runtime_error("head vocab rows must divide TP world");
