@@ -435,6 +435,28 @@ struct DeviceFp4ExpertCache {
     uint8_t* s2 = nullptr;
     uint8_t* w3 = nullptr;
     uint8_t* s3 = nullptr;
+    size_t w1_bytes = 0;
+    size_t s1_bytes = 0;
+    size_t w2_bytes = 0;
+    size_t s2_bytes = 0;
+    size_t w3_bytes = 0;
+    size_t s3_bytes = 0;
+};
+
+struct DeviceFp4ActiveArena {
+    uint8_t* w1 = nullptr;
+    uint8_t* s1 = nullptr;
+    uint8_t* w2 = nullptr;
+    uint8_t* s2 = nullptr;
+    uint8_t* w3 = nullptr;
+    uint8_t* s3 = nullptr;
+    int capacity = 0;
+    size_t w1_bytes = 0;
+    size_t s1_bytes = 0;
+    size_t w2_bytes = 0;
+    size_t s2_bytes = 0;
+    size_t w3_bytes = 0;
+    size_t s3_bytes = 0;
 };
 
 struct SafeForwardContext {
@@ -479,6 +501,14 @@ struct SafeForwardContext {
             cudaFree(c.s3);
         }
         for (auto& [_, c] : expert_cache) {
+            cudaFree(c.w1);
+            cudaFree(c.s1);
+            cudaFree(c.w2);
+            cudaFree(c.s2);
+            cudaFree(c.w3);
+            cudaFree(c.s3);
+        }
+        for (auto& [_, c] : active_arena_cache) {
             cudaFree(c.w1);
             cudaFree(c.s1);
             cudaFree(c.w2);
@@ -576,19 +606,47 @@ struct SafeForwardContext {
         Fp4View w2 = fp4_view(prefix + "w2.weight");
         Fp4View w3 = fp4_view(prefix + "w3.weight");
         DeviceFp4ExpertCache c;
-        check_cuda(cudaMalloc(&c.w1, w1.w->nbytes), "cudaMalloc cached expert w1");
-        check_cuda(cudaMalloc(&c.s1, w1.s->nbytes), "cudaMalloc cached expert s1");
-        check_cuda(cudaMalloc(&c.w2, w2.w->nbytes), "cudaMalloc cached expert w2");
-        check_cuda(cudaMalloc(&c.s2, w2.s->nbytes), "cudaMalloc cached expert s2");
-        check_cuda(cudaMalloc(&c.w3, w3.w->nbytes), "cudaMalloc cached expert w3");
-        check_cuda(cudaMalloc(&c.s3, w3.s->nbytes), "cudaMalloc cached expert s3");
-        check_cuda(cudaMemcpy(c.w1, w1.shard->tensor_data(*w1.w), w1.w->nbytes, cudaMemcpyHostToDevice), "copy cached expert w1");
-        check_cuda(cudaMemcpy(c.s1, w1.shard->tensor_data(*w1.s), w1.s->nbytes, cudaMemcpyHostToDevice), "copy cached expert s1");
-        check_cuda(cudaMemcpy(c.w2, w2.shard->tensor_data(*w2.w), w2.w->nbytes, cudaMemcpyHostToDevice), "copy cached expert w2");
-        check_cuda(cudaMemcpy(c.s2, w2.shard->tensor_data(*w2.s), w2.s->nbytes, cudaMemcpyHostToDevice), "copy cached expert s2");
-        check_cuda(cudaMemcpy(c.w3, w3.shard->tensor_data(*w3.w), w3.w->nbytes, cudaMemcpyHostToDevice), "copy cached expert w3");
-        check_cuda(cudaMemcpy(c.s3, w3.shard->tensor_data(*w3.s), w3.s->nbytes, cudaMemcpyHostToDevice), "copy cached expert s3");
+        c.w1_bytes = w1.w->nbytes;
+        c.s1_bytes = w1.s->nbytes;
+        c.w2_bytes = w2.w->nbytes;
+        c.s2_bytes = w2.s->nbytes;
+        c.w3_bytes = w3.w->nbytes;
+        c.s3_bytes = w3.s->nbytes;
+        check_cuda(cudaMalloc(&c.w1, c.w1_bytes), "cudaMalloc cached expert w1");
+        check_cuda(cudaMalloc(&c.s1, c.s1_bytes), "cudaMalloc cached expert s1");
+        check_cuda(cudaMalloc(&c.w2, c.w2_bytes), "cudaMalloc cached expert w2");
+        check_cuda(cudaMalloc(&c.s2, c.s2_bytes), "cudaMalloc cached expert s2");
+        check_cuda(cudaMalloc(&c.w3, c.w3_bytes), "cudaMalloc cached expert w3");
+        check_cuda(cudaMalloc(&c.s3, c.s3_bytes), "cudaMalloc cached expert s3");
+        check_cuda(cudaMemcpy(c.w1, w1.shard->tensor_data(*w1.w), c.w1_bytes, cudaMemcpyHostToDevice), "copy cached expert w1");
+        check_cuda(cudaMemcpy(c.s1, w1.shard->tensor_data(*w1.s), c.s1_bytes, cudaMemcpyHostToDevice), "copy cached expert s1");
+        check_cuda(cudaMemcpy(c.w2, w2.shard->tensor_data(*w2.w), c.w2_bytes, cudaMemcpyHostToDevice), "copy cached expert w2");
+        check_cuda(cudaMemcpy(c.s2, w2.shard->tensor_data(*w2.s), c.s2_bytes, cudaMemcpyHostToDevice), "copy cached expert s2");
+        check_cuda(cudaMemcpy(c.w3, w3.shard->tensor_data(*w3.w), c.w3_bytes, cudaMemcpyHostToDevice), "copy cached expert w3");
+        check_cuda(cudaMemcpy(c.s3, w3.shard->tensor_data(*w3.s), c.s3_bytes, cudaMemcpyHostToDevice), "copy cached expert s3");
         auto inserted = expert_cache.emplace(key, c);
+        return inserted.first->second;
+    }
+
+    DeviceFp4ActiveArena& active_fp4_arena(int layer_id, int tp_world, int tp_rank, int capacity, const DeviceFp4ExpertCache& sample) {
+        const std::string key = std::to_string(layer_id) + ":" + std::to_string(tp_world) + ":" + std::to_string(tp_rank) + ":" + std::to_string(capacity);
+        auto it = active_arena_cache.find(key);
+        if (it != active_arena_cache.end()) return it->second;
+        DeviceFp4ActiveArena arena;
+        arena.capacity = capacity;
+        arena.w1_bytes = sample.w1_bytes;
+        arena.s1_bytes = sample.s1_bytes;
+        arena.w2_bytes = sample.w2_bytes;
+        arena.s2_bytes = sample.s2_bytes;
+        arena.w3_bytes = sample.w3_bytes;
+        arena.s3_bytes = sample.s3_bytes;
+        check_cuda(cudaMalloc(&arena.w1, static_cast<size_t>(capacity) * arena.w1_bytes), "cudaMalloc active arena w1");
+        check_cuda(cudaMalloc(&arena.s1, static_cast<size_t>(capacity) * arena.s1_bytes), "cudaMalloc active arena s1");
+        check_cuda(cudaMalloc(&arena.w2, static_cast<size_t>(capacity) * arena.w2_bytes), "cudaMalloc active arena w2");
+        check_cuda(cudaMalloc(&arena.s2, static_cast<size_t>(capacity) * arena.s2_bytes), "cudaMalloc active arena s2");
+        check_cuda(cudaMalloc(&arena.w3, static_cast<size_t>(capacity) * arena.w3_bytes), "cudaMalloc active arena w3");
+        check_cuda(cudaMalloc(&arena.s3, static_cast<size_t>(capacity) * arena.s3_bytes), "cudaMalloc active arena s3");
+        auto inserted = active_arena_cache.emplace(key, arena);
         return inserted.first->second;
     }
 
@@ -710,6 +768,7 @@ struct SafeForwardContext {
     std::unordered_map<std::string, DeviceAttentionCache> attention_cache;
     std::unordered_map<std::string, DeviceSharedCache> shared_cache;
     std::unordered_map<std::string, DeviceFp4ExpertCache> expert_cache;
+    std::unordered_map<std::string, DeviceFp4ActiveArena> active_arena_cache;
     std::unordered_map<int, float*> kv_cache;
     std::unordered_map<int, float*> indexer_kv_cache;
     std::unordered_map<int, std::vector<float>> compressor_kv_state;
@@ -890,6 +949,8 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     float* d_hidden = nullptr;
     float* d_moe = nullptr;
     float* d_resid2 = nullptr;
+    int64_t* d_route_indices = nullptr;
+    float* d_route_weights = nullptr;
     float* d_logits = nullptr;
 
     const auto* embed_data = reinterpret_cast<const uint16_t*>(ctx.embed_shard.tensor_data(*embed)) + static_cast<size_t>(token) * dim;
@@ -939,6 +1000,8 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     check_cuda(cudaMalloc(&d_hidden, static_cast<size_t>(inter) * sizeof(float)), "cudaMalloc hidden");
     check_cuda(cudaMalloc(&d_moe, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc moe");
     check_cuda(cudaMalloc(&d_resid2, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc resid2");
+    check_cuda(cudaMalloc(&d_route_indices, static_cast<size_t>(config.n_activated_experts) * sizeof(int64_t)), "cudaMalloc route indices");
+    check_cuda(cudaMalloc(&d_route_weights, static_cast<size_t>(config.n_activated_experts) * sizeof(float)), "cudaMalloc route weights");
     check_cuda(cudaMalloc(&d_logits, static_cast<size_t>(local_head_rows) * sizeof(float)), "cudaMalloc logits");
 
     check_cuda(cudaMemcpy(d_embed, embed_data, static_cast<size_t>(dim) * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy embed");
@@ -1226,14 +1289,47 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         const int experts_per_rank = ctx.options.tp_world > 1 ? static_cast<int>(config.n_routed_experts / ctx.options.tp_world) : static_cast<int>(config.n_routed_experts);
         const int expert_start = ctx.options.tp_rank * experts_per_rank;
         const int expert_end = ctx.options.tp_world > 1 ? expert_start + experts_per_rank : static_cast<int>(config.n_routed_experts);
+        std::vector<int64_t> route_indices;
+        std::vector<float> route_weights;
+        std::vector<Fp4View> active_w1;
+        std::vector<Fp4View> active_w2;
+        std::vector<Fp4View> active_w3;
+        route_indices.reserve(routed.size());
+        route_weights.reserve(routed.size());
+        active_w1.reserve(routed.size());
+        active_w2.reserve(routed.size());
+        active_w3.reserve(routed.size());
         for (const RoutedExpert& route : routed) {
             if (ctx.options.tp_world > 1 && (route.id < expert_start || route.id >= expert_end)) continue;
-            DeviceFp4ExpertCache& expert = ctx.fp4_expert_device_cache(li, route.id);
-            if (!fp4_e2m1_e8m0_matvec_cuda(d_ffn_norm, expert.w1, expert.s1, d_gate, inter, dim)) throw std::runtime_error("w1 launch failed");
-            if (!fp4_e2m1_e8m0_matvec_cuda(d_ffn_norm, expert.w3, expert.s3, d_up, inter, dim)) throw std::runtime_error("w3 launch failed");
-            if (!silu_mul_clamped_cuda(d_gate, d_up, d_hidden, inter, static_cast<float>(config.swiglu_limit))) throw std::runtime_error("silu launch failed");
-            if (!fp4_e2m1_e8m0_matvec_cuda(d_hidden, expert.w2, expert.s2, d_resid2, dim, inter)) throw std::runtime_error("w2 launch failed");
-            if (!vector_accum_cuda(d_resid2, d_moe, dim, route.weight)) throw std::runtime_error("moe accum failed");
+            route_indices.push_back(static_cast<int64_t>(active_w1.size()));
+            route_weights.push_back(route.weight);
+            active_w1.push_back(ctx.fp4_view(prefix + "ffn.experts." + std::to_string(route.id) + ".w1.weight"));
+            active_w2.push_back(ctx.fp4_view(prefix + "ffn.experts." + std::to_string(route.id) + ".w2.weight"));
+            active_w3.push_back(ctx.fp4_view(prefix + "ffn.experts." + std::to_string(route.id) + ".w3.weight"));
+        }
+        if (!active_w1.empty()) {
+            DeviceFp4ExpertCache sample;
+            sample.w1_bytes = active_w1.front().w->nbytes;
+            sample.s1_bytes = active_w1.front().s->nbytes;
+            sample.w2_bytes = active_w2.front().w->nbytes;
+            sample.s2_bytes = active_w2.front().s->nbytes;
+            sample.w3_bytes = active_w3.front().w->nbytes;
+            sample.s3_bytes = active_w3.front().s->nbytes;
+            DeviceFp4ActiveArena& arena = ctx.active_fp4_arena(li, tp_world, tp_rank, static_cast<int>(config.n_activated_experts), sample);
+            for (size_t ri = 0; ri < active_w1.size(); ++ri) {
+                check_cuda(cudaMemcpy(arena.w1 + ri * arena.w1_bytes, active_w1[ri].shard->tensor_data(*active_w1[ri].w), arena.w1_bytes, cudaMemcpyHostToDevice), "stage active w1");
+                check_cuda(cudaMemcpy(arena.s1 + ri * arena.s1_bytes, active_w1[ri].shard->tensor_data(*active_w1[ri].s), arena.s1_bytes, cudaMemcpyHostToDevice), "stage active s1");
+                check_cuda(cudaMemcpy(arena.w2 + ri * arena.w2_bytes, active_w2[ri].shard->tensor_data(*active_w2[ri].w), arena.w2_bytes, cudaMemcpyHostToDevice), "stage active w2");
+                check_cuda(cudaMemcpy(arena.s2 + ri * arena.s2_bytes, active_w2[ri].shard->tensor_data(*active_w2[ri].s), arena.s2_bytes, cudaMemcpyHostToDevice), "stage active s2");
+                check_cuda(cudaMemcpy(arena.w3 + ri * arena.w3_bytes, active_w3[ri].shard->tensor_data(*active_w3[ri].w), arena.w3_bytes, cudaMemcpyHostToDevice), "stage active w3");
+                check_cuda(cudaMemcpy(arena.s3 + ri * arena.s3_bytes, active_w3[ri].shard->tensor_data(*active_w3[ri].s), arena.s3_bytes, cudaMemcpyHostToDevice), "stage active s3");
+            }
+            check_cuda(cudaMemcpy(d_route_indices, route_indices.data(), route_indices.size() * sizeof(int64_t), cudaMemcpyHostToDevice), "copy active route indices");
+            check_cuda(cudaMemcpy(d_route_weights, route_weights.data(), route_weights.size() * sizeof(float), cudaMemcpyHostToDevice), "copy active route weights");
+            if (!moe_single_token_fp4_cuda(d_ffn_norm, d_route_indices, d_route_weights, arena.w1, arena.s1, arena.w2, arena.s2, arena.w3, arena.s3, d_resid2, static_cast<int>(active_w1.size()), 0, static_cast<int>(active_w1.size()), dim, inter, static_cast<float>(config.swiglu_limit))) {
+                throw std::runtime_error("active fp4 moe launch failed");
+            }
+            if (!vector_accum_cuda(d_resid2, d_moe, dim, 1.0f)) throw std::runtime_error("moe accum failed");
         }
 #ifdef DSV4_HAVE_NCCL
         if (ctx.options.tp_world > 1) {
@@ -1370,6 +1466,8 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     cudaFree(d_hidden);
     cudaFree(d_moe);
     cudaFree(d_resid2);
+    cudaFree(d_route_indices);
+    cudaFree(d_route_weights);
     cudaFree(d_logits);
 
     return ForwardSmokeResult{token, dim, inter, head_rows, layer_count, top_token, top_logit, checksum};
