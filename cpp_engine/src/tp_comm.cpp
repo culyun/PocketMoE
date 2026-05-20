@@ -7,9 +7,11 @@
 #include <chrono>
 #include <cstring>
 #include <fstream>
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 #endif
 
 namespace dsv4 {
@@ -75,6 +77,38 @@ void run_nccl_float_sum_smoke(int world, int rank, int device, const char* id_pa
     cudaFree(d_value);
     cudaFree(d_sum);
     ncclCommDestroy(comm);
+}
+
+TpTopResult nccl_global_top1(int world, int rank, int device, const char* id_path, int local_token, float local_logit) {
+    if (world <= 0 || rank < 0 || rank >= world) throw std::runtime_error("invalid NCCL world/rank");
+    check_cuda(cudaSetDevice(device), "cudaSetDevice");
+    ncclUniqueId id = load_or_create_id(rank, id_path);
+    ncclComm_t comm;
+    check_nccl(ncclCommInitRank(&comm, world, id, rank), "ncclCommInitRank");
+    float local[2] = {local_logit, static_cast<float>(local_token)};
+    float* d_local = nullptr;
+    float* d_all = nullptr;
+    check_cuda(cudaMalloc(&d_local, 2 * sizeof(float)), "cudaMalloc local top");
+    check_cuda(cudaMalloc(&d_all, static_cast<size_t>(world) * 2 * sizeof(float)), "cudaMalloc gathered top");
+    check_cuda(cudaMemcpy(d_local, local, 2 * sizeof(float), cudaMemcpyHostToDevice), "copy local top");
+    check_nccl(ncclAllGather(d_local, d_all, 2, ncclFloat, comm, nullptr), "ncclAllGather top");
+    check_cuda(cudaDeviceSynchronize(), "sync top gather");
+    std::vector<float> all(static_cast<size_t>(world) * 2);
+    check_cuda(cudaMemcpy(all.data(), d_all, all.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy gathered top");
+    TpTopResult result;
+    result.logit = -INFINITY;
+    for (int r = 0; r < world; ++r) {
+        const float logit = all[static_cast<size_t>(r) * 2];
+        const int token = static_cast<int>(all[static_cast<size_t>(r) * 2 + 1]);
+        if (logit > result.logit) {
+            result.logit = logit;
+            result.token = token;
+        }
+    }
+    cudaFree(d_local);
+    cudaFree(d_all);
+    ncclCommDestroy(comm);
+    return result;
 }
 #endif
 

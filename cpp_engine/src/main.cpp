@@ -3,6 +3,7 @@
 #include "model_config.hpp"
 #include "safetensors_reader.hpp"
 #include "tokenizer.hpp"
+#include "tp_comm.hpp"
 
 #include <cuda_runtime.h>
 #include <iostream>
@@ -24,6 +25,7 @@ struct Args {
     int tp_world = 1;
     int tp_rank = 0;
     int device = -1;
+    std::string nccl_id_path;
     bool generate_token = false;
     bool dump_config = false;
     bool inspect = false;
@@ -81,6 +83,8 @@ Args parse_args(int argc, char** argv) {
             args.tp_rank = std::stoi(argv[++i]);
         } else if (arg == "--device" && i + 1 < argc) {
             args.device = std::stoi(argv[++i]);
+        } else if (arg == "--nccl-id-path" && i + 1 < argc) {
+            args.nccl_id_path = argv[++i];
         } else {
             throw std::runtime_error("unknown or incomplete argument: " + arg);
         }
@@ -155,6 +159,21 @@ int main(int argc, char** argv) {
                         opts.tp_world = args.tp_world;
                         opts.tp_rank = args.tp_rank;
                         dsv4::ForwardSmokeResult result = dsv4::run_safetensors_prompt_forward_with_options(args.ckpt, prompt_ids, args.smoke_layers, opts);
+                        int top_token = result.top_token;
+                        float top_logit = result.top_logit;
+#ifdef DSV4_HAVE_NCCL
+                        if (args.tp_world > 1 && !args.nccl_id_path.empty()) {
+                            dsv4::TpTopResult global = dsv4::nccl_global_top1(
+                                args.tp_world,
+                                args.tp_rank,
+                                args.device >= 0 ? args.device : args.tp_rank,
+                                args.nccl_id_path.c_str(),
+                                result.top_token,
+                                result.top_logit);
+                            top_token = global.token;
+                            top_logit = global.logit;
+                        }
+#endif
                         std::cout << "smoke_forward=1 token=" << result.token
                                   << " layers=" << result.layers
                                   << " dim=" << result.dim
@@ -162,8 +181,10 @@ int main(int argc, char** argv) {
                                   << " logits=" << result.logits
                                   << " tp_world=" << args.tp_world
                                   << " tp_rank=" << args.tp_rank
-                                  << " top_token=" << result.top_token
-                                  << " top_logit=" << result.top_logit
+                                  << " local_top_token=" << result.top_token
+                                  << " local_top_logit=" << result.top_logit
+                                  << " top_token=" << top_token
+                                  << " top_logit=" << top_logit
                                   << " checksum=" << result.checksum << "\n";
                         return 0;
                     }
