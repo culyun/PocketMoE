@@ -1071,7 +1071,8 @@ GenerateSmokeResult run_safetensors_generate_tokens_timed_with_options(const std
     SafeForwardContext ctx(ckpt_dir);
     ctx.options = options;
     ctx.kv_cache_tokens = static_cast<int>(std::min<size_t>(seed_tokens.size() + static_cast<size_t>(max_new_tokens), 256));
-    if (!options.skip_fp4_host_prepare) ctx.prepare_fp4_host_weights(layer_count, options.tp_world, options.tp_rank);
+    const bool prepare_fp4_host = !options.skip_fp4_host_prepare && env_int_or_default("DSV4_CPP_PREPARE_FP4_HOST", 0) != 0;
+    if (prepare_fp4_host) ctx.prepare_fp4_host_weights(layer_count, options.tp_world, options.tp_rank);
     const auto timed_t0 = Clock::now();
     ForwardSmokeResult result;
     for (size_t i = 0; i < seed_tokens.size(); ++i) {
