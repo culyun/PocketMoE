@@ -951,8 +951,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
 #ifdef DSV4_HAVE_NCCL
         if (ctx.options.tp_world > 1) {
             if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP attention all-reduce requires --nccl-id-path");
-            const std::string attn_id_path = ctx.options.nccl_id_path + ".attn." + std::to_string(position) + "." + std::to_string(li);
-            nccl_all_reduce_sum_float_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, attn_id_path.c_str(), d_attn_out, dim);
+            nccl_all_reduce_sum_float_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_attn_out, dim);
         }
 #endif
         check_cuda(cudaMemcpy(host_x.data(), d_attn_out, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy attn out host");
@@ -997,8 +996,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
 #ifdef DSV4_HAVE_NCCL
         if (ctx.options.tp_world > 1) {
             if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP MoE all-reduce requires --nccl-id-path");
-            const std::string moe_id_path = ctx.options.nccl_id_path + ".moe." + std::to_string(position) + "." + std::to_string(li);
-            nccl_all_reduce_sum_float_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, moe_id_path.c_str(), d_moe, dim);
+            nccl_all_reduce_sum_float_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_moe, dim);
         }
 #endif
         {
@@ -1032,8 +1030,7 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
 #ifdef DSV4_HAVE_NCCL
             if (ctx.options.tp_world > 1) {
                 if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP shared expert all-reduce requires --nccl-id-path");
-                const std::string shared_id_path = ctx.options.nccl_id_path + ".shared." + std::to_string(position) + "." + std::to_string(li);
-                nccl_all_reduce_sum_float_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, shared_id_path.c_str(), d_resid2, dim);
+                nccl_all_reduce_sum_float_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_resid2, dim);
             }
 #endif
             if (!vector_accum_cuda(d_resid2, d_moe, dim, 1.0f)) throw std::runtime_error("shared accum failed");

@@ -11,6 +11,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 #endif
 
@@ -38,6 +39,11 @@ void check_nccl(ncclResult_t err, const char* what) {
 ncclUniqueId load_or_create_id(int rank, const char* path) {
     ncclUniqueId id;
     if (rank == 0) {
+        std::ifstream existing(path, std::ios::binary);
+        if (existing) {
+            existing.read(reinterpret_cast<char*>(&id), sizeof(id));
+            if (existing.gcount() == static_cast<std::streamsize>(sizeof(id))) return id;
+        }
         check_nccl(ncclGetUniqueId(&id), "ncclGetUniqueId");
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
         if (!out) throw std::runtime_error("failed to write NCCL id file");
@@ -54,6 +60,23 @@ ncclUniqueId load_or_create_id(int rank, const char* path) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     throw std::runtime_error("timed out waiting for NCCL id file");
+}
+
+struct CachedComm {
+    ncclComm_t comm = nullptr;
+};
+
+ncclComm_t cached_comm(int world, int rank, int device, const char* id_path) {
+    static std::unordered_map<std::string, CachedComm> comms;
+    const std::string key = std::to_string(world) + ":" + std::to_string(rank) + ":" + std::to_string(device) + ":" + id_path;
+    auto it = comms.find(key);
+    if (it != comms.end()) return it->second.comm;
+    check_cuda(cudaSetDevice(device), "cudaSetDevice");
+    ncclUniqueId id = load_or_create_id(rank, id_path);
+    ncclComm_t comm;
+    check_nccl(ncclCommInitRank(&comm, world, id, rank), "ncclCommInitRank");
+    comms.emplace(key, CachedComm{comm});
+    return comm;
 }
 
 }  // namespace
@@ -81,21 +104,14 @@ void run_nccl_float_sum_smoke(int world, int rank, int device, const char* id_pa
 
 void nccl_all_reduce_sum_float_inplace(int world, int rank, int device, const char* id_path, float* d_values, int count) {
     if (world <= 0 || rank < 0 || rank >= world || d_values == nullptr || count <= 0) throw std::runtime_error("invalid NCCL all-reduce args");
-    check_cuda(cudaSetDevice(device), "cudaSetDevice");
-    ncclUniqueId id = load_or_create_id(rank, id_path);
-    ncclComm_t comm;
-    check_nccl(ncclCommInitRank(&comm, world, id, rank), "ncclCommInitRank");
+    ncclComm_t comm = cached_comm(world, rank, device, id_path);
     check_nccl(ncclAllReduce(d_values, d_values, count, ncclFloat, ncclSum, comm, nullptr), "ncclAllReduce inplace");
     check_cuda(cudaDeviceSynchronize(), "sync all-reduce inplace");
-    ncclCommDestroy(comm);
 }
 
 TpTopResult nccl_global_top1(int world, int rank, int device, const char* id_path, int local_token, float local_logit) {
     if (world <= 0 || rank < 0 || rank >= world) throw std::runtime_error("invalid NCCL world/rank");
-    check_cuda(cudaSetDevice(device), "cudaSetDevice");
-    ncclUniqueId id = load_or_create_id(rank, id_path);
-    ncclComm_t comm;
-    check_nccl(ncclCommInitRank(&comm, world, id, rank), "ncclCommInitRank");
+    ncclComm_t comm = cached_comm(world, rank, device, id_path);
     float local[2] = {local_logit, static_cast<float>(local_token)};
     float* d_local = nullptr;
     float* d_all = nullptr;
@@ -118,7 +134,6 @@ TpTopResult nccl_global_top1(int world, int rank, int device, const char* id_pat
     }
     cudaFree(d_local);
     cudaFree(d_all);
-    ncclCommDestroy(comm);
     return result;
 }
 #endif
