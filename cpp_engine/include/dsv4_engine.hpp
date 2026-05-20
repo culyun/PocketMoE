@@ -31,10 +31,16 @@ struct ForwardSmokeResult {
     float checksum = 0.0f;
 };
 
+struct GenerateSmokeResult {
+    std::vector<ForwardSmokeResult> tokens;
+    double wall_seconds = 0.0;
+};
+
 struct ForwardSmokeOptions {
     int tp_world = 1;
     int tp_rank = 0;
     int device = 0;
+    bool skip_fp4_host_prepare = false;
     std::string nccl_id_path;
 };
 
@@ -47,5 +53,6 @@ ForwardSmokeResult run_safetensors_prompt_forward(const std::string& ckpt_dir, c
 ForwardSmokeResult run_safetensors_prompt_forward_with_options(const std::string& ckpt_dir, const std::vector<int>& tokens, int layer_count, const ForwardSmokeOptions& options);
 std::vector<ForwardSmokeResult> run_safetensors_generate_tokens(const std::string& ckpt_dir, const std::vector<int>& seed_tokens, int layer_count, int max_new_tokens);
 std::vector<ForwardSmokeResult> run_safetensors_generate_tokens_with_options(const std::string& ckpt_dir, const std::vector<int>& seed_tokens, int layer_count, int max_new_tokens, const ForwardSmokeOptions& options);
+GenerateSmokeResult run_safetensors_generate_tokens_timed_with_options(const std::string& ckpt_dir, const std::vector<int>& seed_tokens, int layer_count, int max_new_tokens, const ForwardSmokeOptions& options);
 
 }  // namespace dsv4

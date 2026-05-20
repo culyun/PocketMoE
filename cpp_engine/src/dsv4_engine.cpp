@@ -829,6 +829,25 @@ struct SafeForwardContext {
         }
     }
 
+    void prepare_fp4_host_weights(int layer_count, int tp_world, int tp_rank) {
+        if (layer_count <= 0) layer_count = static_cast<int>(config.n_layers);
+        layer_count = std::min(layer_count, static_cast<int>(config.n_layers));
+        const int world = std::max(1, tp_world);
+        const int rank = std::max(0, tp_rank);
+        const int experts_per_rank = static_cast<int>(config.n_routed_experts / world);
+        const int expert_start = rank * experts_per_rank;
+        const int expert_end = world > 1 ? expert_start + experts_per_rank : static_cast<int>(config.n_routed_experts);
+        for (int li = 0; li < layer_count; ++li) {
+            const std::string prefix = "layers." + std::to_string(li) + ".ffn.experts.";
+            for (int expert_id = expert_start; expert_id < expert_end; ++expert_id) {
+                Fp4View w1 = fp4_view(prefix + std::to_string(expert_id) + ".w1.weight");
+                Fp4View w2 = fp4_view(prefix + std::to_string(expert_id) + ".w2.weight");
+                Fp4View w3 = fp4_view(prefix + std::to_string(expert_id) + ".w3.weight");
+                (void)host_fp4_slot(li, expert_id, w1, w2, w3);
+            }
+        }
+    }
+
     DeviceFp4ActiveArena& active_fp4_arena(int layer_id, int tp_world, int tp_rank, int capacity, const DeviceFp4ExpertCache& sample) {
         const std::string key = std::to_string(layer_id) + ":" + std::to_string(tp_world) + ":" + std::to_string(tp_rank) + ":" + std::to_string(capacity);
         auto it = active_arena_cache.find(key);
@@ -1046,12 +1065,14 @@ std::vector<ForwardSmokeResult> run_safetensors_generate_tokens(const std::strin
     return run_safetensors_generate_tokens_with_options(ckpt_dir, seed_tokens, layer_count, max_new_tokens, ForwardSmokeOptions{});
 }
 
-std::vector<ForwardSmokeResult> run_safetensors_generate_tokens_with_options(const std::string& ckpt_dir, const std::vector<int>& seed_tokens, int layer_count, int max_new_tokens, const ForwardSmokeOptions& options) {
+GenerateSmokeResult run_safetensors_generate_tokens_timed_with_options(const std::string& ckpt_dir, const std::vector<int>& seed_tokens, int layer_count, int max_new_tokens, const ForwardSmokeOptions& options) {
     if (seed_tokens.empty()) throw std::runtime_error("generation seed has no tokens");
     if (max_new_tokens <= 0) return {};
     SafeForwardContext ctx(ckpt_dir);
     ctx.options = options;
     ctx.kv_cache_tokens = static_cast<int>(std::min<size_t>(seed_tokens.size() + static_cast<size_t>(max_new_tokens), 256));
+    if (!options.skip_fp4_host_prepare) ctx.prepare_fp4_host_weights(layer_count, options.tp_world, options.tp_rank);
+    const auto timed_t0 = Clock::now();
     ForwardSmokeResult result;
     for (size_t i = 0; i < seed_tokens.size(); ++i) {
         result = run_safetensors_token_forward_impl(ctx, seed_tokens[i], layer_count, static_cast<int>(i));
@@ -1085,7 +1106,11 @@ std::vector<ForwardSmokeResult> run_safetensors_generate_tokens_with_options(con
         generated.token = token;
         out.push_back(generated);
     }
-    return out;
+    return GenerateSmokeResult{std::move(out), elapsed_ms(timed_t0, Clock::now()) / 1000.0};
+}
+
+std::vector<ForwardSmokeResult> run_safetensors_generate_tokens_with_options(const std::string& ckpt_dir, const std::vector<int>& seed_tokens, int layer_count, int max_new_tokens, const ForwardSmokeOptions& options) {
+    return run_safetensors_generate_tokens_timed_with_options(ckpt_dir, seed_tokens, layer_count, max_new_tokens, options).tokens;
 }
 
 ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, int token, int layer_count, int position) {

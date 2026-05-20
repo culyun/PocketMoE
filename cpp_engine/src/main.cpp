@@ -207,9 +207,8 @@ int main(int argc, char** argv) {
                     opts.tp_rank = args.tp_rank;
                     opts.device = args.device >= 0 ? args.device : args.tp_rank;
                     opts.nccl_id_path = args.nccl_id_path;
-                    const auto t0 = std::chrono::steady_clock::now();
-                    auto results = dsv4::run_safetensors_generate_tokens_with_options(args.ckpt, prompt_ids, args.smoke_layers, args.max_new_tokens, opts);
-                    const auto t1 = std::chrono::steady_clock::now();
+                    auto timed = dsv4::run_safetensors_generate_tokens_timed_with_options(args.ckpt, prompt_ids, args.smoke_layers, args.max_new_tokens, opts);
+                    auto& results = timed.tokens;
                     std::vector<int> generated_ids;
                     generated_ids.reserve(results.size());
                     for (size_t step = 0; step < results.size(); ++step) {
@@ -225,7 +224,7 @@ int main(int argc, char** argv) {
                                   << " checksum=" << result.checksum << "\n";
                     }
                     if (args.resident_bench) {
-                        const double wall = std::chrono::duration<double>(t1 - t0).count();
+                        const double wall = timed.wall_seconds;
                         const double tokens = static_cast<double>(prompt_ids.size() + results.size());
                         const double tps = wall > 0.0 ? tokens / wall : 0.0;
                         std::cout << "resident_bench=1 prompt_tokens=" << prompt_ids.size()
