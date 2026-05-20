@@ -158,6 +158,8 @@ int main(int argc, char** argv) {
                         dsv4::ForwardSmokeOptions opts;
                         opts.tp_world = args.tp_world;
                         opts.tp_rank = args.tp_rank;
+                        opts.device = args.device >= 0 ? args.device : args.tp_rank;
+                        opts.nccl_id_path = args.nccl_id_path;
                         dsv4::ForwardSmokeResult result = dsv4::run_safetensors_prompt_forward_with_options(args.ckpt, prompt_ids, args.smoke_layers, opts);
                         int top_token = result.top_token;
                         float top_logit = result.top_logit;

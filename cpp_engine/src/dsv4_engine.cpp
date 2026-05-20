@@ -2,6 +2,7 @@
 
 #include "cuda_ops.hpp"
 #include "safetensors_reader.hpp"
+#include "tp_comm.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -932,7 +933,11 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         const auto routed = select_smoke_experts(
             index, prefix, li, token, ffn_norm_host, config.n_hash_layers, config.n_routed_experts, config.n_activated_experts, static_cast<float>(config.route_scale));
         check_cuda(cudaMemset(d_moe, 0, static_cast<size_t>(dim) * sizeof(float)), "zero moe");
+        const int experts_per_rank = ctx.options.tp_world > 1 ? static_cast<int>(config.n_routed_experts / ctx.options.tp_world) : static_cast<int>(config.n_routed_experts);
+        const int expert_start = ctx.options.tp_rank * experts_per_rank;
+        const int expert_end = ctx.options.tp_world > 1 ? expert_start + experts_per_rank : static_cast<int>(config.n_routed_experts);
         for (const RoutedExpert& route : routed) {
+            if (ctx.options.tp_world > 1 && (route.id < expert_start || route.id >= expert_end)) continue;
             Fp4Handle w1 = open_fp4(index, prefix + "ffn.experts." + std::to_string(route.id) + ".w1.weight");
             Fp4Handle w2 = open_fp4(index, prefix + "ffn.experts." + std::to_string(route.id) + ".w2.weight");
             Fp4Handle w3 = open_fp4(index, prefix + "ffn.experts." + std::to_string(route.id) + ".w3.weight");
@@ -948,6 +953,13 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
             if (!fp4_e2m1_e8m0_matvec_cuda(d_hidden, d_w2, d_s2, d_resid2, dim, inter)) throw std::runtime_error("w2 launch failed");
             if (!vector_accum_cuda(d_resid2, d_moe, dim, route.weight)) throw std::runtime_error("moe accum failed");
         }
+#ifdef DSV4_HAVE_NCCL
+        if (ctx.options.tp_world > 1) {
+            if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP MoE all-reduce requires --nccl-id-path");
+            const std::string moe_id_path = ctx.options.nccl_id_path + ".moe." + std::to_string(position) + "." + std::to_string(li);
+            nccl_all_reduce_sum_float_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, moe_id_path.c_str(), d_moe, dim);
+        }
+#endif
         {
             SafeTensorsShard shared_shard(index.shard_path(*index.shard_for_tensor(prefix + "ffn.shared_experts.w1.weight")));
             const auto* w1 = require_tensor(shared_shard, prefix + "ffn.shared_experts.w1.weight");

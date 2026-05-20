@@ -79,6 +79,17 @@ void run_nccl_float_sum_smoke(int world, int rank, int device, const char* id_pa
     ncclCommDestroy(comm);
 }
 
+void nccl_all_reduce_sum_float_inplace(int world, int rank, int device, const char* id_path, float* d_values, int count) {
+    if (world <= 0 || rank < 0 || rank >= world || d_values == nullptr || count <= 0) throw std::runtime_error("invalid NCCL all-reduce args");
+    check_cuda(cudaSetDevice(device), "cudaSetDevice");
+    ncclUniqueId id = load_or_create_id(rank, id_path);
+    ncclComm_t comm;
+    check_nccl(ncclCommInitRank(&comm, world, id, rank), "ncclCommInitRank");
+    check_nccl(ncclAllReduce(d_values, d_values, count, ncclFloat, ncclSum, comm, nullptr), "ncclAllReduce inplace");
+    check_cuda(cudaDeviceSynchronize(), "sync all-reduce inplace");
+    ncclCommDestroy(comm);
+}
+
 TpTopResult nccl_global_top1(int world, int rank, int device, const char* id_path, int local_token, float local_logit) {
     if (world <= 0 || rank < 0 || rank >= world) throw std::runtime_error("invalid NCCL world/rank");
     check_cuda(cudaSetDevice(device), "cudaSetDevice");

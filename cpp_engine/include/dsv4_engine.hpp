@@ -34,6 +34,8 @@ struct ForwardSmokeResult {
 struct ForwardSmokeOptions {
     int tp_world = 1;
     int tp_rank = 0;
+    int device = 0;
+    std::string nccl_id_path;
 };
 
 ForwardSmokeResult run_safetensors_min_layer_smoke(const std::string& ckpt_dir);
