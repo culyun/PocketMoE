@@ -11,6 +11,22 @@ set(CMAKE_CUDA_EXTENSIONS OFF)
 
 find_package(CUDAToolkit REQUIRED)
 
+set(NCCL_ROOT "" CACHE PATH "Optional NCCL root directory")
+set(DSV4_HAVE_NCCL OFF)
+if(NCCL_ROOT)
+    find_path(NCCL_INCLUDE_DIR nccl.h PATHS "${NCCL_ROOT}/include" NO_DEFAULT_PATH)
+    find_library(NCCL_LIBRARY NAMES nccl libnccl.so.2 PATHS "${NCCL_ROOT}/lib" NO_DEFAULT_PATH)
+else()
+    find_path(NCCL_INCLUDE_DIR nccl.h)
+    find_library(NCCL_LIBRARY NAMES nccl libnccl.so.2)
+endif()
+if(NCCL_INCLUDE_DIR AND NCCL_LIBRARY)
+    set(DSV4_HAVE_NCCL ON)
+    message(STATUS "NCCL found: ${NCCL_LIBRARY}")
+else()
+    message(STATUS "NCCL not found; distributed C++ TP helpers disabled")
+endif()
+
 add_library(dsv4_cpp_core STATIC
     src/json_lite.cpp
     src/gguf_reader.cpp
@@ -19,6 +35,7 @@ add_library(dsv4_cpp_core STATIC
     src/model_config.cpp
     src/tokenizer.cpp
     src/tensor.cpp
+    src/tp_comm.cpp
     src/dsv4_engine.cpp
     src/sampler.cpp
     cuda/cuda_ops.cu
@@ -34,6 +51,11 @@ target_include_directories(dsv4_cpp_core PUBLIC
 )
 
 target_link_libraries(dsv4_cpp_core PUBLIC CUDA::cudart CUDA::cublas)
+if(DSV4_HAVE_NCCL)
+    target_include_directories(dsv4_cpp_core PUBLIC ${NCCL_INCLUDE_DIR})
+    target_link_libraries(dsv4_cpp_core PUBLIC ${NCCL_LIBRARY})
+    target_compile_definitions(dsv4_cpp_core PUBLIC DSV4_HAVE_NCCL=1)
+endif()
 set_target_properties(dsv4_cpp_core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 
 add_executable(dsv4_cpp_engine src/main.cpp)
@@ -94,3 +116,7 @@ set_target_properties(test_tokenizer PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE
 add_executable(test_min_layer_smoke tests/test_min_layer_smoke.cpp)
 target_link_libraries(test_min_layer_smoke PRIVATE dsv4_cpp_core)
 set_target_properties(test_min_layer_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_nccl_smoke tests/test_nccl_smoke.cpp)
+target_link_libraries(test_nccl_smoke PRIVATE dsv4_cpp_core)
+set_target_properties(test_nccl_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
