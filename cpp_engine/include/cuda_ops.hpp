@@ -113,6 +113,49 @@ bool moe_prefill_fp4_grouped_cuda(
     float swiglu_limit,
     void* stream = nullptr);
 
+struct MoePrefillFp4GroupedWorkspace {
+    float* d_x_sorted = nullptr;
+    int8_t* d_x_q = nullptr;
+    float* d_x_scale = nullptr;
+    int8_t* d_x_pad = nullptr;
+    float* d_x_scale_pad = nullptr;
+    float* d_gate = nullptr;
+    float* d_up = nullptr;
+    int8_t* d_hidden_q = nullptr;
+    float* d_hidden_scale = nullptr;
+    int32_t* d_tile_experts = nullptr;
+    int32_t* d_tile_rows = nullptr;
+    int routes_cap = 0;
+    int padded_rows_cap = 0;
+    int tile_cap = 0;
+    int tile_count = 0;
+    int dim = 0;
+    int inter_dim = 0;
+};
+
+bool moe_prefill_fp4_grouped_cuda_with_workspace(
+    const float* d_x,
+    const int64_t* d_route_tokens,
+    const float* d_route_weights,
+    const int32_t* d_seg_starts,
+    const uint8_t* d_w1q,
+    const uint8_t* d_w1s,
+    const uint8_t* d_w2q,
+    const uint8_t* d_w2s,
+    const uint8_t* d_w3q,
+    const uint8_t* d_w3s,
+    float* d_y,
+    int tokens,
+    int topk,
+    int routes,
+    int n_local_experts,
+    int max_count,
+    int dim,
+    int inter_dim,
+    float swiglu_limit,
+    MoePrefillFp4GroupedWorkspace workspace,
+    void* stream = nullptr);
+
 bool fp8_e4m3_e8m0_matvec_cuda(
     const float* d_x,
     const uint8_t* d_weight,
@@ -130,6 +173,18 @@ bool fp8_e4m3_e8m0_matmul_cuda(
     int batch,
     int rows,
     int cols,
+    void* stream = nullptr);
+
+bool fp8_e4m3_e8m0_matmul_strided_cuda(
+    const float* d_x,
+    const uint8_t* d_weight,
+    const uint8_t* d_scale,
+    float* d_y,
+    int batch,
+    int rows,
+    int cols,
+    int x_stride,
+    int y_stride,
     void* stream = nullptr);
 
 bool rmsnorm_bf16_gamma_cuda(
@@ -252,6 +307,20 @@ bool gate_topk_bf16_rows_cuda(
     float route_scale,
     void* stream = nullptr);
 
+bool gate_hash_bf16_rows_cuda(
+    const float* d_x,
+    const uint16_t* d_w_bf16,
+    const int64_t* d_tid2eid,
+    const int* d_token_ids,
+    int64_t* d_indices,
+    float* d_weights,
+    int tokens,
+    int cols,
+    int table_topk,
+    int topk,
+    float route_scale,
+    void* stream = nullptr);
+
 bool gate_hash_bf16_cuda(
     const float* d_x,
     const uint16_t* d_w_bf16,
@@ -293,6 +362,39 @@ bool repeat_vector_cuda(
     float* d_y,
     int cols,
     int repeats,
+    void* stream = nullptr);
+
+bool prefill_causal_attention_cuda(
+    const float* d_q,
+    const float* d_kv,
+    const float* d_attn_sink,
+    float* d_y,
+    int tokens,
+    int heads,
+    int head_dim,
+    int window_size,
+    float scale,
+    void* stream = nullptr);
+
+bool build_prefill_window_indices_cuda(
+    int32_t* d_indices,
+    int tokens,
+    int window_size,
+    int topk,
+    void* stream = nullptr);
+
+bool prefill_sparse_attention_headpair_cuda(
+    const float* d_q,
+    const float* d_kv,
+    const float* d_attn_sink,
+    const int32_t* d_topk_indices,
+    float* d_y,
+    int tokens,
+    int heads,
+    int kv_len,
+    int topk,
+    int head_dim,
+    float scale,
     void* stream = nullptr);
 
 bool single_token_sparse_attention_cuda(
@@ -410,6 +512,41 @@ bool head_rmsnorm_rope_freqs_cuda(
     float eps,
     void* stream = nullptr);
 
+bool head_rmsnorm_rope_freqs_rows_cuda(
+    float* d_x,
+    const float* d_inv_freqs,
+    int tokens,
+    int heads,
+    int head_dim,
+    int rope_dim,
+    int start_position,
+    bool inverse,
+    float eps,
+    void* stream = nullptr);
+
+bool fp8_act_quant_dequant_rows_cuda(
+    float* d_x,
+    int rows,
+    int cols,
+    int block_size,
+    void* stream = nullptr);
+
+bool fp8_act_quant_dequant_rows_strided_cuda(
+    float* d_x,
+    int rows,
+    int cols,
+    int row_stride,
+    int block_size,
+    void* stream = nullptr);
+
+bool copy_rows_to_kv_cache_cuda(
+    const float* d_rows,
+    float* d_cache,
+    int rows,
+    int cols,
+    int window_size,
+    void* stream = nullptr);
+
 bool fp32_to_bf16_cuda(
     const float* d_x,
     uint16_t* d_y,
@@ -421,6 +558,36 @@ bool bf16_to_fp32_cuda(
     float* d_y,
     int count,
     void* stream = nullptr);
+
+bool hc_repeat_rows_cuda(
+    const float* d_x_rows,
+    float* d_h4_rows,
+    int rows,
+    int dim,
+    void* stream = nullptr);
+
+bool hc_pre_float_rows_cuda(
+    const float* d_h4_rows,
+    const float* d_fn,
+    const float* d_scale,
+    const float* d_base,
+    float* d_x_rows,
+    float* d_post_rows,
+    float* d_comb_rows,
+    int rows,
+    int dim,
+    void* stream = nullptr);
+
+bool hc_post_float_rows_cuda(
+    const float* d_x_rows,
+    const float* d_residual_h4_rows,
+    const float* d_post_rows,
+    const float* d_comb_rows,
+    float* d_y_h4_rows,
+    int rows,
+    int dim,
+    void* stream = nullptr);
+
 
 bool hc_pre_float_cuda(
     const float* d_h4,

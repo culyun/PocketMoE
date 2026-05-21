@@ -528,6 +528,47 @@ struct DeviceMoeDecodeWorkspace {
     MoeSingleTokenFp4Workspace fp4;
 };
 
+struct DeviceMoePrefillWorkspace {
+    MoePrefillFp4GroupedWorkspace fp4;
+    ~DeviceMoePrefillWorkspace() { release(); }
+
+    void release() {
+        cudaFree(fp4.d_x_sorted);
+        cudaFree(fp4.d_x_q);
+        cudaFree(fp4.d_x_scale);
+        cudaFree(fp4.d_x_pad);
+        cudaFree(fp4.d_x_scale_pad);
+        cudaFree(fp4.d_gate);
+        cudaFree(fp4.d_up);
+        cudaFree(fp4.d_hidden_q);
+        cudaFree(fp4.d_hidden_scale);
+        cudaFree(fp4.d_tile_experts);
+        cudaFree(fp4.d_tile_rows);
+        fp4 = MoePrefillFp4GroupedWorkspace{};
+    }
+
+    void ensure(int routes_cap, int tile_cap, int dim, int inter_dim) {
+        if (fp4.d_x_sorted != nullptr && fp4.routes_cap >= routes_cap && fp4.tile_cap >= tile_cap && fp4.dim == dim && fp4.inter_dim == inter_dim) return;
+        release();
+        fp4.dim = dim;
+        fp4.inter_dim = inter_dim;
+        fp4.routes_cap = routes_cap;
+        fp4.padded_rows_cap = routes_cap;
+        fp4.tile_cap = tile_cap;
+        const size_t routes_dim = static_cast<size_t>(routes_cap) * dim;
+        const size_t routes_inter = static_cast<size_t>(routes_cap) * inter_dim;
+        check_cuda(cudaMalloc(&fp4.d_x_sorted, routes_dim * sizeof(float)), "cudaMalloc prefill moe x sorted");
+        check_cuda(cudaMalloc(&fp4.d_x_q, routes_dim), "cudaMalloc prefill moe x q");
+        check_cuda(cudaMalloc(&fp4.d_x_scale, static_cast<size_t>(routes_cap) * sizeof(float)), "cudaMalloc prefill moe x scale");
+        check_cuda(cudaMalloc(&fp4.d_gate, routes_inter * sizeof(float)), "cudaMalloc prefill moe gate");
+        check_cuda(cudaMalloc(&fp4.d_up, routes_inter * sizeof(float)), "cudaMalloc prefill moe up");
+        check_cuda(cudaMalloc(&fp4.d_hidden_q, routes_inter), "cudaMalloc prefill moe hidden q");
+        check_cuda(cudaMalloc(&fp4.d_hidden_scale, static_cast<size_t>(routes_cap) * sizeof(float)), "cudaMalloc prefill moe hidden scale");
+        check_cuda(cudaMalloc(&fp4.d_tile_experts, static_cast<size_t>(tile_cap) * sizeof(int32_t)), "cudaMalloc prefill moe tile experts");
+        check_cuda(cudaMalloc(&fp4.d_tile_rows, static_cast<size_t>(tile_cap) * sizeof(int32_t)), "cudaMalloc prefill moe tile rows");
+    }
+};
+
 struct DeviceHcCache {
     float* attn_fn = nullptr;
     float* attn_scale = nullptr;
@@ -620,6 +661,15 @@ struct DeviceFp4ActiveArena {
     size_t w3_bytes = 0;
     size_t s3_bytes = 0;
     std::unordered_set<int> staged_local;
+    // Sparse slot mapping (decode path): maps a routed expert's local_id to
+    // a small slot index inside this arena (range [0, capacity)). Enables
+    // per-layer arenas to stay resident across decode steps with a small
+    // total GPU footprint via LRU eviction within the arena.
+    bool sparse_slots = false;
+    std::unordered_map<int, int> slot_by_local;
+    std::vector<int> slot_local;
+    std::list<int> slot_lru;
+    std::vector<std::list<int>::iterator> slot_lru_pos;
 };
 
 struct HostFp4ExpertSlot {
@@ -1034,6 +1084,10 @@ struct SafeForwardContext {
         active_arena_device_freelist.push_back(blk);
         arena.w1 = arena.s1 = arena.w2 = arena.s2 = arena.w3 = arena.s3 = nullptr;
         arena.staged_local.clear();
+        arena.slot_by_local.clear();
+        arena.slot_lru.clear();
+        arena.slot_lru_pos.clear();
+        arena.slot_local.clear();
     }
 
     bool try_pop_active_arena_freelist(DeviceFp4ActiveArena& arena) {
@@ -1053,19 +1107,48 @@ struct SafeForwardContext {
         return false;
     }
 
+    static bool key_is_sparse(const std::string& key) {
+        return key.size() >= 2 && key[key.size() - 2] == ':' && key[key.size() - 1] == 's';
+    }
+
     void touch_active_arena(const std::string& key) {
         auto it = active_arena_lru_pos.find(key);
         if (it != active_arena_lru_pos.end()) active_arena_lru.erase(it->second);
         active_arena_lru.push_back(key);
         active_arena_lru_pos[key] = std::prev(active_arena_lru.end());
-        const int cap = active_arena_max_layers;
-        while (cap > 0 && static_cast<int>(active_arena_lru.size()) > cap) {
-            const std::string evict = active_arena_lru.front();
-            active_arena_lru.pop_front();
-            active_arena_lru_pos.erase(evict);
-            auto victim = active_arena_cache.find(evict);
-            if (victim != active_arena_cache.end()) release_active_arena_device(victim->second);
-        }
+        // Sparse arenas (per-layer persistent cache) get a separate cap.
+        // Default sparse cap = active_arena_max_layers; dense (prefill)
+        // arenas keep the historic small cap (3 for tp>1) to avoid blowing
+        // the GPU memory budget on full-capacity prefill arenas.
+        const bool incoming_sparse = key_is_sparse(key);
+        const int dense_cap = active_arena_cache_limit_dense();
+        const int sparse_cap = active_arena_max_layers;
+        // Count sparse and dense separately.
+        int sparse_n = 0, dense_n = 0;
+        for (const std::string& k : active_arena_lru) (key_is_sparse(k) ? sparse_n : dense_n)++;
+        // Evict from the front according to the matching cap.
+        auto evict_front_if = [&](bool want_sparse, int& count, int cap) {
+            while (cap > 0 && count > cap) {
+                bool evicted = false;
+                for (auto lr = active_arena_lru.begin(); lr != active_arena_lru.end(); ++lr) {
+                    if (key_is_sparse(*lr) == want_sparse) {
+                        const std::string evict = *lr;
+                        if (evict == key) continue;
+                        active_arena_lru.erase(lr);
+                        active_arena_lru_pos.erase(evict);
+                        auto victim = active_arena_cache.find(evict);
+                        if (victim != active_arena_cache.end()) release_active_arena_device(victim->second);
+                        --count;
+                        evicted = true;
+                        break;
+                    }
+                }
+                if (!evicted) break;
+            }
+        };
+        evict_front_if(true, sparse_n, sparse_cap);
+        evict_front_if(false, dense_n, dense_cap);
+        (void)incoming_sparse;
     }
 
     HostFp4ExpertSlot& host_fp4_slot(int layer_id, int expert_id, const Fp4View& w1, const Fp4View& w2, const Fp4View& w3) {
@@ -1100,6 +1183,10 @@ struct SafeForwardContext {
         return tp_world > 1 ? 3 : 1;
     }
 
+    int active_arena_cache_limit_dense() const {
+        return options.tp_world > 1 ? 3 : 1;
+    }
+
     void evict_active_arena_if_needed(const std::string& incoming_key, int tp_world) {
         const int cap = active_arena_cache_limit(tp_world);
         while (cap > 0 && static_cast<int>(active_arena_lru.size()) >= cap) {
@@ -1110,6 +1197,41 @@ struct SafeForwardContext {
             auto victim = active_arena_cache.find(evict);
             if (victim != active_arena_cache.end()) release_active_arena_device(victim->second);
         }
+    }
+
+    // Release all active arenas whose key has a given suffix (":d" = dense,
+    // ":s" = sparse). Used to free prefill's dense arenas before decode
+    // starts when decode uses a sparse arena, since the two have different
+    // capacities and cannot share a buffer via the freelist.
+    void release_active_arenas_with_suffix(const std::string& suffix) {
+        std::vector<std::string> victims;
+        for (auto& kv : active_arena_cache) {
+            const std::string& key = kv.first;
+            if (key.size() >= suffix.size() && key.compare(key.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                victims.push_back(key);
+            }
+        }
+        for (const std::string& key : victims) {
+            auto it = active_arena_lru_pos.find(key);
+            if (it != active_arena_lru_pos.end()) {
+                active_arena_lru.erase(it->second);
+                active_arena_lru_pos.erase(it);
+            }
+            auto cache_it = active_arena_cache.find(key);
+            if (cache_it != active_arena_cache.end()) {
+                release_active_arena_device(cache_it->second);
+            }
+        }
+        // Free the now-stranded buffers so cudaMalloc can succeed below.
+        for (auto& blk : active_arena_device_freelist) {
+            if (blk.w1) cudaFree(blk.w1);
+            if (blk.s1) cudaFree(blk.s1);
+            if (blk.w2) cudaFree(blk.w2);
+            if (blk.s2) cudaFree(blk.s2);
+            if (blk.w3) cudaFree(blk.w3);
+            if (blk.s3) cudaFree(blk.s3);
+        }
+        active_arena_device_freelist.clear();
     }
 
     void prepare_fp4_host_weights(int layer_count, int tp_world, int tp_rank) {
@@ -1159,8 +1281,8 @@ struct SafeForwardContext {
         }
     }
 
-    DeviceFp4ActiveArena& active_fp4_arena(int layer_id, int tp_world, int tp_rank, int capacity, const DeviceFp4ExpertCache& sample) {
-        const std::string key = std::to_string(layer_id) + ":" + std::to_string(tp_world) + ":" + std::to_string(tp_rank) + ":" + std::to_string(capacity);
+    DeviceFp4ActiveArena& active_fp4_arena(int layer_id, int tp_world, int tp_rank, int capacity, const DeviceFp4ExpertCache& sample, bool sparse = false) {
+        const std::string key = std::to_string(layer_id) + ":" + std::to_string(tp_world) + ":" + std::to_string(tp_rank) + ":" + std::to_string(capacity) + (sparse ? ":s" : ":d");
         auto it = active_arena_cache.find(key);
         if (it != active_arena_cache.end()) {
             DeviceFp4ActiveArena& arena = it->second;
@@ -1176,6 +1298,12 @@ struct SafeForwardContext {
                         check_cuda(cudaMalloc(&arena.s3, static_cast<size_t>(arena.capacity) * arena.s3_bytes), "cudaMalloc active arena s3");
                     }
                     arena.staged_local.clear();
+                    if (arena.sparse_slots) {
+                        arena.slot_by_local.clear();
+                        arena.slot_lru.clear();
+                        arena.slot_lru_pos.assign(static_cast<size_t>(arena.capacity), arena.slot_lru.end());
+                        arena.slot_local.assign(static_cast<size_t>(arena.capacity), -1);
+                    }
                 }
             }
             touch_active_arena(key);
@@ -1189,6 +1317,11 @@ struct SafeForwardContext {
         arena.s2_bytes = sample.s2_bytes;
         arena.w3_bytes = sample.w3_bytes;
         arena.s3_bytes = sample.s3_bytes;
+        arena.sparse_slots = sparse;
+        if (sparse) {
+            arena.slot_lru_pos.assign(static_cast<size_t>(capacity), arena.slot_lru.end());
+            arena.slot_local.assign(static_cast<size_t>(capacity), -1);
+        }
         if (!try_pop_active_arena_freelist(arena)) {
             evict_active_arena_if_needed(key, tp_world);
             if (!try_pop_active_arena_freelist(arena)) {
@@ -1203,6 +1336,45 @@ struct SafeForwardContext {
         auto inserted = active_arena_cache.emplace(key, arena);
         touch_active_arena(key);
         return inserted.first->second;
+    }
+
+    // Acquire a slot index inside a sparse arena for an expert with local_id.
+    // Returns the slot index in [0, arena.capacity). If the expert is already
+    // staged, returns its slot. Otherwise: if there's an empty slot use it,
+    // else evict the LRU slot. Caller must follow up with H2D writes when
+    // already_staged is false.
+    int acquire_sparse_slot(DeviceFp4ActiveArena& arena, int local_id, bool& already_staged) {
+        auto hit = arena.slot_by_local.find(local_id);
+        if (hit != arena.slot_by_local.end()) {
+            int slot = hit->second;
+            // Touch LRU.
+            arena.slot_lru.erase(arena.slot_lru_pos[static_cast<size_t>(slot)]);
+            arena.slot_lru.push_back(slot);
+            arena.slot_lru_pos[static_cast<size_t>(slot)] = std::prev(arena.slot_lru.end());
+            already_staged = true;
+            return slot;
+        }
+        int slot;
+        if (static_cast<int>(arena.slot_lru.size()) < arena.capacity) {
+            slot = static_cast<int>(arena.slot_lru.size());
+            for (int s = 0; s < arena.capacity; ++s) {
+                if (arena.slot_local[static_cast<size_t>(s)] == -1) {
+                    slot = s;
+                    break;
+                }
+            }
+        } else {
+            slot = arena.slot_lru.front();
+            arena.slot_lru.pop_front();
+            int victim_local = arena.slot_local[static_cast<size_t>(slot)];
+            if (victim_local >= 0) arena.slot_by_local.erase(victim_local);
+        }
+        arena.slot_local[static_cast<size_t>(slot)] = local_id;
+        arena.slot_by_local[local_id] = slot;
+        arena.slot_lru.push_back(slot);
+        arena.slot_lru_pos[static_cast<size_t>(slot)] = std::prev(arena.slot_lru.end());
+        already_staged = false;
+        return slot;
     }
 
     DeviceSharedCache& shared_device_cache(int layer_id, int tp_world, int tp_rank, int dim) {
@@ -1478,6 +1650,13 @@ GenerateSmokeResult run_safetensors_generate_tokens_timed_with_options(const std
     }
 #endif
     const auto prefill_t1 = Clock::now();
+    // When decode uses a sparse per-layer arena (matching PyTorch's lazy
+    // per-layer cache), prefill's dense (full n_local_experts) arenas would
+    // double the per-layer footprint and OOM at MAX_CACHED_LAYERS=43. Drop
+    // them here so decode can keep all 43 sparse arenas resident.
+    if (env_int_or_default("DSV4_CPP_DECODE_SPARSE_ARENA", 0) > 0) {
+        ctx.release_active_arenas_with_suffix(":d");
+    }
     std::vector<ForwardSmokeResult> out;
     out.reserve(static_cast<size_t>(max_new_tokens));
     ForwardSmokeResult generated = result;
@@ -1543,6 +1722,7 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
 #ifdef DSV4_HAVE_NCCL
     BF16AllReduceScratch bf16_reduce_scratch;
 #endif
+    DeviceMoePrefillWorkspace prefill_moe_workspace;
 
     std::vector<int> token_ids(tokens.begin(), tokens.end());
     for (int token : token_ids) {
@@ -1552,6 +1732,12 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
     int* d_token_ids = nullptr;
     uint16_t* d_embed_matrix = nullptr;
     float* d_x_rows = nullptr;
+    float* d_h4_rows = nullptr;
+    float* d_h4_next_rows = nullptr;
+    uint16_t* d_h4_bf16_rows = nullptr;
+    float* d_hc_post_rows = nullptr;
+    float* d_hc_comb_rows = nullptr;
+    float* d_attn_out_rows = nullptr;
     uint16_t* d_ffn_gamma = nullptr;
     float* d_ffn_norm_rows = nullptr;
     int64_t* d_route_indices = nullptr;
@@ -1567,15 +1753,23 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
     uint16_t* d_kv_gamma = nullptr;
     float* d_attn_x = nullptr;
     float* d_attn_norm = nullptr;
+    float* d_attn_norm_rows = nullptr;
     float* d_q_a = nullptr;
     float* d_q_norm = nullptr;
     float* d_q = nullptr;
+    float* d_q_a_rows = nullptr;
+    float* d_q_norm_rows = nullptr;
+    float* d_q_rows = nullptr;
     float* d_kv_a = nullptr;
     float* d_kv_norm = nullptr;
+    float* d_kv_a_rows = nullptr;
+    float* d_kv_norm_rows = nullptr;
     float* d_attn_value = nullptr;
+    float* d_attn_value_rows = nullptr;
     float* d_attn_mid = nullptr;
+    float* d_attn_mid_rows = nullptr;
     float* d_attn_out = nullptr;
-    int* d_kv_indices = nullptr;
+    int32_t* d_prefill_window_indices = nullptr;
     float* d_moe_rows = nullptr;
     float* d_shared_gate = nullptr;
     float* d_shared_up = nullptr;
@@ -1592,6 +1786,12 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
     check_cuda(cudaMalloc(&d_token_ids, static_cast<size_t>(token_count) * sizeof(int)), "cudaMalloc token ids");
     check_cuda(cudaMalloc(&d_embed_matrix, ctx.embed->nbytes), "cudaMalloc embed matrix");
     check_cuda(cudaMalloc(&d_x_rows, token_dim * sizeof(float)), "cudaMalloc x rows");
+    check_cuda(cudaMalloc(&d_h4_rows, token_dim * 4 * sizeof(float)), "cudaMalloc prefill hc h4 rows");
+    check_cuda(cudaMalloc(&d_h4_next_rows, token_dim * 4 * sizeof(float)), "cudaMalloc prefill hc h4 next rows");
+    check_cuda(cudaMalloc(&d_h4_bf16_rows, token_dim * 4 * sizeof(uint16_t)), "cudaMalloc prefill hc h4 bf16 rows");
+    check_cuda(cudaMalloc(&d_hc_post_rows, static_cast<size_t>(token_count) * 4 * sizeof(float)), "cudaMalloc prefill hc post rows");
+    check_cuda(cudaMalloc(&d_hc_comb_rows, static_cast<size_t>(token_count) * 16 * sizeof(float)), "cudaMalloc prefill hc comb rows");
+    check_cuda(cudaMalloc(&d_attn_out_rows, token_dim * sizeof(float)), "cudaMalloc prefill attn out rows");
     check_cuda(cudaMalloc(&d_ffn_gamma, static_cast<size_t>(dim) * sizeof(uint16_t)), "cudaMalloc ffn gamma");
     check_cuda(cudaMalloc(&d_ffn_norm_rows, token_dim * sizeof(float)), "cudaMalloc ffn norm rows");
     check_cuda(cudaMalloc(&d_route_indices, routes_cap * sizeof(int64_t)), "cudaMalloc prefill route indices");
@@ -1608,22 +1808,25 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
     check_cuda(cudaMalloc(&d_kv_gamma, static_cast<size_t>(attn_dims.kv_dim) * sizeof(uint16_t)), "cudaMalloc prefill kv gamma");
     check_cuda(cudaMalloc(&d_attn_x, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc prefill attn x");
     check_cuda(cudaMalloc(&d_attn_norm, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc prefill attn norm");
+    check_cuda(cudaMalloc(&d_attn_norm_rows, token_dim * sizeof(float)), "cudaMalloc prefill attn norm rows");
     check_cuda(cudaMalloc(&d_q_a, static_cast<size_t>(attn_dims.q_a_dim) * sizeof(float)), "cudaMalloc prefill q_a");
     check_cuda(cudaMalloc(&d_q_norm, static_cast<size_t>(attn_dims.q_a_dim) * sizeof(float)), "cudaMalloc prefill q_norm");
     check_cuda(cudaMalloc(&d_q, static_cast<size_t>(attn_dims.q_dim) * sizeof(float)), "cudaMalloc prefill q");
+    check_cuda(cudaMalloc(&d_q_a_rows, static_cast<size_t>(token_count) * attn_dims.q_a_dim * sizeof(float)), "cudaMalloc prefill q_a rows");
+    check_cuda(cudaMalloc(&d_q_norm_rows, static_cast<size_t>(token_count) * attn_dims.q_a_dim * sizeof(float)), "cudaMalloc prefill q_norm rows");
+    check_cuda(cudaMalloc(&d_q_rows, static_cast<size_t>(token_count) * attn_dims.q_dim * sizeof(float)), "cudaMalloc prefill q rows");
     check_cuda(cudaMalloc(&d_kv_a, static_cast<size_t>(attn_dims.kv_dim) * sizeof(float)), "cudaMalloc prefill kv_a");
     check_cuda(cudaMalloc(&d_kv_norm, static_cast<size_t>(attn_dims.kv_dim) * sizeof(float)), "cudaMalloc prefill kv_norm");
+    check_cuda(cudaMalloc(&d_kv_a_rows, static_cast<size_t>(token_count) * attn_dims.kv_dim * sizeof(float)), "cudaMalloc prefill kv_a rows");
+    check_cuda(cudaMalloc(&d_kv_norm_rows, static_cast<size_t>(token_count) * attn_dims.kv_dim * sizeof(float)), "cudaMalloc prefill kv_norm rows");
     check_cuda(cudaMalloc(&d_attn_value, static_cast<size_t>(attn_dims.q_dim) * sizeof(float)), "cudaMalloc prefill attn value");
+    check_cuda(cudaMalloc(&d_attn_value_rows, static_cast<size_t>(token_count) * attn_dims.q_dim * sizeof(float)), "cudaMalloc prefill attn value rows");
     check_cuda(cudaMalloc(&d_attn_mid, static_cast<size_t>(attn_dims.attn_mid) * sizeof(float)), "cudaMalloc prefill attn mid");
+    check_cuda(cudaMalloc(&d_attn_mid_rows, static_cast<size_t>(token_count) * attn_dims.attn_mid * sizeof(float)), "cudaMalloc prefill attn mid rows");
     check_cuda(cudaMalloc(&d_attn_out, static_cast<size_t>(dim) * sizeof(float)), "cudaMalloc prefill attn out");
     {
-        int max_compressed = 0;
-        for (uint64_t ratio : config.compress_ratios) {
-            if (ratio == 0) continue;
-            max_compressed = std::max(max_compressed, (token_count + static_cast<int>(ratio) - 1) / static_cast<int>(ratio));
-        }
-        const int max_kv_indices = static_cast<int>(std::max<uint64_t>(1, config.window_size == 0 ? 128 : config.window_size)) + std::max(1, max_compressed);
-        check_cuda(cudaMalloc(&d_kv_indices, static_cast<size_t>(max_kv_indices) * sizeof(int)), "cudaMalloc prefill kv indices");
+        const int window_topk = static_cast<int>(std::min<uint64_t>(static_cast<uint64_t>(token_count), std::max<uint64_t>(1, config.window_size == 0 ? 128 : config.window_size)));
+        check_cuda(cudaMalloc(&d_prefill_window_indices, static_cast<size_t>(token_count) * window_topk * sizeof(int32_t)), "cudaMalloc prefill window indices");
     }
     check_cuda(cudaMalloc(&d_moe_rows, token_dim * sizeof(float)), "cudaMalloc moe rows");
     check_cuda(cudaMalloc(&d_shared_gate, static_cast<size_t>(token_count) * inter * sizeof(float)), "cudaMalloc shared gate rows");
@@ -1641,34 +1844,33 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
     check_cuda(cudaMemcpy(d_head, reinterpret_cast<const uint16_t*>(ctx.head_shard.tensor_data(*head)) + static_cast<size_t>(local_head_start) * dim, static_cast<size_t>(local_head_rows) * dim * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy head");
     check_cuda(cudaMemcpy(d_final_norm_gamma, ctx.final_norm_shard.tensor_data(*ctx.final_norm), ctx.final_norm->nbytes, cudaMemcpyHostToDevice), "copy final norm gamma");
     if (!bf16_rows_to_float_cuda(d_embed_matrix, d_token_ids, d_x_rows, token_count, dim)) throw std::runtime_error("embed rows launch failed");
-
-    std::vector<float> h4_rows(static_cast<size_t>(token_count) * 4 * dim);
-    {
-        std::vector<float> host_x(token_dim);
-        check_cuda(cudaMemcpy(host_x.data(), d_x_rows, token_dim * sizeof(float), cudaMemcpyDeviceToHost), "copy prefill embed rows host");
-        for (int t = 0; t < token_count; ++t) {
-            for (int m = 0; m < 4; ++m) {
-                std::copy(host_x.begin() + static_cast<size_t>(t) * dim, host_x.begin() + static_cast<size_t>(t + 1) * dim, h4_rows.begin() + (static_cast<size_t>(t) * 4 + m) * dim);
-            }
-        }
-    }
+    if (!hc_repeat_rows_cuda(d_x_rows, d_h4_rows, token_count, dim)) throw std::runtime_error("prefill hc repeat rows launch failed");
+    const bool profile_forward = profile_forward_enabled();
+    double total_prefill_hc_pre_ms = 0.0;
+    double total_prefill_attn_ms = 0.0;
+    double total_prefill_attn_post_ms = 0.0;
+    double total_prefill_ffn_pre_ms = 0.0;
+    double total_prefill_gate_ms = 0.0;
+    double total_prefill_group_ms = 0.0;
+    double total_prefill_moe_ms = 0.0;
+    double total_prefill_reduce_ms = 0.0;
+    double total_prefill_shared_ms = 0.0;
+    double total_prefill_ffn_post_ms = 0.0;
+    auto sync_prefill_profile = [&](const char* what) {
+        if (profile_forward) check_cuda(cudaDeviceSynchronize(), what);
+    };
 
     for (int li = 0; li < layer_count; ++li) {
         const std::string prefix = "layers." + std::to_string(li) + ".";
         SafeTensorsShard& attn_norm_shard = ctx.shard_for_tensor(prefix + "attn_norm.weight");
         SafeTensorsShard& qkv_shard = ctx.shard_for_tensor(prefix + "attn.wq_a.weight");
         SafeTensorsShard& ffn_norm_shard = ctx.shard_for_tensor(prefix + "ffn_norm.weight");
-        const auto* hc_attn_fn = require_tensor(qkv_shard, prefix + "hc_attn_fn");
-        const auto* hc_attn_scale = require_tensor(qkv_shard, prefix + "hc_attn_scale");
-        const auto* hc_attn_base = require_tensor(qkv_shard, prefix + "hc_attn_base");
-        const auto* hc_ffn_fn = require_tensor(qkv_shard, prefix + "hc_ffn_fn");
-        const auto* hc_ffn_scale = require_tensor(qkv_shard, prefix + "hc_ffn_scale");
-        const auto* hc_ffn_base = require_tensor(qkv_shard, prefix + "hc_ffn_base");
         const auto* attn_norm = require_tensor(attn_norm_shard, prefix + "attn_norm.weight");
         const auto* q_norm = require_tensor(qkv_shard, prefix + "attn.q_norm.weight");
         const auto* kv_norm = require_tensor(qkv_shard, prefix + "attn.kv_norm.weight");
         const auto* ffn_norm = require_tensor(ffn_norm_shard, prefix + "ffn_norm.weight");
         DeviceAttentionCache& attn_cache = ctx.attention_device_cache(li, tp_world, tp_rank, attn_dims);
+        DeviceHcCache& hc_cache = ctx.hc_device_cache(li);
         check_cuda(cudaMemcpy(d_attn_gamma, attn_norm_shard.tensor_data(*attn_norm), attn_norm->nbytes, cudaMemcpyHostToDevice), "copy prefill attn gamma");
         check_cuda(cudaMemcpy(d_q_gamma, qkv_shard.tensor_data(*q_norm), q_norm->nbytes, cudaMemcpyHostToDevice), "copy prefill q gamma");
         check_cuda(cudaMemcpy(d_kv_gamma, qkv_shard.tensor_data(*kv_norm), kv_norm->nbytes, cudaMemcpyHostToDevice), "copy prefill kv gamma");
@@ -1678,67 +1880,118 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
         attn_dims.d_inv_freqs = ctx.rope_inv_freqs_for(li, layer_compress_ratio != 0, attn_dims.rope_dim, attn_dims.rope_theta);
         float* d_layer_kv_cache = ctx.kv_cache_tokens > 0 ? ctx.kv_cache_for_layer(li, attn_dims.head_dim) : nullptr;
 
-        std::vector<HcPreResult> attn_pre = hc_pre_rows_cpu(h4_rows, reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_attn_fn)), reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_attn_scale)), reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_attn_base)), token_count, dim);
-        std::vector<float> attn_x_rows = hc_pre_x_rows_cpu(attn_pre, dim);
-        std::vector<float> attn_out_rows(token_dim);
-        for (int t = 0; t < token_count; ++t) {
-            attn_dims.position = t;
-            attn_dims.cache_write_slot = t % attn_dims.window_size;
-            const int window_len = std::min(t + 1, attn_dims.window_size);
-            const int layer_cache_len = d_layer_kv_cache == nullptr ? 0 : std::min(ctx.kv_cache_capacity_for_layer(li), window_len);
-            check_cuda(cudaMemcpy(d_attn_x, attn_x_rows.data() + static_cast<size_t>(t) * dim, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyHostToDevice), "copy prefill attn token x");
-            if (!run_single_token_attention_smoke(
-                    attn_dims,
-                    d_attn_x,
-                    d_attn_gamma,
-                    attn_cache.wq_a,
-                    attn_cache.wq_a_scale,
-                    d_q_gamma,
-                    attn_cache.wq_b,
-                    attn_cache.wq_b_scale,
-                    attn_cache.wkv,
-                    attn_cache.wkv_scale,
-                    d_kv_gamma,
-                    attn_cache.wo_a,
-                    attn_cache.wo_a_scale,
-                    attn_cache.wo_b,
-                    attn_cache.wo_b_scale,
-                    attn_cache.attn_sink,
-                    d_layer_kv_cache,
-                    nullptr,
-                    0,
-                    layer_cache_len,
-                    d_attn_norm,
-                    d_q_a,
-                    d_q_norm,
-                    d_q,
-                    d_kv_a,
-                    d_kv_norm,
-                    d_attn_value,
-                    d_attn_mid,
-                    d_attn_out)) {
-                throw std::runtime_error("prefill attention launch failed");
+        auto stage_t = Clock::now();
+        if (!hc_pre_float_rows_cuda(d_h4_rows, hc_cache.attn_fn, hc_cache.attn_scale, hc_cache.attn_base, d_x_rows, d_hc_post_rows, d_hc_comb_rows, token_count, dim)) throw std::runtime_error("prefill hc attn pre rows launch failed");
+        sync_prefill_profile("profile sync prefill hc attn pre");
+        total_prefill_hc_pre_ms += elapsed_ms(stage_t, Clock::now());
+        stage_t = Clock::now();
+        if (env_int_or_default("DSV4_CPP_PREFILL_BATCHED_ATTN", 0) != 0) {
+            if (!rmsnorm_bf16_gamma_rows_cuda(d_x_rows, d_attn_gamma, d_attn_norm_rows, token_count, dim, 1e-6f)) throw std::runtime_error("prefill attn norm rows launch failed");
+            if (!fp8_e4m3_e8m0_matmul_cuda(d_attn_norm_rows, attn_cache.wq_a, attn_cache.wq_a_scale, d_q_a_rows, token_count, attn_dims.q_a_dim, dim)) throw std::runtime_error("prefill wq_a rows launch failed");
+            if (!rmsnorm_bf16_gamma_rows_cuda(d_q_a_rows, d_q_gamma, d_q_norm_rows, token_count, attn_dims.q_a_dim, 1e-6f)) throw std::runtime_error("prefill q norm rows launch failed");
+            if (!fp8_e4m3_e8m0_matmul_cuda(d_q_norm_rows, attn_cache.wq_b, attn_cache.wq_b_scale, d_q_rows, token_count, attn_dims.q_dim, attn_dims.q_a_dim)) throw std::runtime_error("prefill wq_b rows launch failed");
+            if (!head_rmsnorm_rope_freqs_rows_cuda(d_q_rows, attn_dims.d_inv_freqs, token_count, attn_dims.heads, attn_dims.head_dim, attn_dims.rope_dim, 0, false, 1e-6f)) throw std::runtime_error("prefill q rope rows launch failed");
+            if (!fp8_e4m3_e8m0_matmul_cuda(d_attn_norm_rows, attn_cache.wkv, attn_cache.wkv_scale, d_kv_a_rows, token_count, attn_dims.kv_dim, dim)) throw std::runtime_error("prefill wkv rows launch failed");
+            if (!rmsnorm_bf16_gamma_rows_cuda(d_kv_a_rows, d_kv_gamma, d_kv_norm_rows, token_count, attn_dims.kv_dim, 1e-6f)) throw std::runtime_error("prefill kv norm rows launch failed");
+            if (!head_rmsnorm_rope_freqs_rows_cuda(d_kv_norm_rows, attn_dims.d_inv_freqs, token_count, 1, attn_dims.head_dim, attn_dims.rope_dim, 0, false, 0.0f)) throw std::runtime_error("prefill kv rope rows launch failed");
+            if (!fp8_act_quant_dequant_rows_strided_cuda(d_kv_norm_rows, token_count, attn_dims.head_dim - attn_dims.rope_dim, attn_dims.head_dim, 64)) throw std::runtime_error("prefill kv act quant rows failed");
+            if (d_layer_kv_cache != nullptr && !copy_rows_to_kv_cache_cuda(d_kv_norm_rows, d_layer_kv_cache, token_count, attn_dims.head_dim, attn_dims.window_size)) throw std::runtime_error("prefill kv cache rows copy failed");
+            const int window_topk = static_cast<int>(std::min<uint64_t>(static_cast<uint64_t>(token_count), std::max<uint64_t>(1, config.window_size == 0 ? 128 : config.window_size)));
+            if (!build_prefill_window_indices_cuda(d_prefill_window_indices, token_count, attn_dims.window_size, window_topk)) throw std::runtime_error("prefill window indices launch failed");
+            if (!prefill_sparse_attention_headpair_cuda(d_q_rows, d_kv_norm_rows, attn_cache.attn_sink, d_prefill_window_indices, d_attn_value_rows, token_count, attn_dims.heads, token_count, window_topk, attn_dims.head_dim, 1.0f / std::sqrt(static_cast<float>(attn_dims.head_dim)))) throw std::runtime_error("prefill sparse attention headpair launch failed");
+            if (!head_rmsnorm_rope_freqs_rows_cuda(d_attn_value_rows, attn_dims.d_inv_freqs, token_count, attn_dims.heads, attn_dims.head_dim, attn_dims.rope_dim, 0, true, 0.0f)) throw std::runtime_error("prefill attn value inverse rope rows launch failed");
+            for (int g = 0; g < attn_dims.groups; ++g) {
+                const float* group_x = d_attn_value_rows + static_cast<size_t>(g) * attn_dims.group_dim;
+                const uint8_t* group_w = attn_cache.wo_a + static_cast<size_t>(g) * attn_dims.group_rank * attn_dims.group_dim;
+                const uint8_t* group_s = attn_cache.wo_a_scale + static_cast<size_t>(g) * (attn_dims.group_rank / 128) * (attn_dims.group_dim / 128);
+                float* group_y = d_attn_mid_rows + static_cast<size_t>(g) * attn_dims.group_rank;
+                if (!fp8_e4m3_e8m0_matmul_strided_cuda(group_x, group_w, group_s, group_y, token_count, attn_dims.group_rank, attn_dims.group_dim, attn_dims.q_dim, attn_dims.attn_mid)) throw std::runtime_error("prefill wo_a rows launch failed");
             }
+            if (!fp8_e4m3_e8m0_matmul_cuda(d_attn_mid_rows, attn_cache.wo_b, attn_cache.wo_b_scale, d_attn_out_rows, token_count, dim, attn_dims.attn_mid)) throw std::runtime_error("prefill wo_b rows launch failed");
 #ifdef DSV4_HAVE_NCCL
             if (ctx.options.tp_world > 1) {
                 if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP prefill attention all-reduce requires --nccl-id-path");
-                all_reduce_sum_fp32_via_bf16_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_attn_out, dim, bf16_reduce_scratch);
+                if (env_int_or_default("DSV4_CPP_PREFILL_BATCHED_ATTN_BULK_REDUCE", 0) != 0) {
+                    all_reduce_sum_fp32_via_bf16_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_attn_out_rows, static_cast<int>(token_dim), bf16_reduce_scratch);
+                } else {
+                    for (int t = 0; t < token_count; ++t) {
+                        all_reduce_sum_fp32_via_bf16_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_attn_out_rows + static_cast<size_t>(t) * dim, dim, bf16_reduce_scratch);
+                    }
+                }
             }
 #endif
-            check_cuda(cudaMemcpy(attn_out_rows.data() + static_cast<size_t>(t) * dim, d_attn_out, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy prefill attn out token");
+        } else {
+            for (int t = 0; t < token_count; ++t) {
+                attn_dims.position = t;
+                attn_dims.cache_write_slot = t % attn_dims.window_size;
+                const int window_len = std::min(t + 1, attn_dims.window_size);
+                const int layer_cache_len = d_layer_kv_cache == nullptr ? 0 : std::min(ctx.kv_cache_capacity_for_layer(li), window_len);
+                check_cuda(cudaMemcpy(d_attn_x, d_x_rows + static_cast<size_t>(t) * dim, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToDevice), "copy prefill attn token x");
+                if (!run_single_token_attention_smoke(
+                        attn_dims,
+                        d_attn_x,
+                        d_attn_gamma,
+                        attn_cache.wq_a,
+                        attn_cache.wq_a_scale,
+                        d_q_gamma,
+                        attn_cache.wq_b,
+                        attn_cache.wq_b_scale,
+                        attn_cache.wkv,
+                        attn_cache.wkv_scale,
+                        d_kv_gamma,
+                        attn_cache.wo_a,
+                        attn_cache.wo_a_scale,
+                        attn_cache.wo_b,
+                        attn_cache.wo_b_scale,
+                        attn_cache.attn_sink,
+                        d_layer_kv_cache,
+                        nullptr,
+                        0,
+                        layer_cache_len,
+                        d_attn_norm,
+                        d_q_a,
+                        d_q_norm,
+                        d_q,
+                        d_kv_a,
+                        d_kv_norm,
+                        d_attn_value,
+                        d_attn_mid,
+                        d_attn_out)) {
+                    throw std::runtime_error("prefill attention launch failed");
+                }
+#ifdef DSV4_HAVE_NCCL
+                if (ctx.options.tp_world > 1) {
+                    if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP prefill attention all-reduce requires --nccl-id-path");
+                    all_reduce_sum_fp32_via_bf16_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_attn_out, dim, bf16_reduce_scratch);
+                }
+#endif
+                check_cuda(cudaMemcpy(d_attn_out_rows + static_cast<size_t>(t) * dim, d_attn_out, static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToDevice), "copy prefill attn out token");
+            }
         }
-        h4_rows = hc_post_rows_cpu(attn_out_rows, h4_rows, attn_pre, dim);
-        round_vector_to_bf16(h4_rows);
+        sync_prefill_profile("profile sync prefill attention");
+        total_prefill_attn_ms += elapsed_ms(stage_t, Clock::now());
+        stage_t = Clock::now();
+        if (!hc_post_float_rows_cuda(d_attn_out_rows, d_h4_rows, d_hc_post_rows, d_hc_comb_rows, d_h4_next_rows, token_count, dim)) throw std::runtime_error("prefill hc attn post rows launch failed");
+        if (!fp32_to_bf16_cuda(d_h4_next_rows, d_h4_bf16_rows, static_cast<int>(token_dim * 4))) throw std::runtime_error("prefill hc attn post bf16 round failed");
+        if (!bf16_to_fp32_cuda(d_h4_bf16_rows, d_h4_rows, static_cast<int>(token_dim * 4))) throw std::runtime_error("prefill hc attn post bf16 restore failed");
+        sync_prefill_profile("profile sync prefill hc attn post");
+        total_prefill_attn_post_ms += elapsed_ms(stage_t, Clock::now());
+        stage_t = Clock::now();
 
-        std::vector<HcPreResult> ffn_pre = hc_pre_rows_cpu(h4_rows, reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_ffn_fn)), reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_ffn_scale)), reinterpret_cast<const float*>(qkv_shard.tensor_data(*hc_ffn_base)), token_count, dim);
-        std::vector<float> ffn_x_rows = hc_pre_x_rows_cpu(ffn_pre, dim);
-        check_cuda(cudaMemcpy(d_x_rows, ffn_x_rows.data(), token_dim * sizeof(float), cudaMemcpyHostToDevice), "copy prefill ffn x rows");
+        if (!hc_pre_float_rows_cuda(d_h4_rows, hc_cache.ffn_fn, hc_cache.ffn_scale, hc_cache.ffn_base, d_x_rows, d_hc_post_rows, d_hc_comb_rows, token_count, dim)) throw std::runtime_error("prefill hc ffn pre rows launch failed");
         check_cuda(cudaMemcpy(d_ffn_gamma, ffn_norm_shard.tensor_data(*ffn_norm), ffn_norm->nbytes, cudaMemcpyHostToDevice), "copy prefill ffn gamma");
         if (!rmsnorm_bf16_gamma_rows_cuda(d_x_rows, d_ffn_gamma, d_ffn_norm_rows, token_count, dim, 1e-6f)) throw std::runtime_error("prefill ffn norm rows launch failed");
+        sync_prefill_profile("profile sync prefill hc ffn pre");
+        total_prefill_ffn_pre_ms += elapsed_ms(stage_t, Clock::now());
+        stage_t = Clock::now();
 
-        if (static_cast<uint64_t>(li) < config.n_hash_layers && index.shard_for_tensor(prefix + "ffn.gate.tid2eid") != nullptr) {
+        DeviceGateCache& gate = ctx.gate_device_cache(li);
+        const bool use_gpu_hash_gate = env_int_or_default("DSV4_CPP_PREFILL_GPU_HASH_GATE", 0) != 0;
+        if (static_cast<uint64_t>(li) < config.n_hash_layers && gate.tid2eid != nullptr && use_gpu_hash_gate) {
+            if (!gate_hash_bf16_rows_cuda(d_ffn_norm_rows, gate.weight, gate.tid2eid, d_token_ids, d_route_indices, d_route_weights, token_count, gate.dim, gate.hash_topk, route_count, static_cast<float>(config.route_scale))) throw std::runtime_error("prefill hash gate rows launch failed");
+        } else if (static_cast<uint64_t>(li) < config.n_hash_layers && gate.tid2eid != nullptr) {
             std::vector<float> ffn_norm_host(token_dim);
-            check_cuda(cudaMemcpy(ffn_norm_host.data(), d_ffn_norm_rows, token_dim * sizeof(float), cudaMemcpyDeviceToHost), "copy prefill ffn norm for hash gate");
+            check_cuda(cudaMemcpy(ffn_norm_host.data(), d_ffn_norm_rows, token_dim * sizeof(float), cudaMemcpyDeviceToHost), "copy prefill ffn norm for host hash gate");
             SafeTensorsShard& gate_shard = ctx.shard_for_tensor(prefix + "ffn.gate.tid2eid");
             const auto* tid2eid = require_tensor(gate_shard, prefix + "ffn.gate.tid2eid");
             const auto* ids = reinterpret_cast<const int64_t*>(gate_shard.tensor_data(*tid2eid));
@@ -1766,9 +2019,11 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
             check_cuda(cudaMemcpy(d_route_indices, h_indices.data(), routes_cap * sizeof(int64_t), cudaMemcpyHostToDevice), "copy hash route indices rows");
             check_cuda(cudaMemcpy(d_route_weights, h_weights.data(), routes_cap * sizeof(float), cudaMemcpyHostToDevice), "copy hash route weights rows");
         } else {
-            DeviceGateCache& gate = ctx.gate_device_cache(li);
             if (!gate_topk_bf16_rows_cuda(d_ffn_norm_rows, gate.weight, gate.bias, d_route_indices, d_route_weights, token_count, gate.experts, gate.dim, route_count, static_cast<float>(config.route_scale))) throw std::runtime_error("prefill gate topk rows launch failed");
         }
+        sync_prefill_profile("profile sync prefill gate");
+        total_prefill_gate_ms += elapsed_ms(stage_t, Clock::now());
+        stage_t = Clock::now();
 
         if (!moe_group_routes_cuda(d_route_indices, d_route_weights, d_group_route_tokens, d_group_route_weights, d_seg_starts, d_counts, d_offsets, d_total_routes, token_count, route_count, expert_start, experts_per_rank)) throw std::runtime_error("prefill group routes launch failed");
         int32_t total_routes = 0;
@@ -1776,8 +2031,24 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
         check_cuda(cudaMemcpy(&total_routes, d_total_routes, sizeof(int32_t), cudaMemcpyDeviceToHost), "copy total routes");
         check_cuda(cudaMemcpy(h_counts.data(), d_counts, h_counts.size() * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy route counts");
         int max_count = 0;
-        for (int32_t c : h_counts) max_count = std::max(max_count, static_cast<int>(c));
-        check_cuda(cudaMemset(d_moe_rows, 0, token_dim * sizeof(float)), "zero prefill moe rows");
+        int active_experts = 0;
+        int64_t route_sum = 0;
+        for (int32_t c : h_counts) {
+            max_count = std::max(max_count, static_cast<int>(c));
+            if (c > 0) ++active_experts;
+            route_sum += c;
+        }
+        if (env_int_or_default("DSV4_CPP_PREFILL_ROUTE_STATS", 0) != 0 && tp_rank == 0) {
+            std::cerr << "CPP_PREFILL_ROUTE_STATS layer=" << li
+                      << " total_routes=" << total_routes
+                      << " route_sum=" << route_sum
+                      << " active_experts=" << active_experts
+                      << " max_count=" << max_count
+                      << " padded_rows=" << static_cast<int64_t>(experts_per_rank) * max_count << "\n";
+        }
+        sync_prefill_profile("profile sync prefill group");
+        total_prefill_group_ms += elapsed_ms(stage_t, Clock::now());
+        stage_t = Clock::now();
         if (total_routes > 0 && max_count > 0) {
             DeviceFp4ExpertCache sample;
             Fp4View sample_w1 = ctx.fp4_view(prefix + "ffn.experts." + std::to_string(expert_start) + ".w1.weight");
@@ -1805,14 +2076,37 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
                     check_cuda(cudaMemcpyAsync(arena.s3 + static_cast<size_t>(local) * arena.s3_bytes, slot.h_w3s, arena.s3_bytes, cudaMemcpyHostToDevice), "stage prefill s3");
                 }
             }
-            if (!moe_prefill_fp4_grouped_cuda(d_ffn_norm_rows, d_group_route_tokens, d_group_route_weights, d_seg_starts, arena.w1, arena.s1, arena.w2, arena.s2, arena.w3, arena.s3, d_moe_rows, token_count, route_count, total_routes, experts_per_rank, max_count, dim, inter, static_cast<float>(config.swiglu_limit))) throw std::runtime_error("prefill grouped fp4 moe launch failed");
+            std::vector<int32_t> h_tile_experts;
+            std::vector<int32_t> h_tile_rows;
+            h_tile_experts.reserve(static_cast<size_t>((total_routes + 15) / 16 + experts_per_rank));
+            h_tile_rows.reserve(h_tile_experts.capacity());
+            for (int local = 0; local < experts_per_rank; ++local) {
+                const int count = h_counts[static_cast<size_t>(local)];
+                for (int row = 0; row < count; row += 16) {
+                    h_tile_experts.push_back(local);
+                    h_tile_rows.push_back(row);
+                }
+            }
+            prefill_moe_workspace.ensure(total_routes, static_cast<int>(h_tile_experts.size()), dim, inter);
+            prefill_moe_workspace.fp4.tile_count = static_cast<int>(h_tile_experts.size());
+            check_cuda(cudaMemcpy(prefill_moe_workspace.fp4.d_tile_experts, h_tile_experts.data(), h_tile_experts.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "copy prefill moe tile experts");
+            check_cuda(cudaMemcpy(prefill_moe_workspace.fp4.d_tile_rows, h_tile_rows.data(), h_tile_rows.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "copy prefill moe tile rows");
+            if (!moe_prefill_fp4_grouped_cuda_with_workspace(d_ffn_norm_rows, d_group_route_tokens, d_group_route_weights, d_seg_starts, arena.w1, arena.s1, arena.w2, arena.s2, arena.w3, arena.s3, d_moe_rows, token_count, route_count, total_routes, experts_per_rank, max_count, dim, inter, static_cast<float>(config.swiglu_limit), prefill_moe_workspace.fp4)) throw std::runtime_error("prefill grouped fp4 moe launch failed");
+        } else {
+            check_cuda(cudaMemset(d_moe_rows, 0, token_dim * sizeof(float)), "zero empty prefill moe rows");
         }
+        sync_prefill_profile("profile sync prefill moe");
+        total_prefill_moe_ms += elapsed_ms(stage_t, Clock::now());
+        stage_t = Clock::now();
 #ifdef DSV4_HAVE_NCCL
         if (ctx.options.tp_world > 1) {
             if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP prefill MoE all-reduce requires --nccl-id-path");
             all_reduce_sum_fp32_via_bf16_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_moe_rows, static_cast<int>(token_dim), bf16_reduce_scratch);
         }
 #endif
+        sync_prefill_profile("profile sync prefill reduce");
+        total_prefill_reduce_ms += elapsed_ms(stage_t, Clock::now());
+        stage_t = Clock::now();
         {
             DeviceSharedCache& shared = ctx.shared_device_cache(li, tp_world, tp_rank, dim);
             const int shared_inter = inter;
@@ -1822,14 +2116,31 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
             if (!fp8_e4m3_e8m0_matmul_cuda(d_shared_hidden, shared.w2, shared.s2, d_shared_out, token_count, dim, shared_inter)) throw std::runtime_error("prefill shared w2 launch failed");
             if (!vector_accum_rows_cuda(d_shared_out, d_moe_rows, token_count, dim, 1.0f)) throw std::runtime_error("prefill shared accum failed");
         }
-        std::vector<float> moe_rows(token_dim);
-        check_cuda(cudaMemcpy(moe_rows.data(), d_moe_rows, token_dim * sizeof(float), cudaMemcpyDeviceToHost), "copy prefill moe rows host");
-        h4_rows = hc_post_rows_cpu(moe_rows, h4_rows, ffn_pre, dim);
-        round_vector_to_bf16(h4_rows);
+        sync_prefill_profile("profile sync prefill shared");
+        total_prefill_shared_ms += elapsed_ms(stage_t, Clock::now());
+        stage_t = Clock::now();
+        if (!hc_post_float_rows_cuda(d_moe_rows, d_h4_rows, d_hc_post_rows, d_hc_comb_rows, d_h4_next_rows, token_count, dim)) throw std::runtime_error("prefill hc ffn post rows launch failed");
+        if (!fp32_to_bf16_cuda(d_h4_next_rows, d_h4_bf16_rows, static_cast<int>(token_dim * 4))) throw std::runtime_error("prefill hc ffn post bf16 round failed");
+        if (!bf16_to_fp32_cuda(d_h4_bf16_rows, d_h4_rows, static_cast<int>(token_dim * 4))) throw std::runtime_error("prefill hc ffn post bf16 restore failed");
+        sync_prefill_profile("profile sync prefill hc ffn post");
+        total_prefill_ffn_post_ms += elapsed_ms(stage_t, Clock::now());
+    }
+
+    if (profile_forward) {
+        std::cout << "CPP_PREFILL_PROFILE_TOTAL hc_pre_ms=" << total_prefill_hc_pre_ms
+                  << " attn_ms=" << total_prefill_attn_ms
+                  << " attn_post_ms=" << total_prefill_attn_post_ms
+                  << " ffn_pre_ms=" << total_prefill_ffn_pre_ms
+                  << " gate_ms=" << total_prefill_gate_ms
+                  << " group_ms=" << total_prefill_group_ms
+                  << " moe_ms=" << total_prefill_moe_ms
+                  << " reduce_ms=" << total_prefill_reduce_ms
+                  << " shared_ms=" << total_prefill_shared_ms
+                  << " ffn_post_ms=" << total_prefill_ffn_post_ms << "\n";
     }
 
     std::vector<float> last_h4(4 * static_cast<size_t>(dim));
-    std::copy(h4_rows.begin() + static_cast<size_t>(token_count - 1) * 4 * dim, h4_rows.begin() + static_cast<size_t>(token_count) * 4 * dim, last_h4.begin());
+    check_cuda(cudaMemcpy(last_h4.data(), d_h4_rows + static_cast<size_t>(token_count - 1) * 4 * dim, 4 * static_cast<size_t>(dim) * sizeof(float), cudaMemcpyDeviceToHost), "copy prefill last h4");
     std::vector<float> host_x = hc_head_cpu(last_h4, reinterpret_cast<const float*>(ctx.hc_head_shard.tensor_data(*ctx.hc_head_fn)), reinterpret_cast<const float*>(ctx.hc_head_shard.tensor_data(*ctx.hc_head_scale)), reinterpret_cast<const float*>(ctx.hc_head_shard.tensor_data(*ctx.hc_head_base)), dim);
     check_cuda(cudaMemcpy(d_last_x, host_x.data(), static_cast<size_t>(dim) * sizeof(float), cudaMemcpyHostToDevice), "copy prefill hc head");
     if (!rmsnorm_bf16_gamma_cuda(d_last_x, d_final_norm_gamma, d_final_norm, dim, 1e-6f)) throw std::runtime_error("prefill final norm launch failed");
@@ -1849,9 +2160,9 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
         }
     }
 
-    cudaFree(d_token_ids); cudaFree(d_embed_matrix); cudaFree(d_x_rows); cudaFree(d_ffn_gamma); cudaFree(d_ffn_norm_rows);
+    cudaFree(d_token_ids); cudaFree(d_embed_matrix); cudaFree(d_x_rows); cudaFree(d_h4_rows); cudaFree(d_h4_next_rows); cudaFree(d_h4_bf16_rows); cudaFree(d_hc_post_rows); cudaFree(d_hc_comb_rows); cudaFree(d_attn_out_rows); cudaFree(d_ffn_gamma); cudaFree(d_ffn_norm_rows);
     cudaFree(d_route_indices); cudaFree(d_route_weights); cudaFree(d_group_route_tokens); cudaFree(d_group_route_weights); cudaFree(d_seg_starts); cudaFree(d_counts); cudaFree(d_offsets); cudaFree(d_total_routes);
-    cudaFree(d_attn_gamma); cudaFree(d_q_gamma); cudaFree(d_kv_gamma); cudaFree(d_attn_x); cudaFree(d_attn_norm); cudaFree(d_q_a); cudaFree(d_q_norm); cudaFree(d_q); cudaFree(d_kv_a); cudaFree(d_kv_norm); cudaFree(d_attn_value); cudaFree(d_attn_mid); cudaFree(d_attn_out); cudaFree(d_kv_indices);
+    cudaFree(d_attn_gamma); cudaFree(d_q_gamma); cudaFree(d_kv_gamma); cudaFree(d_attn_x); cudaFree(d_attn_norm); cudaFree(d_attn_norm_rows); cudaFree(d_q_a); cudaFree(d_q_norm); cudaFree(d_q); cudaFree(d_q_a_rows); cudaFree(d_q_norm_rows); cudaFree(d_q_rows); cudaFree(d_kv_a); cudaFree(d_kv_norm); cudaFree(d_kv_a_rows); cudaFree(d_kv_norm_rows); cudaFree(d_attn_value); cudaFree(d_attn_value_rows); cudaFree(d_attn_mid); cudaFree(d_attn_mid_rows); cudaFree(d_attn_out); cudaFree(d_prefill_window_indices);
     cudaFree(d_moe_rows); cudaFree(d_shared_gate); cudaFree(d_shared_up); cudaFree(d_shared_hidden); cudaFree(d_shared_out);
     cudaFree(d_head); cudaFree(d_final_norm_gamma); cudaFree(d_last_x); cudaFree(d_final_norm); cudaFree(d_logits);
     return ForwardSmokeResult{last_token, dim, inter, head_rows, layer_count, top_token, top_logit, checksum};
@@ -2004,6 +2315,8 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
     if (!bf16_row_to_float_cuda(d_embed, d_x, 0, dim)) throw std::runtime_error("embed launch failed");
     const bool debug_forward = debug_forward_enabled();
     const bool profile_forward = profile_forward_enabled();
+    const int sparse_slots_per_layer = env_int_or_default("DSV4_CPP_DECODE_SPARSE_ARENA", 0);
+    const bool use_sparse_arena = sparse_slots_per_layer > 0;
     double total_load_ms = 0.0;
     double total_hc_ms = 0.0;
     double total_attn_ms = 0.0;
@@ -2332,21 +2645,32 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
             sample.s2_bytes = active_w2.front().s->nbytes;
             sample.w3_bytes = active_w3.front().w->nbytes;
             sample.s3_bytes = active_w3.front().s->nbytes;
-            active_arena = &ctx.active_fp4_arena(li, tp_world, tp_rank, experts_per_rank, sample);
+            active_arena = &ctx.active_fp4_arena(li, tp_world, tp_rank, use_sparse_arena ? sparse_slots_per_layer : experts_per_rank, sample, use_sparse_arena);
             if (moe_stage_event_recorded) check_cuda(cudaStreamWaitEvent(moe_copy_stream, moe_stage_event, 0), "wait prior moe stage event");
+            std::vector<int64_t> route_indices_kernel = route_indices;
             for (size_t ri = 0; ri < active_w1.size(); ++ri) {
                 const int local = active_local_ids[ri];
-                if (active_arena->staged_local.insert(local).second) {
-                    HostFp4ExpertSlot& slot = ctx.host_fp4_slot(li, expert_start + local, active_w1[ri], active_w2[ri], active_w3[ri]);
-                    check_cuda(cudaMemcpyAsync(active_arena->w1 + static_cast<size_t>(local) * active_arena->w1_bytes, slot.h_w1q, active_arena->w1_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active w1");
-                    check_cuda(cudaMemcpyAsync(active_arena->s1 + static_cast<size_t>(local) * active_arena->s1_bytes, slot.h_w1s, active_arena->s1_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active s1");
-                    check_cuda(cudaMemcpyAsync(active_arena->w2 + static_cast<size_t>(local) * active_arena->w2_bytes, slot.h_w2q, active_arena->w2_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active w2");
-                    check_cuda(cudaMemcpyAsync(active_arena->s2 + static_cast<size_t>(local) * active_arena->s2_bytes, slot.h_w2s, active_arena->s2_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active s2");
-                    check_cuda(cudaMemcpyAsync(active_arena->w3 + static_cast<size_t>(local) * active_arena->w3_bytes, slot.h_w3q, active_arena->w3_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active w3");
-                    check_cuda(cudaMemcpyAsync(active_arena->s3 + static_cast<size_t>(local) * active_arena->s3_bytes, slot.h_w3s, active_arena->s3_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active s3");
+                int slot = local;
+                bool need_stage = false;
+                if (use_sparse_arena) {
+                    bool already_staged = false;
+                    slot = ctx.acquire_sparse_slot(*active_arena, local, already_staged);
+                    need_stage = !already_staged;
+                    route_indices_kernel[ri] = static_cast<int64_t>(expert_start + slot);
+                } else {
+                    need_stage = active_arena->staged_local.insert(local).second;
+                }
+                if (need_stage) {
+                    HostFp4ExpertSlot& slot_h = ctx.host_fp4_slot(li, expert_start + local, active_w1[ri], active_w2[ri], active_w3[ri]);
+                    check_cuda(cudaMemcpyAsync(active_arena->w1 + static_cast<size_t>(slot) * active_arena->w1_bytes, slot_h.h_w1q, active_arena->w1_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active w1");
+                    check_cuda(cudaMemcpyAsync(active_arena->s1 + static_cast<size_t>(slot) * active_arena->s1_bytes, slot_h.h_w1s, active_arena->s1_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active s1");
+                    check_cuda(cudaMemcpyAsync(active_arena->w2 + static_cast<size_t>(slot) * active_arena->w2_bytes, slot_h.h_w2q, active_arena->w2_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active w2");
+                    check_cuda(cudaMemcpyAsync(active_arena->s2 + static_cast<size_t>(slot) * active_arena->s2_bytes, slot_h.h_w2s, active_arena->s2_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active s2");
+                    check_cuda(cudaMemcpyAsync(active_arena->w3 + static_cast<size_t>(slot) * active_arena->w3_bytes, slot_h.h_w3q, active_arena->w3_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active w3");
+                    check_cuda(cudaMemcpyAsync(active_arena->s3 + static_cast<size_t>(slot) * active_arena->s3_bytes, slot_h.h_w3s, active_arena->s3_bytes, cudaMemcpyHostToDevice, moe_copy_stream), "stage active s3");
                 }
             }
-            check_cuda(cudaMemcpyAsync(d_route_indices, route_indices.data(), route_indices.size() * sizeof(int64_t), cudaMemcpyHostToDevice, moe_copy_stream), "copy active route indices");
+            check_cuda(cudaMemcpyAsync(d_route_indices, route_indices_kernel.data(), route_indices_kernel.size() * sizeof(int64_t), cudaMemcpyHostToDevice, moe_copy_stream), "copy active route indices");
             check_cuda(cudaEventRecord(moe_stage_event, moe_copy_stream), "record moe stage event");
             moe_stage_event_recorded = true;
         }
@@ -2365,7 +2689,8 @@ ForwardSmokeResult run_safetensors_token_forward_impl(SafeForwardContext& ctx, i
         if (has_active_moe) {
             check_cuda(cudaStreamWaitEvent(nullptr, moe_stage_event, 0), "wait active moe stage");
             DeviceMoeDecodeWorkspace& moe_workspace = ctx.moe_decode_workspace(route_count, dim, inter);
-            if (!moe_single_token_fp4_cuda_with_workspace(d_ffn_norm, d_route_indices, d_route_weights, active_arena->w1, active_arena->s1, active_arena->w2, active_arena->s2, active_arena->w3, active_arena->s3, d_resid2, route_count, expert_start, experts_per_rank, dim, inter, static_cast<float>(config.swiglu_limit), moe_workspace.fp4)) {
+            const int moe_n_local = use_sparse_arena ? active_arena->capacity : experts_per_rank;
+            if (!moe_single_token_fp4_cuda_with_workspace(d_ffn_norm, d_route_indices, d_route_weights, active_arena->w1, active_arena->s1, active_arena->w2, active_arena->s2, active_arena->w3, active_arena->s3, d_resid2, route_count, expert_start, moe_n_local, dim, inter, static_cast<float>(config.swiglu_limit), moe_workspace.fp4)) {
                 throw std::runtime_error("active fp4 moe launch failed");
             }
             if (!vector_accum_cuda(d_resid2, d_moe, dim, 1.0f)) throw std::runtime_error("moe accum failed");

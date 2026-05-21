@@ -104,6 +104,122 @@ __global__ void hc_post_float_kernel(const float* x, const float* residual, cons
     }
 }
 
+__global__ void hc_repeat_rows_kernel(const float* x, float* h4, int rows, int dim) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (row >= rows) return;
+    const float* src = x + static_cast<size_t>(row) * dim;
+    float* dst = h4 + static_cast<size_t>(row) * 4 * dim;
+    for (int i = tid; i < 4 * dim; i += blockDim.x) dst[i] = src[i % dim];
+}
+
+__global__ void hc_pre_float_rows_kernel(
+    const float* h4_rows,
+    const float* fn,
+    const float* scale,
+    const float* base,
+    float* x_rows,
+    float* post_rows,
+    float* comb_rows,
+    int rows,
+    int dim) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const float* h4 = h4_rows + static_cast<size_t>(row) * 4 * dim;
+    float* x = x_rows + static_cast<size_t>(row) * dim;
+    float* post_out = post_rows + static_cast<size_t>(row) * 4;
+    float* comb_out = comb_rows + static_cast<size_t>(row) * 16;
+    constexpr float eps = 1e-6f;
+    const int tid = threadIdx.x;
+    __shared__ float mixes[24];
+    __shared__ float pre[4];
+    __shared__ float post[4];
+    __shared__ float comb[16];
+    __shared__ float partial[256];
+    float sum_sq = 0.0f;
+    for (int i = tid; i < 4 * dim; i += blockDim.x) {
+        const float v = h4[i];
+        sum_sq += v * v;
+    }
+    partial[tid] = sum_sq;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        __syncthreads();
+    }
+    const float rsqrt = rsqrtf(partial[0] / static_cast<float>(4 * dim) + eps);
+    for (int r = tid; r < 24; r += blockDim.x) {
+        float dot = 0.0f;
+        const float* fn_row = fn + static_cast<size_t>(r) * 4 * dim;
+        for (int i = 0; i < 4 * dim; ++i) dot += fn_row[i] * h4[i];
+        mixes[r] = dot * rsqrt;
+    }
+    __syncthreads();
+    if (tid < 4) {
+        pre[tid] = sigmoidf_fast(mixes[tid] * scale[0] + base[tid]) + eps;
+        post[tid] = 2.0f * sigmoidf_fast(mixes[4 + tid] * scale[1] + base[4 + tid]);
+    }
+    if (tid < 16) {
+        float vals[4];
+        const int rr = tid / 4;
+        const int col = tid - rr * 4;
+        const float* cm = mixes + 8 + rr * 4;
+        float max_v = cm[0] * scale[2] + base[8 + rr * 4];
+        for (int c = 1; c < 4; ++c) max_v = fmaxf(max_v, cm[c] * scale[2] + base[8 + rr * 4 + c]);
+        float sum = 0.0f;
+        for (int c = 0; c < 4; ++c) {
+            vals[c] = expf(cm[c] * scale[2] + base[8 + rr * 4 + c] - max_v);
+            sum += vals[c];
+        }
+        comb[tid] = vals[col] / sum + eps;
+    }
+    __syncthreads();
+    if (tid < 4) {
+        float col_sum = 0.0f;
+        for (int r = 0; r < 4; ++r) col_sum += comb[r * 4 + tid];
+        for (int r = 0; r < 4; ++r) comb[r * 4 + tid] /= col_sum + eps;
+    }
+    __syncthreads();
+    for (int iter = 0; iter < 19; ++iter) {
+        if (tid < 4) {
+            float row_sum = 0.0f;
+            for (int c = 0; c < 4; ++c) row_sum += comb[tid * 4 + c];
+            for (int c = 0; c < 4; ++c) comb[tid * 4 + c] /= row_sum + eps;
+        }
+        __syncthreads();
+        if (tid < 4) {
+            float col_sum = 0.0f;
+            for (int r = 0; r < 4; ++r) col_sum += comb[r * 4 + tid];
+            for (int r = 0; r < 4; ++r) comb[r * 4 + tid] /= col_sum + eps;
+        }
+        __syncthreads();
+    }
+    if (tid < 4) post_out[tid] = post[tid];
+    if (tid < 16) comb_out[tid] = comb[tid];
+    for (int d = tid; d < dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int h = 0; h < 4; ++h) acc += pre[h] * h4[static_cast<size_t>(h) * dim + d];
+        x[d] = acc;
+    }
+}
+
+__global__ void hc_post_float_rows_kernel(const float* x_rows, const float* residual_rows, const float* post_rows, const float* comb_rows, float* y_rows, int rows, int dim) {
+    const int row = blockIdx.x;
+    const int h = blockIdx.y;
+    const int tid = threadIdx.x;
+    if (row >= rows || h >= 4) return;
+    const float* x = x_rows + static_cast<size_t>(row) * dim;
+    const float* residual = residual_rows + static_cast<size_t>(row) * 4 * dim;
+    const float* post = post_rows + static_cast<size_t>(row) * 4;
+    const float* comb = comb_rows + static_cast<size_t>(row) * 16;
+    float* y = y_rows + static_cast<size_t>(row) * 4 * dim + static_cast<size_t>(h) * dim;
+    for (int d = tid; d < dim; d += blockDim.x) {
+        float acc = post[h] * x[d];
+        for (int i = 0; i < 4; ++i) acc += comb[i * 4 + h] * residual[static_cast<size_t>(i) * dim + d];
+        y[d] = acc;
+    }
+}
+
 __global__ void silu_mul_kernel(const float* gate, const float* up, float* y, int cols) {
     const int row = blockIdx.x;
     const float* row_gate = gate + static_cast<size_t>(row) * cols;
@@ -239,6 +355,303 @@ __global__ void head_rmsnorm_rope_freqs_kernel(
         const float b = x[base + 1];
         x[base] = a * c - b * s;
         x[base + 1] = a * s + b * c;
+    }
+}
+
+__device__ float round_pow2_device(float x);
+__device__ float fp8_e4m3_quant_dequant(float v, float scale);
+
+__global__ void head_rmsnorm_rope_freqs_rows_kernel(
+    float* x,
+    const float* inv_freqs,
+    int tokens,
+    int heads,
+    int head_dim,
+    int rope_dim,
+    int start_position,
+    bool inverse,
+    float eps) {
+    const int head = blockIdx.x;
+    const int token = blockIdx.y;
+    if (token >= tokens || head >= heads) return;
+    float* row = x + (static_cast<size_t>(token) * heads + head) * head_dim;
+    if (eps > 0.0f) {
+        float sum_sq = 0.0f;
+        for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+            const float v = row[i];
+            sum_sq += v * v;
+        }
+        __shared__ float partial[256];
+        partial[threadIdx.x] = sum_sq;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+            __syncthreads();
+        }
+        const float norm = rsqrtf(partial[0] / static_cast<float>(head_dim) + eps);
+        for (int i = threadIdx.x; i < head_dim; i += blockDim.x) row[i] *= norm;
+        __syncthreads();
+    }
+    const int rope_start = head_dim - rope_dim;
+    const int position = start_position + token;
+    for (int pair = threadIdx.x * 2; pair < rope_dim; pair += blockDim.x * 2) {
+        const int offset = rope_start + pair;
+        const float angle = static_cast<float>(position) * inv_freqs[pair >> 1];
+        const float c = cosf(angle);
+        const float s = inverse ? -sinf(angle) : sinf(angle);
+        const float a = row[offset];
+        const float b = row[offset + 1];
+        row[offset] = a * c - b * s;
+        row[offset + 1] = a * s + b * c;
+    }
+}
+
+__global__ void fp8_act_quant_dequant_rows_kernel(float* x, int cols, int block_size) {
+    const int row = blockIdx.y;
+    const int block = blockIdx.x;
+    const int start = block * block_size;
+    float* row_x = x + static_cast<size_t>(row) * cols;
+    float max_abs = 0.0f;
+    for (int i = threadIdx.x; i < block_size; i += blockDim.x) max_abs = fmaxf(max_abs, fabsf(row_x[start + i]));
+    __shared__ float partial[256];
+    partial[threadIdx.x] = max_abs;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    const float scale = round_pow2_device(fmaxf(partial[0], 1e-4f) / 448.0f);
+    for (int i = threadIdx.x; i < block_size; i += blockDim.x) row_x[start + i] = fp8_e4m3_quant_dequant(row_x[start + i], scale);
+}
+
+__global__ void fp8_act_quant_dequant_rows_strided_kernel(float* x, int cols, int row_stride, int block_size) {
+    const int row = blockIdx.y;
+    const int block = blockIdx.x;
+    const int start = block * block_size;
+    float* row_x = x + static_cast<size_t>(row) * row_stride;
+    float max_abs = 0.0f;
+    for (int i = threadIdx.x; i < block_size; i += blockDim.x) max_abs = fmaxf(max_abs, fabsf(row_x[start + i]));
+    __shared__ float partial[256];
+    partial[threadIdx.x] = max_abs;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    const float scale = round_pow2_device(fmaxf(partial[0], 1e-4f) / 448.0f);
+    for (int i = threadIdx.x; i < block_size; i += blockDim.x) row_x[start + i] = fp8_e4m3_quant_dequant(row_x[start + i], scale);
+}
+
+__global__ void copy_rows_to_kv_cache_kernel(const float* rows, float* cache, int rows_count, int cols, int window_size) {
+    const int row = blockIdx.x;
+    if (row >= rows_count) return;
+    const int slot = row % window_size;
+    const float* src = rows + static_cast<size_t>(row) * cols;
+    float* dst = cache + static_cast<size_t>(slot) * cols;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) dst[c] = src[c];
+}
+
+__global__ void prefill_causal_attention_kernel(
+    const float* q,
+    const float* kv,
+    const float* attn_sink,
+    float* y,
+    int tokens,
+    int heads,
+    int head_dim,
+    int window_size,
+    float scale) {
+    const int head = blockIdx.x;
+    const int token = blockIdx.y;
+    if (head >= heads || token >= tokens) return;
+    const float* qh = q + (static_cast<size_t>(token) * heads + head) * head_dim;
+    const int start = max(0, token - window_size + 1);
+    __shared__ float denom;
+    __shared__ float max_logit;
+    __shared__ float partial[256];
+    float local_max = attn_sink == nullptr ? -INFINITY : attn_sink[head];
+    for (int t = start + threadIdx.x; t <= token; t += blockDim.x) {
+        const float* kth = kv + static_cast<size_t>(t) * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; ++d) dot += qh[d] * kth[d];
+        local_max = fmaxf(local_max, dot * scale);
+    }
+    partial[threadIdx.x] = local_max;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) max_logit = partial[0];
+    __syncthreads();
+
+    float local_denom = 0.0f;
+    for (int t = start + threadIdx.x; t <= token; t += blockDim.x) {
+        const float* kth = kv + static_cast<size_t>(t) * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; ++d) dot += qh[d] * kth[d];
+        local_denom += expf(dot * scale - max_logit);
+    }
+    partial[threadIdx.x] = local_denom;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) denom = partial[0] + (attn_sink == nullptr ? 0.0f : expf(attn_sink[head] - max_logit));
+    __syncthreads();
+
+    float* yh = y + (static_cast<size_t>(token) * heads + head) * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float out = 0.0f;
+        for (int t = start; t <= token; ++t) {
+            const float* kth = kv + static_cast<size_t>(t) * head_dim;
+            float dot = 0.0f;
+            for (int i = 0; i < head_dim; ++i) dot += qh[i] * kth[i];
+            const float w = expf(dot * scale - max_logit) / denom;
+            out += w * kth[d];
+        }
+        yh[d] = out;
+    }
+}
+
+
+__global__ void build_prefill_window_indices_kernel(int32_t* indices, int tokens, int window_size, int topk) {
+    const int token = blockIdx.x;
+    if (token >= tokens) return;
+    int32_t* row = indices + static_cast<size_t>(token) * topk;
+    const int start = max(0, token - window_size + 1);
+    const int count = token - start + 1;
+    for (int i = threadIdx.x; i < topk; i += blockDim.x) {
+        row[i] = i < count ? (start + i) : -1;
+    }
+}
+
+__global__ void prefill_sparse_attention_headpair_kernel(
+    const float* __restrict__ q,
+    const float* __restrict__ kv,
+    const float* __restrict__ attn_sink,
+    const int32_t* __restrict__ topk_idxs,
+    float* __restrict__ out,
+    int seqlen,
+    int heads,
+    int kv_len,
+    int topk,
+    int dim,
+    float softmax_scale) {
+    const int head_pairs = (heads + 1) / 2;
+    const int bsp = blockIdx.x;
+    const int pair = bsp % head_pairs;
+    const int s = (bsp / head_pairs) % seqlen;
+    const int h0 = pair * 2;
+    const int h1 = h0 + 1;
+    const bool has_h1 = h1 < heads;
+    const int tid = threadIdx.x;
+
+    extern __shared__ float smem[];
+    float* scores0 = smem;
+    float* scores1 = scores0 + topk;
+    float* q0_shared = scores1 + topk;
+    float* q1_shared = q0_shared + dim;
+    int32_t* idx_shared = reinterpret_cast<int32_t*>(q1_shared + dim);
+    float* reduce0 = reinterpret_cast<float*>(idx_shared + topk);
+    float* reduce1 = reduce0 + blockDim.x;
+
+    const float* q0_ptr = q + (static_cast<size_t>(s) * heads + h0) * dim;
+    const float* q1_ptr = has_h1 ? q + (static_cast<size_t>(s) * heads + h1) * dim : q0_ptr;
+    const float* kv_base = kv;
+    const int32_t* idx_base = topk_idxs + static_cast<size_t>(s) * topk;
+    for (int d = tid; d < dim; d += blockDim.x) {
+        q0_shared[d] = q0_ptr[d];
+        if (has_h1) q1_shared[d] = q1_ptr[d];
+    }
+    for (int t = tid; t < topk; t += blockDim.x) idx_shared[t] = idx_base[t];
+    __syncthreads();
+
+    for (int t = tid; t < topk; t += blockDim.x) {
+        const int idx = idx_shared[t];
+        float score0 = -INFINITY;
+        float score1 = -INFINITY;
+        if (idx >= 0 && idx < kv_len) {
+            float acc0 = 0.0f;
+            float acc1 = 0.0f;
+            const float* kv_ptr = kv_base + static_cast<size_t>(idx) * dim;
+            for (int d = 0; d < dim; ++d) {
+                const float v = kv_ptr[d];
+                acc0 += q0_shared[d] * v;
+                if (has_h1) acc1 += q1_shared[d] * v;
+            }
+            score0 = acc0 * softmax_scale;
+            if (has_h1) score1 = acc1 * softmax_scale;
+        }
+        scores0[t] = score0;
+        if (has_h1) scores1[t] = score1;
+    }
+    __syncthreads();
+
+    float local_max0 = -INFINITY;
+    float local_max1 = -INFINITY;
+    for (int t = tid; t < topk; t += blockDim.x) {
+        local_max0 = fmaxf(local_max0, scores0[t]);
+        if (has_h1) local_max1 = fmaxf(local_max1, scores1[t]);
+    }
+    reduce0[tid] = local_max0;
+    if (has_h1) reduce1[tid] = local_max1;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduce0[tid] = fmaxf(reduce0[tid], reduce0[tid + stride]);
+            if (has_h1) reduce1[tid] = fmaxf(reduce1[tid], reduce1[tid + stride]);
+        }
+        __syncthreads();
+    }
+    const float max_score0 = fmaxf(reduce0[0], attn_sink[h0]);
+    const float max_score1 = has_h1 ? fmaxf(reduce1[0], attn_sink[h1]) : -INFINITY;
+
+    float local_denom0 = 0.0f;
+    float local_denom1 = 0.0f;
+    for (int t = tid; t < topk; t += blockDim.x) {
+        const float w0 = expf(scores0[t] - max_score0);
+        scores0[t] = w0;
+        local_denom0 += w0;
+        if (has_h1) {
+            const float w1 = expf(scores1[t] - max_score1);
+            scores1[t] = w1;
+            local_denom1 += w1;
+        }
+    }
+    if (tid == 0) {
+        local_denom0 += expf(attn_sink[h0] - max_score0);
+        if (has_h1) local_denom1 += expf(attn_sink[h1] - max_score1);
+    }
+    reduce0[tid] = local_denom0;
+    if (has_h1) reduce1[tid] = local_denom1;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduce0[tid] += reduce0[tid + stride];
+            if (has_h1) reduce1[tid] += reduce1[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float denom0 = reduce0[0];
+    const float denom1 = has_h1 ? reduce1[0] : 1.0f;
+
+    float* out0_ptr = out + (static_cast<size_t>(s) * heads + h0) * dim;
+    float* out1_ptr = has_h1 ? out + (static_cast<size_t>(s) * heads + h1) * dim : out0_ptr;
+    for (int d = tid; d < dim; d += blockDim.x) {
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        for (int t = 0; t < topk; ++t) {
+            const int idx = idx_shared[t];
+            if (idx >= 0 && idx < kv_len) {
+                const float v = kv_base[static_cast<size_t>(idx) * dim + d];
+                acc0 += scores0[t] * v;
+                if (has_h1) acc1 += scores1[t] * v;
+            }
+        }
+        out0_ptr[d] = acc0 / denom0;
+        if (has_h1) out1_ptr[d] = acc1 / denom1;
     }
 }
 
@@ -685,10 +1098,49 @@ bool hc_pre_float_cuda(const float* d_h4, const float* d_fn, const float* d_scal
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool hc_repeat_rows_cuda(const float* d_x_rows, float* d_h4_rows, int rows, int dim, void* stream) {
+    if (d_x_rows == nullptr || d_h4_rows == nullptr || rows <= 0 || dim <= 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    hc_repeat_rows_kernel<<<rows, 256, 0, cuda_stream>>>(d_x_rows, d_h4_rows, rows, dim);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool hc_pre_float_rows_cuda(
+    const float* d_h4_rows,
+    const float* d_fn,
+    const float* d_scale,
+    const float* d_base,
+    float* d_x_rows,
+    float* d_post_rows,
+    float* d_comb_rows,
+    int rows,
+    int dim,
+    void* stream) {
+    if (d_h4_rows == nullptr || d_fn == nullptr || d_scale == nullptr || d_base == nullptr || d_x_rows == nullptr || d_post_rows == nullptr || d_comb_rows == nullptr || rows <= 0 || dim <= 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    hc_pre_float_rows_kernel<<<rows, 256, 0, cuda_stream>>>(d_h4_rows, d_fn, d_scale, d_base, d_x_rows, d_post_rows, d_comb_rows, rows, dim);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool hc_post_float_cuda(const float* d_x, const float* d_residual_h4, const float* d_post, const float* d_comb, float* d_y_h4, int dim, void* stream) {
     if (d_x == nullptr || d_residual_h4 == nullptr || d_post == nullptr || d_comb == nullptr || d_y_h4 == nullptr || dim <= 0) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     hc_post_float_kernel<<<4, 256, 0, cuda_stream>>>(d_x, d_residual_h4, d_post, d_comb, d_y_h4, dim);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool hc_post_float_rows_cuda(
+    const float* d_x_rows,
+    const float* d_residual_h4_rows,
+    const float* d_post_rows,
+    const float* d_comb_rows,
+    float* d_y_h4_rows,
+    int rows,
+    int dim,
+    void* stream) {
+    if (d_x_rows == nullptr || d_residual_h4_rows == nullptr || d_post_rows == nullptr || d_comb_rows == nullptr || d_y_h4_rows == nullptr || rows <= 0 || dim <= 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    hc_post_float_rows_kernel<<<dim3(rows, 4), 256, 0, cuda_stream>>>(d_x_rows, d_residual_h4_rows, d_post_rows, d_comb_rows, d_y_h4_rows, rows, dim);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -738,6 +1190,53 @@ bool repeat_vector_cuda(const float* d_x, float* d_y, int cols, int repeats, voi
     if (d_x == nullptr || d_y == nullptr || cols <= 0 || repeats <= 0) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     repeat_vector_kernel<<<1, 256, 0, cuda_stream>>>(d_x, d_y, cols, repeats);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool prefill_causal_attention_cuda(
+    const float* d_q,
+    const float* d_kv,
+    const float* d_attn_sink,
+    float* d_y,
+    int tokens,
+    int heads,
+    int head_dim,
+    int window_size,
+    float scale,
+    void* stream) {
+    if (d_q == nullptr || d_kv == nullptr || d_y == nullptr || tokens <= 0 || heads <= 0 || head_dim <= 0 || window_size <= 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    prefill_causal_attention_kernel<<<dim3(heads, tokens), 256, 0, cuda_stream>>>(d_q, d_kv, d_attn_sink, d_y, tokens, heads, head_dim, window_size, scale);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool build_prefill_window_indices_cuda(int32_t* d_indices, int tokens, int window_size, int topk, void* stream) {
+    if (d_indices == nullptr || tokens <= 0 || window_size <= 0 || topk <= 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    build_prefill_window_indices_kernel<<<tokens, 256, 0, cuda_stream>>>(d_indices, tokens, window_size, topk);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool prefill_sparse_attention_headpair_cuda(
+    const float* d_q,
+    const float* d_kv,
+    const float* d_attn_sink,
+    const int32_t* d_topk_indices,
+    float* d_y,
+    int tokens,
+    int heads,
+    int kv_len,
+    int topk,
+    int head_dim,
+    float scale,
+    void* stream) {
+    if (d_q == nullptr || d_kv == nullptr || d_attn_sink == nullptr || d_topk_indices == nullptr || d_y == nullptr) return false;
+    if (tokens <= 0 || heads <= 0 || kv_len <= 0 || topk <= 0 || head_dim <= 0) return false;
+    const int head_pairs = (heads + 1) / 2;
+    const int threads = 256;
+    const size_t shared_bytes = (static_cast<size_t>(2) * topk + static_cast<size_t>(2) * head_dim + static_cast<size_t>(topk) * sizeof(int32_t) / sizeof(float) + static_cast<size_t>(2) * threads + 8) * sizeof(float);
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    prefill_sparse_attention_headpair_kernel<<<tokens * head_pairs, threads, shared_bytes, cuda_stream>>>(d_q, d_kv, d_attn_sink, d_topk_indices, d_y, tokens, heads, kv_len, topk, head_dim, scale);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -835,6 +1334,27 @@ bool fp8_act_quant_dequant_cuda(float* d_x, int cols, int block_size, void* stre
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool fp8_act_quant_dequant_rows_cuda(float* d_x, int rows, int cols, int block_size, void* stream) {
+    if (d_x == nullptr || rows <= 0 || cols <= 0 || block_size <= 0 || (cols % block_size) != 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    fp8_act_quant_dequant_rows_kernel<<<dim3(cols / block_size, rows), 256, 0, cuda_stream>>>(d_x, cols, block_size);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool fp8_act_quant_dequant_rows_strided_cuda(float* d_x, int rows, int cols, int row_stride, int block_size, void* stream) {
+    if (d_x == nullptr || rows <= 0 || cols <= 0 || row_stride < cols || block_size <= 0 || (cols % block_size) != 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    fp8_act_quant_dequant_rows_strided_kernel<<<dim3(cols / block_size, rows), 256, 0, cuda_stream>>>(d_x, cols, row_stride, block_size);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool copy_rows_to_kv_cache_cuda(const float* d_rows, float* d_cache, int rows, int cols, int window_size, void* stream) {
+    if (d_rows == nullptr || d_cache == nullptr || rows <= 0 || cols <= 0 || window_size <= 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    copy_rows_to_kv_cache_kernel<<<rows, 256, 0, cuda_stream>>>(d_rows, d_cache, rows, cols, window_size);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool compressor_update_state_cuda(const float* d_kv, const float* d_score, const float* d_ape, float* d_kv_state, float* d_score_state, int offset, int write_slot, int state_cols, void* stream) {
     (void)offset;
     if (d_kv == nullptr || d_score == nullptr || d_ape == nullptr || d_kv_state == nullptr || d_score_state == nullptr || write_slot < 0 || state_cols <= 0) return false;
@@ -897,6 +1417,23 @@ bool head_rmsnorm_rope_freqs_cuda(
     if (d_x == nullptr || d_inv_freqs == nullptr || heads <= 0 || head_dim <= 0 || rope_dim <= 0 || rope_dim > head_dim || (rope_dim % 2) != 0) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     head_rmsnorm_rope_freqs_kernel<<<heads, 256, 0, cuda_stream>>>(d_x, d_inv_freqs, head_dim, rope_dim, position, inverse, eps);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool head_rmsnorm_rope_freqs_rows_cuda(
+    float* d_x,
+    const float* d_inv_freqs,
+    int tokens,
+    int heads,
+    int head_dim,
+    int rope_dim,
+    int start_position,
+    bool inverse,
+    float eps,
+    void* stream) {
+    if (d_x == nullptr || d_inv_freqs == nullptr || tokens <= 0 || heads <= 0 || head_dim <= 0 || rope_dim <= 0 || rope_dim > head_dim || (rope_dim % 2) != 0) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    head_rmsnorm_rope_freqs_rows_kernel<<<dim3(heads, tokens), 256, 0, cuda_stream>>>(d_x, d_inv_freqs, tokens, heads, head_dim, rope_dim, start_position, inverse, eps);
     return cudaGetLastError() == cudaSuccess;
 }
 

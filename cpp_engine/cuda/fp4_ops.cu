@@ -1,6 +1,7 @@
 #include "cuda_ops.hpp"
 
 #include <cuda_runtime.h>
+#include <mma.h>
 #include <sm_61_intrinsics.h>
 
 namespace dsv4 {
@@ -8,7 +9,11 @@ namespace {
 
 constexpr int kQuantThreads = 256;
 constexpr int kGemmThreads = 128;
-constexpr int kFp4GroupedRows = 4;
+
+__device__ __constant__ int8_t fp4_lut_x2[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12,
+    0, -1, -2, -3, -4, -6, -8, -12
+};
 
 __host__ __device__ __forceinline__ int ceil_div_int(int a, int b) {
     return (a + b - 1) / b;
@@ -120,15 +125,14 @@ __global__ void moe_route_fill_kernel(
     const int expert = static_cast<int>(indices[idx]);
     const int local = expert - experts_start_idx;
     if (local < 0 || local >= n_local_experts) return;
-    const int ordinal = idx;
     const int out = atomicAdd(offsets + local, 1);
-    route_tokens[out] = static_cast<int64_t>(ordinal);
+    route_tokens[out] = static_cast<int64_t>(idx / topk);
     route_weights[out] = weights[idx];
 }
 
 __global__ void gather_routes_float_kernel(
     const float* __restrict__ x,
-    const int64_t* __restrict__ route_ordinals,
+    const int64_t* __restrict__ route_tokens,
     float* __restrict__ x_sorted,
     int routes,
     int topk,
@@ -138,8 +142,7 @@ __global__ void gather_routes_float_kernel(
     if (idx >= total) return;
     const int route = idx / dim;
     const int d = idx - route * dim;
-    const int64_t ordinal = route_ordinals[route];
-    const int token = static_cast<int>(ordinal / topk);
+    const int64_t token = route_tokens[route];
     x_sorted[idx] = x[static_cast<size_t>(token) * dim + d];
 }
 
@@ -366,7 +369,11 @@ __global__ void moe_single_swiglu_quant_fp4_kernel(
     }
 }
 
-__global__ void moe_prefill_fp4_grouped_w13_kernel(
+__device__ __forceinline__ int8_t fp4_decode_code_x2(uint8_t code) {
+    return fp4_lut_x2[code & 0x0f];
+}
+
+__global__ void moe_prefill_fp4_grouped_w13_wmma_kernel(
     const int8_t* __restrict__ x_q_pad,
     const float* __restrict__ x_scale_pad,
     const int32_t* __restrict__ seg_starts,
@@ -379,68 +386,468 @@ __global__ void moe_prefill_fp4_grouped_w13_kernel(
     int rows_per_expert,
     int dim,
     int inter_dim) {
+    using namespace nvcuda;
+    constexpr int TILE = 16;
     const int expert = blockIdx.z;
-    const int row_base = blockIdx.y * kFp4GroupedRows;
-    const int col = blockIdx.x * blockDim.x + threadIdx.x;
-    const int dim_packs = dim / 4;
+    const int row_base = blockIdx.y * TILE;
+    const int col_base = blockIdx.x * TILE;
+    const int tid = threadIdx.x;
     const int blocks_k = dim / 32;
     const int count = seg_starts[expert + 1] - seg_starts[expert];
-    extern __shared__ int x_shared[];
-    for (int idx = threadIdx.x; idx < kFp4GroupedRows * dim_packs; idx += blockDim.x) {
-        const int r = idx / dim_packs;
-        const int pack = idx - r * dim_packs;
-        const int row = row_base + r;
-        int value = 0;
-        if (row < count && row < rows_per_expert) {
-            const int* x_row = reinterpret_cast<const int*>(x_q_pad + (static_cast<int64_t>(expert) * rows_per_expert + row) * dim);
-            value = x_row[pack];
-        }
-        x_shared[idx] = value;
+    extern __shared__ __align__(16) unsigned char smem[];
+    signed char* a_tile = reinterpret_cast<signed char*>(smem);
+    signed char* b_tile = a_tile + TILE * TILE;
+    int* c_tile = reinterpret_cast<int*>(b_tile + 2 * TILE * TILE);
+    float* gate_acc = reinterpret_cast<float*>(c_tile + TILE * TILE);
+    float* up_acc = gate_acc + TILE * TILE;
+
+    for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+        gate_acc[i] = 0.0f;
+        up_acc[i] = 0.0f;
     }
     __syncthreads();
-    if (col >= inter_dim) return;
 
-    const uint8_t* w1_row_bytes = w1q + (static_cast<int64_t>(expert) * inter_dim + col) * (dim / 2);
-    const uint8_t* w3_row_bytes = w3q + (static_cast<int64_t>(expert) * inter_dim + col) * (dim / 2);
-    const uint8_t* w1_scale_row = w1s + (static_cast<int64_t>(expert) * inter_dim + col) * blocks_k;
-    const uint8_t* w3_scale_row = w3s + (static_cast<int64_t>(expert) * inter_dim + col) * blocks_k;
-    const uint16_t* w1_pack_base = reinterpret_cast<const uint16_t*>(w1_row_bytes);
-    const uint16_t* w3_pack_base = reinterpret_cast<const uint16_t*>(w3_row_bytes);
-    float gate_acc[kFp4GroupedRows] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float up_acc[kFp4GroupedRows] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (int kb = 0; kb < blocks_k; ++kb) {
-        const uint16_t* w1_pack = w1_pack_base + kb * 8;
-        const uint16_t* w3_pack = w3_pack_base + kb * 8;
-        int gate_block[kFp4GroupedRows] = {0, 0, 0, 0};
-        int up_block[kFp4GroupedRows] = {0, 0, 0, 0};
+        wmma::fragment<wmma::matrix_a, TILE, TILE, TILE, signed char, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, TILE, TILE, TILE, signed char, wmma::col_major> b_frag;
+        wmma::fragment<wmma::accumulator, TILE, TILE, TILE, int> c1_frag;
+        wmma::fragment<wmma::accumulator, TILE, TILE, TILE, int> c3_frag;
+        wmma::fill_fragment(c1_frag, 0);
+        wmma::fill_fragment(c3_frag, 0);
         #pragma unroll
-        for (int ip = 0; ip < 8; ++ip) {
-            const int w1_p = fp4_unpack_4codes_prmt(static_cast<uint32_t>(w1_pack[ip]));
-            const int w3_p = fp4_unpack_4codes_prmt(static_cast<uint32_t>(w3_pack[ip]));
-            #pragma unroll
-            for (int r = 0; r < kFp4GroupedRows; ++r) {
-                const int x_p = x_shared[r * dim_packs + kb * 8 + ip];
-                gate_block[r] = dot_i8x4(x_p, w1_p, gate_block[r]);
-                up_block[r] = dot_i8x4(x_p, w3_p, up_block[r]);
+        for (int half = 0; half < 2; ++half) {
+            const int k0 = kb * 32 + half * TILE;
+            for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+                const int r = i / TILE;
+                const int k = i - r * TILE;
+                const int row = row_base + r;
+                a_tile[i] = (row < count && row < rows_per_expert)
+                    ? x_q_pad[(static_cast<int64_t>(expert) * rows_per_expert + row) * dim + k0 + k]
+                    : 0;
+            }
+            for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+                const int k = i & (TILE - 1);
+                const int n = i >> 4;
+                const int col = col_base + n;
+                signed char v1 = 0;
+                signed char v3 = 0;
+                if (col < inter_dim) {
+                    const int kk = k0 + k;
+                    const uint8_t* w1_row = w1q + (static_cast<int64_t>(expert) * inter_dim + col) * (dim / 2);
+                    const uint8_t* w3_row = w3q + (static_cast<int64_t>(expert) * inter_dim + col) * (dim / 2);
+                    const uint8_t b1 = w1_row[kk >> 1];
+                    const uint8_t b3 = w3_row[kk >> 1];
+                    const uint8_t c1 = (kk & 1) ? (b1 >> 4) : (b1 & 0x0f);
+                    const uint8_t c3 = (kk & 1) ? (b3 >> 4) : (b3 & 0x0f);
+                    v1 = fp4_decode_code_x2(c1);
+                    v3 = fp4_decode_code_x2(c3);
+                }
+                b_tile[k + n * TILE] = v1;
+                b_tile[TILE * TILE + k + n * TILE] = v3;
+            }
+            __syncthreads();
+            wmma::load_matrix_sync(a_frag, a_tile, TILE);
+            wmma::load_matrix_sync(b_frag, b_tile, TILE);
+            wmma::mma_sync(c1_frag, a_frag, b_frag, c1_frag);
+            wmma::load_matrix_sync(b_frag, b_tile + TILE * TILE, TILE);
+            wmma::mma_sync(c3_frag, a_frag, b_frag, c3_frag);
+            __syncthreads();
+        }
+        wmma::store_matrix_sync(c_tile, c1_frag, TILE, wmma::mem_row_major);
+        __syncthreads();
+        for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+            const int n = i & (TILE - 1);
+            const int col = col_base + n;
+            if (col < inter_dim) {
+                const float s = fp4_block_scale(w1s[(static_cast<int64_t>(expert) * inter_dim + col) * blocks_k + kb]);
+                gate_acc[i] += static_cast<float>(c_tile[i]) * s;
             }
         }
-        const float s1 = fp4_block_scale(w1_scale_row[kb]);
-        const float s3 = fp4_block_scale(w3_scale_row[kb]);
-        #pragma unroll
-        for (int r = 0; r < kFp4GroupedRows; ++r) {
-            gate_acc[r] += static_cast<float>(gate_block[r]) * s1;
-            up_acc[r] += static_cast<float>(up_block[r]) * s3;
+        __syncthreads();
+        wmma::store_matrix_sync(c_tile, c3_frag, TILE, wmma::mem_row_major);
+        __syncthreads();
+        for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+            const int n = i & (TILE - 1);
+            const int col = col_base + n;
+            if (col < inter_dim) {
+                const float s = fp4_block_scale(w3s[(static_cast<int64_t>(expert) * inter_dim + col) * blocks_k + kb]);
+                up_acc[i] += static_cast<float>(c_tile[i]) * s;
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+        const int r = i / TILE;
+        const int n = i - r * TILE;
+        const int row = row_base + r;
+        const int col = col_base + n;
+        if (row < count && row < rows_per_expert && col < inter_dim) {
+            const int64_t out = (static_cast<int64_t>(expert) * rows_per_expert + row) * inter_dim + col;
+            const float xs = x_scale_pad[expert * rows_per_expert + row];
+            gate_f32[out] = gate_acc[i] * xs;
+            up_f32[out] = up_acc[i] * xs;
         }
     }
-    #pragma unroll
-    for (int r = 0; r < kFp4GroupedRows; ++r) {
-        const int row = row_base + r;
-        if (row < count && row < rows_per_expert) {
-            const int64_t base = (static_cast<int64_t>(expert) * rows_per_expert + row) * inter_dim + col;
-            const float xs = x_scale_pad[expert * rows_per_expert + row];
-            gate_f32[base] = gate_acc[r] * xs;
-            up_f32[base] = up_acc[r] * xs;
+}
+
+__global__ void moe_prefill_fp4_grouped_w13_wmma_compact_kernel(
+    const int8_t* __restrict__ x_q,
+    const float* __restrict__ x_scale,
+    const int32_t* __restrict__ seg_starts,
+    const int32_t* __restrict__ tile_experts,
+    const int32_t* __restrict__ tile_rows,
+    const uint8_t* __restrict__ w1q,
+    const uint8_t* __restrict__ w1s,
+    const uint8_t* __restrict__ w3q,
+    const uint8_t* __restrict__ w3s,
+    float* __restrict__ gate_f32,
+    float* __restrict__ up_f32,
+    int tile_count,
+    int dim,
+    int inter_dim) {
+    using namespace nvcuda;
+    constexpr int TILE = 16;
+    const int tile_id = blockIdx.y;
+    if (tile_id >= tile_count) return;
+    const int expert = tile_experts[tile_id];
+    const int row_base = tile_rows[tile_id];
+    const int col_base = blockIdx.x * TILE;
+    const int tid = threadIdx.x;
+    const int blocks_k = dim / 32;
+    const int count = seg_starts[expert + 1] - seg_starts[expert];
+    extern __shared__ __align__(16) unsigned char smem[];
+    signed char* a_tile = reinterpret_cast<signed char*>(smem);
+    signed char* b_tile = a_tile + TILE * TILE;
+    int* c_tile = reinterpret_cast<int*>(b_tile + 2 * TILE * TILE);
+    float* gate_acc = reinterpret_cast<float*>(c_tile + TILE * TILE);
+    float* up_acc = gate_acc + TILE * TILE;
+
+    for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+        gate_acc[i] = 0.0f;
+        up_acc[i] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int kb = 0; kb < blocks_k; ++kb) {
+        wmma::fragment<wmma::matrix_a, TILE, TILE, TILE, signed char, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, TILE, TILE, TILE, signed char, wmma::col_major> b_frag;
+        wmma::fragment<wmma::accumulator, TILE, TILE, TILE, int> c1_frag;
+        wmma::fragment<wmma::accumulator, TILE, TILE, TILE, int> c3_frag;
+        wmma::fill_fragment(c1_frag, 0);
+        wmma::fill_fragment(c3_frag, 0);
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int k0 = kb * 32 + half * TILE;
+            for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+                const int r = i / TILE;
+                const int k = i - r * TILE;
+                const int row = row_base + r;
+                const int route = seg_starts[expert] + row;
+                a_tile[i] = row < count ? x_q[static_cast<int64_t>(route) * dim + k0 + k] : 0;
+            }
+            for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+                const int k = i & (TILE - 1);
+                const int n = i >> 4;
+                const int col = col_base + n;
+                signed char v1 = 0;
+                signed char v3 = 0;
+                if (col < inter_dim) {
+                    const int kk = k0 + k;
+                    const uint8_t* w1_row = w1q + (static_cast<int64_t>(expert) * inter_dim + col) * (dim / 2);
+                    const uint8_t* w3_row = w3q + (static_cast<int64_t>(expert) * inter_dim + col) * (dim / 2);
+                    const uint8_t b1 = w1_row[kk >> 1];
+                    const uint8_t b3 = w3_row[kk >> 1];
+                    const uint8_t c1 = (kk & 1) ? (b1 >> 4) : (b1 & 0x0f);
+                    const uint8_t c3 = (kk & 1) ? (b3 >> 4) : (b3 & 0x0f);
+                    v1 = fp4_decode_code_x2(c1);
+                    v3 = fp4_decode_code_x2(c3);
+                }
+                b_tile[k + n * TILE] = v1;
+                b_tile[TILE * TILE + k + n * TILE] = v3;
+            }
+            __syncthreads();
+            wmma::load_matrix_sync(a_frag, a_tile, TILE);
+            wmma::load_matrix_sync(b_frag, b_tile, TILE);
+            wmma::mma_sync(c1_frag, a_frag, b_frag, c1_frag);
+            wmma::load_matrix_sync(b_frag, b_tile + TILE * TILE, TILE);
+            wmma::mma_sync(c3_frag, a_frag, b_frag, c3_frag);
+            __syncthreads();
         }
+        wmma::store_matrix_sync(c_tile, c1_frag, TILE, wmma::mem_row_major);
+        __syncthreads();
+        for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+            const int n = i & (TILE - 1);
+            const int col = col_base + n;
+            if (col < inter_dim) {
+                const float s = fp4_block_scale(w1s[(static_cast<int64_t>(expert) * inter_dim + col) * blocks_k + kb]);
+                gate_acc[i] += static_cast<float>(c_tile[i]) * s;
+            }
+        }
+        __syncthreads();
+        wmma::store_matrix_sync(c_tile, c3_frag, TILE, wmma::mem_row_major);
+        __syncthreads();
+        for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+            const int n = i & (TILE - 1);
+            const int col = col_base + n;
+            if (col < inter_dim) {
+                const float s = fp4_block_scale(w3s[(static_cast<int64_t>(expert) * inter_dim + col) * blocks_k + kb]);
+                up_acc[i] += static_cast<float>(c_tile[i]) * s;
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+        const int r = i / TILE;
+        const int n = i - r * TILE;
+        const int row = row_base + r;
+        const int col = col_base + n;
+        if (row < count && col < inter_dim) {
+            const int route = seg_starts[expert] + row;
+            const float xs = x_scale[route];
+            gate_f32[static_cast<int64_t>(route) * inter_dim + col] = gate_acc[i] * xs;
+            up_f32[static_cast<int64_t>(route) * inter_dim + col] = up_acc[i] * xs;
+        }
+    }
+}
+
+__global__ void moe_prefill_fp4_grouped_w2_wmma_kernel(
+    const int8_t* __restrict__ hidden_q,
+    const float* __restrict__ hidden_scale,
+    const int64_t* __restrict__ route_tokens,
+    const int32_t* __restrict__ seg_starts,
+    const uint8_t* __restrict__ w2q,
+    const uint8_t* __restrict__ w2s,
+    float* __restrict__ y,
+    int rows_per_expert,
+    int dim,
+    int inter_dim) {
+    using namespace nvcuda;
+    constexpr int TILE = 16;
+    const int expert = blockIdx.z;
+    const int row_base = blockIdx.y * TILE;
+    const int col_base = blockIdx.x * TILE;
+    const int tid = threadIdx.x;
+    const int blocks_k = inter_dim / 32;
+    const int count = seg_starts[expert + 1] - seg_starts[expert];
+    extern __shared__ __align__(16) unsigned char smem[];
+    signed char* a_tile = reinterpret_cast<signed char*>(smem);
+    signed char* b_tile = a_tile + TILE * TILE;
+    int* c_tile = reinterpret_cast<int*>(b_tile + TILE * TILE);
+    float* acc = reinterpret_cast<float*>(c_tile + TILE * TILE);
+
+    for (int i = tid; i < TILE * TILE; i += blockDim.x) acc[i] = 0.0f;
+    __syncthreads();
+
+    for (int kb = 0; kb < blocks_k; ++kb) {
+        wmma::fragment<wmma::matrix_a, TILE, TILE, TILE, signed char, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, TILE, TILE, TILE, signed char, wmma::col_major> b_frag;
+        wmma::fragment<wmma::accumulator, TILE, TILE, TILE, int> c_frag;
+        wmma::fill_fragment(c_frag, 0);
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int k0 = kb * 32 + half * TILE;
+            for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+                const int r = i / TILE;
+                const int k = i - r * TILE;
+                const int row = row_base + r;
+                a_tile[i] = (row < count && row < rows_per_expert)
+                    ? hidden_q[(static_cast<int64_t>(expert) * rows_per_expert + row) * inter_dim + k0 + k]
+                    : 0;
+            }
+            for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+                const int k = i & (TILE - 1);
+                const int n = i >> 4;
+                const int col = col_base + n;
+                signed char v = 0;
+                if (col < dim) {
+                    const int kk = k0 + k;
+                    const uint8_t* w2_row = w2q + (static_cast<int64_t>(expert) * dim + col) * (inter_dim / 2);
+                    const uint8_t b = w2_row[kk >> 1];
+                    const uint8_t c = (kk & 1) ? (b >> 4) : (b & 0x0f);
+                    v = fp4_decode_code_x2(c);
+                }
+                b_tile[k + n * TILE] = v;
+            }
+            __syncthreads();
+            wmma::load_matrix_sync(a_frag, a_tile, TILE);
+            wmma::load_matrix_sync(b_frag, b_tile, TILE);
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+            __syncthreads();
+        }
+        wmma::store_matrix_sync(c_tile, c_frag, TILE, wmma::mem_row_major);
+        __syncthreads();
+        for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+            const int n = i & (TILE - 1);
+            const int col = col_base + n;
+            if (col < dim) {
+                const float s = fp4_block_scale(w2s[(static_cast<int64_t>(expert) * dim + col) * blocks_k + kb]);
+                acc[i] += static_cast<float>(c_tile[i]) * s;
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+        const int r = i / TILE;
+        const int n = i - r * TILE;
+        const int row = row_base + r;
+        const int col = col_base + n;
+        if (row < count && row < rows_per_expert && col < dim) {
+            const int route = seg_starts[expert] + row;
+            const int64_t token = route_tokens[route];
+            atomicAdd(y + static_cast<size_t>(token) * dim + col,
+                      acc[i] * hidden_scale[expert * rows_per_expert + row]);
+        }
+    }
+}
+
+__global__ void moe_prefill_fp4_grouped_w2_wmma_compact_kernel(
+    const int8_t* __restrict__ hidden_q,
+    const float* __restrict__ hidden_scale,
+    const int64_t* __restrict__ route_tokens,
+    const int32_t* __restrict__ seg_starts,
+    const int32_t* __restrict__ tile_experts,
+    const int32_t* __restrict__ tile_rows,
+    const uint8_t* __restrict__ w2q,
+    const uint8_t* __restrict__ w2s,
+    float* __restrict__ y,
+    int tile_count,
+    int dim,
+    int inter_dim) {
+    using namespace nvcuda;
+    constexpr int TILE = 16;
+    const int tile_id = blockIdx.y;
+    if (tile_id >= tile_count) return;
+    const int expert = tile_experts[tile_id];
+    const int row_base = tile_rows[tile_id];
+    const int col_base = blockIdx.x * TILE;
+    const int tid = threadIdx.x;
+    const int blocks_k = inter_dim / 32;
+    const int count = seg_starts[expert + 1] - seg_starts[expert];
+    extern __shared__ __align__(16) unsigned char smem[];
+    signed char* a_tile = reinterpret_cast<signed char*>(smem);
+    signed char* b_tile = a_tile + TILE * TILE;
+    int* c_tile = reinterpret_cast<int*>(b_tile + TILE * TILE);
+    float* acc = reinterpret_cast<float*>(c_tile + TILE * TILE);
+
+    for (int i = tid; i < TILE * TILE; i += blockDim.x) acc[i] = 0.0f;
+    __syncthreads();
+
+    for (int kb = 0; kb < blocks_k; ++kb) {
+        wmma::fragment<wmma::matrix_a, TILE, TILE, TILE, signed char, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, TILE, TILE, TILE, signed char, wmma::col_major> b_frag;
+        wmma::fragment<wmma::accumulator, TILE, TILE, TILE, int> c_frag;
+        wmma::fill_fragment(c_frag, 0);
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int k0 = kb * 32 + half * TILE;
+            for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+                const int r = i / TILE;
+                const int k = i - r * TILE;
+                const int row = row_base + r;
+                const int route = seg_starts[expert] + row;
+                a_tile[i] = row < count ? hidden_q[static_cast<int64_t>(route) * inter_dim + k0 + k] : 0;
+            }
+            for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+                const int k = i & (TILE - 1);
+                const int n = i >> 4;
+                const int col = col_base + n;
+                signed char v = 0;
+                if (col < dim) {
+                    const int kk = k0 + k;
+                    const uint8_t* w2_row = w2q + (static_cast<int64_t>(expert) * dim + col) * (inter_dim / 2);
+                    const uint8_t b = w2_row[kk >> 1];
+                    const uint8_t c = (kk & 1) ? (b >> 4) : (b & 0x0f);
+                    v = fp4_decode_code_x2(c);
+                }
+                b_tile[k + n * TILE] = v;
+            }
+            __syncthreads();
+            wmma::load_matrix_sync(a_frag, a_tile, TILE);
+            wmma::load_matrix_sync(b_frag, b_tile, TILE);
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+            __syncthreads();
+        }
+        wmma::store_matrix_sync(c_tile, c_frag, TILE, wmma::mem_row_major);
+        __syncthreads();
+        for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+            const int n = i & (TILE - 1);
+            const int col = col_base + n;
+            if (col < dim) {
+                const float s = fp4_block_scale(w2s[(static_cast<int64_t>(expert) * dim + col) * blocks_k + kb]);
+                acc[i] += static_cast<float>(c_tile[i]) * s;
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int i = tid; i < TILE * TILE; i += blockDim.x) {
+        const int r = i / TILE;
+        const int n = i - r * TILE;
+        const int row = row_base + r;
+        const int col = col_base + n;
+        if (row < count && col < dim) {
+            const int route = seg_starts[expert] + row;
+            const int64_t token = route_tokens[route];
+            atomicAdd(y + static_cast<size_t>(token) * dim + col,
+                      acc[i] * hidden_scale[route]);
+        }
+    }
+}
+
+__global__ void moe_prefill_swiglu_quant_fp4_routes_kernel(
+    const float* __restrict__ gate_f32,
+    const float* __restrict__ up_f32,
+    const float* __restrict__ route_weights,
+    int8_t* __restrict__ hidden_q,
+    float* __restrict__ hidden_scale,
+    int routes,
+    int inter_dim,
+    float swiglu_limit) {
+    const int route = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (route >= routes) return;
+    const int base = route * inter_dim;
+    __shared__ float sdata[kQuantThreads];
+    const float route_weight = route_weights[route];
+    float local_max = 0.0f;
+    for (int col = tid; col < inter_dim; col += blockDim.x) {
+        const int idx = base + col;
+        float gate = gate_f32[idx];
+        float up = up_f32[idx];
+        if (swiglu_limit > 0.0f) {
+            up = fminf(fmaxf(up, -swiglu_limit), swiglu_limit);
+            gate = fminf(gate, swiglu_limit);
+        }
+        const float silu = gate / (1.0f + expf(-gate));
+        const float value = silu * up * route_weight;
+        local_max = fmaxf(local_max, fabsf(value));
+    }
+    sdata[tid] = local_max;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sdata[tid] = fmaxf(sdata[tid], sdata[tid + stride]);
+        __syncthreads();
+    }
+    const float scale = fmaxf(sdata[0], 1.0e-6f) / 127.0f;
+    if (tid == 0) hidden_scale[route] = scale;
+    __syncthreads();
+    const float inv_scale = 1.0f / scale;
+    for (int col = tid; col < inter_dim; col += blockDim.x) {
+        const int idx = base + col;
+        float gate = gate_f32[idx];
+        float up = up_f32[idx];
+        if (swiglu_limit > 0.0f) {
+            up = fminf(fmaxf(up, -swiglu_limit), swiglu_limit);
+            gate = fminf(gate, swiglu_limit);
+        }
+        const float silu = gate / (1.0f + expf(-gate));
+        const float value = silu * up * route_weight;
+        int q = __float2int_rn(value * inv_scale);
+        q = max(-127, min(127, q));
+        hidden_q[idx] = static_cast<int8_t>(q);
     }
 }
 
@@ -505,87 +912,6 @@ __global__ void moe_prefill_swiglu_quant_fp4_kernel(
         q = max(-127, min(127, q));
         hidden_q[idx] = static_cast<int8_t>(q);
     }
-}
-
-__global__ void moe_prefill_fp4_grouped_w2_kernel(
-    const int8_t* __restrict__ hidden_q,
-    const float* __restrict__ hidden_scale,
-    const int64_t* __restrict__ route_ordinals,
-    const int32_t* __restrict__ seg_starts,
-    const uint8_t* __restrict__ w2q,
-    const uint8_t* __restrict__ w2s,
-    float* __restrict__ route_y,
-    int rows_per_expert,
-    int dim,
-    int inter_dim) {
-    const int expert = blockIdx.z;
-    const int row_base = blockIdx.y * kFp4GroupedRows;
-    const int col = blockIdx.x * blockDim.x + threadIdx.x;
-    const int inter_packs = inter_dim / 4;
-    const int blocks_k = inter_dim / 32;
-    const int count = seg_starts[expert + 1] - seg_starts[expert];
-    extern __shared__ int h_shared[];
-    for (int idx = threadIdx.x; idx < kFp4GroupedRows * inter_packs; idx += blockDim.x) {
-        const int r = idx / inter_packs;
-        const int pack = idx - r * inter_packs;
-        const int row = row_base + r;
-        int value = 0;
-        if (row < count && row < rows_per_expert) {
-            const int* h_row = reinterpret_cast<const int*>(hidden_q + (static_cast<int64_t>(expert) * rows_per_expert + row) * inter_dim);
-            value = h_row[pack];
-        }
-        h_shared[idx] = value;
-    }
-    __syncthreads();
-    if (col >= dim) return;
-
-    const uint8_t* w2_row_bytes = w2q + (static_cast<int64_t>(expert) * dim + col) * (inter_dim / 2);
-    const uint8_t* w2_scale_row = w2s + (static_cast<int64_t>(expert) * dim + col) * blocks_k;
-    const uint16_t* w2_pack_base = reinterpret_cast<const uint16_t*>(w2_row_bytes);
-    float acc[kFp4GroupedRows] = {0.0f, 0.0f, 0.0f, 0.0f};
-    for (int kb = 0; kb < blocks_k; ++kb) {
-        const uint16_t* w2_pack = w2_pack_base + kb * 8;
-        int block_acc[kFp4GroupedRows] = {0, 0, 0, 0};
-        #pragma unroll
-        for (int ip = 0; ip < 8; ++ip) {
-            const int w_p = fp4_unpack_4codes_prmt(static_cast<uint32_t>(w2_pack[ip]));
-            #pragma unroll
-            for (int r = 0; r < kFp4GroupedRows; ++r) {
-                const int h_p = h_shared[r * inter_packs + kb * 8 + ip];
-                block_acc[r] = dot_i8x4(h_p, w_p, block_acc[r]);
-            }
-        }
-        const float s = fp4_block_scale(w2_scale_row[kb]);
-        #pragma unroll
-        for (int r = 0; r < kFp4GroupedRows; ++r) {
-            acc[r] += static_cast<float>(block_acc[r]) * s;
-        }
-    }
-    #pragma unroll
-    for (int r = 0; r < kFp4GroupedRows; ++r) {
-        const int row = row_base + r;
-        if (row < count && row < rows_per_expert) {
-            const int route = seg_starts[expert] + row;
-            const int64_t ordinal = route_ordinals[route];
-            route_y[static_cast<size_t>(ordinal) * dim + col] = acc[r] * hidden_scale[expert * rows_per_expert + row];
-        }
-    }
-}
-
-__global__ void sum_token_topk_kernel(
-    const float* __restrict__ route_y,
-    float* __restrict__ y,
-    int tokens,
-    int topk,
-    int dim) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = tokens * dim;
-    if (idx >= total) return;
-    const int token = idx / dim;
-    const int col = idx - token * dim;
-    float sum = 0.0f;
-    for (int k = 0; k < topk; ++k) sum += route_y[(static_cast<size_t>(token) * topk + k) * dim + col];
-    y[idx] = sum;
 }
 
 __global__ void moe_single_w2_write_fp4_kernel(
@@ -695,6 +1021,85 @@ bool moe_group_routes_cuda(
     return cudaGetLastError() == cudaSuccess;
 }
 
+bool moe_prefill_fp4_grouped_cuda_with_workspace(
+    const float* d_x,
+    const int64_t* d_route_tokens,
+    const float* d_route_weights,
+    const int32_t* d_seg_starts,
+    const uint8_t* d_w1q,
+    const uint8_t* d_w1s,
+    const uint8_t* d_w2q,
+    const uint8_t* d_w2s,
+    const uint8_t* d_w3q,
+    const uint8_t* d_w3s,
+    float* d_y,
+    int tokens,
+    int topk,
+    int routes,
+    int n_local_experts,
+    int max_count,
+    int dim,
+    int inter_dim,
+    float swiglu_limit,
+    MoePrefillFp4GroupedWorkspace workspace,
+    void* stream) {
+    if (d_x == nullptr || d_route_tokens == nullptr || d_route_weights == nullptr || d_seg_starts == nullptr || d_w1q == nullptr || d_w1s == nullptr || d_w2q == nullptr || d_w2s == nullptr || d_w3q == nullptr || d_w3s == nullptr || d_y == nullptr) return false;
+    if (tokens <= 0 || topk <= 0 || routes < 0 || n_local_experts <= 0 || dim <= 0 || inter_dim <= 0 || (dim % 32) != 0 || (inter_dim % 32) != 0) return false;
+    if (workspace.dim < dim || workspace.inter_dim < inter_dim) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    if (cudaMemsetAsync(d_y, 0, static_cast<size_t>(tokens) * dim * sizeof(float), cuda_stream) != cudaSuccess) return false;
+    if (routes == 0 || max_count <= 0) return cudaGetLastError() == cudaSuccess;
+    const int threads = 256;
+    const size_t routes_dim = static_cast<size_t>(routes) * dim;
+    const int gather_blocks = static_cast<int>((routes_dim + threads - 1) / threads);
+    const bool compact_tiles = workspace.d_tile_experts != nullptr && workspace.d_tile_rows != nullptr && workspace.tile_count > 0;
+    if (compact_tiles) {
+        if (workspace.routes_cap < routes || workspace.tile_cap < workspace.tile_count) return false;
+        if (workspace.d_x_sorted == nullptr || workspace.d_x_q == nullptr || workspace.d_x_scale == nullptr || workspace.d_gate == nullptr || workspace.d_up == nullptr || workspace.d_hidden_q == nullptr || workspace.d_hidden_scale == nullptr) return false;
+        gather_routes_float_kernel<<<gather_blocks, threads, 0, cuda_stream>>>(d_x, d_route_tokens, workspace.d_x_sorted, routes, topk, dim);
+        quantize_float_rows_kernel<<<routes, kQuantThreads, 0, cuda_stream>>>(workspace.d_x_sorted, workspace.d_x_q, workspace.d_x_scale, routes, dim);
+        const dim3 fp4_block(128);
+        const size_t x_shared_bytes = 4096;
+        const dim3 w13_grid(ceil_div_int(inter_dim, 16), workspace.tile_count);
+        moe_prefill_fp4_grouped_w13_wmma_compact_kernel<<<w13_grid, fp4_block, x_shared_bytes, cuda_stream>>>(
+            workspace.d_x_q, workspace.d_x_scale, d_seg_starts, workspace.d_tile_experts, workspace.d_tile_rows, d_w1q, d_w1s, d_w3q, d_w3s, workspace.d_gate, workspace.d_up, workspace.tile_count, dim, inter_dim);
+        moe_prefill_swiglu_quant_fp4_routes_kernel<<<routes, kQuantThreads, 0, cuda_stream>>>(
+            workspace.d_gate, workspace.d_up, d_route_weights, workspace.d_hidden_q, workspace.d_hidden_scale, routes, inter_dim, swiglu_limit);
+        const dim3 w2_grid(ceil_div_int(dim, 16), workspace.tile_count);
+        const size_t h_shared_bytes = 4096;
+        moe_prefill_fp4_grouped_w2_wmma_compact_kernel<<<w2_grid, fp4_block, h_shared_bytes, cuda_stream>>>(
+            workspace.d_hidden_q, workspace.d_hidden_scale, d_route_tokens, d_seg_starts, workspace.d_tile_experts, workspace.d_tile_rows, d_w2q, d_w2s, d_y, workspace.tile_count, dim, inter_dim);
+        return cudaGetLastError() == cudaSuccess;
+    }
+    const int padded_rows = n_local_experts * max_count;
+    if (workspace.routes_cap < routes || workspace.padded_rows_cap < padded_rows) return false;
+    if (workspace.d_x_sorted == nullptr || workspace.d_x_q == nullptr || workspace.d_x_scale == nullptr || workspace.d_x_pad == nullptr || workspace.d_x_scale_pad == nullptr || workspace.d_gate == nullptr || workspace.d_up == nullptr || workspace.d_hidden_q == nullptr || workspace.d_hidden_scale == nullptr) return false;
+    const size_t padded_dim = static_cast<size_t>(padded_rows) * dim;
+    const size_t padded_inter = static_cast<size_t>(padded_rows) * inter_dim;
+    if (cudaMemsetAsync(workspace.d_x_pad, 0, padded_dim, cuda_stream) != cudaSuccess) return false;
+    if (cudaMemsetAsync(workspace.d_x_scale_pad, 0, static_cast<size_t>(padded_rows) * sizeof(float), cuda_stream) != cudaSuccess) return false;
+    if (cudaMemsetAsync(workspace.d_gate, 0, padded_inter * sizeof(float), cuda_stream) != cudaSuccess) return false;
+    if (cudaMemsetAsync(workspace.d_up, 0, padded_inter * sizeof(float), cuda_stream) != cudaSuccess) return false;
+    if (cudaMemsetAsync(workspace.d_hidden_q, 0, padded_inter, cuda_stream) != cudaSuccess) return false;
+    if (cudaMemsetAsync(workspace.d_hidden_scale, 0, static_cast<size_t>(padded_rows) * sizeof(float), cuda_stream) != cudaSuccess) return false;
+    gather_routes_float_kernel<<<gather_blocks, threads, 0, cuda_stream>>>(d_x, d_route_tokens, workspace.d_x_sorted, routes, topk, dim);
+    quantize_float_rows_kernel<<<routes, kQuantThreads, 0, cuda_stream>>>(workspace.d_x_sorted, workspace.d_x_q, workspace.d_x_scale, routes, dim);
+    const int pad_blocks = static_cast<int>((padded_dim + threads - 1) / threads);
+    pad_q_rows_kernel<<<pad_blocks, threads, 0, cuda_stream>>>(workspace.d_x_q, workspace.d_x_scale, d_seg_starts, workspace.d_x_pad, workspace.d_x_scale_pad, n_local_experts, max_count, dim);
+    const dim3 fp4_block(128);
+    const dim3 w13_grid(ceil_div_int(inter_dim, 16), ceil_div_int(max_count, 16), n_local_experts);
+    const size_t x_shared_bytes = 4096;
+    moe_prefill_fp4_grouped_w13_wmma_kernel<<<w13_grid, fp4_block, x_shared_bytes, cuda_stream>>>(
+        workspace.d_x_pad, workspace.d_x_scale_pad, d_seg_starts, d_w1q, d_w1s, d_w3q, d_w3s, workspace.d_gate, workspace.d_up, max_count, dim, inter_dim);
+    moe_prefill_swiglu_quant_fp4_kernel<<<dim3(n_local_experts, max_count), kQuantThreads, 0, cuda_stream>>>(
+        workspace.d_gate, workspace.d_up, d_seg_starts, d_route_weights, workspace.d_hidden_q, workspace.d_hidden_scale, max_count, inter_dim, swiglu_limit);
+    const dim3 w2_grid(ceil_div_int(dim, 16), ceil_div_int(max_count, 16), n_local_experts);
+    const size_t h_shared_bytes = 4096;
+    moe_prefill_fp4_grouped_w2_wmma_kernel<<<w2_grid, fp4_block, h_shared_bytes, cuda_stream>>>(
+        workspace.d_hidden_q, workspace.d_hidden_scale, d_route_tokens, d_seg_starts, d_w2q, d_w2s, d_y, max_count, dim, inter_dim);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 bool moe_prefill_fp4_grouped_cuda(
     const float* d_x,
     const int64_t* d_route_tokens,
@@ -719,76 +1124,52 @@ bool moe_prefill_fp4_grouped_cuda(
     if (d_x == nullptr || d_route_tokens == nullptr || d_route_weights == nullptr || d_seg_starts == nullptr || d_w1q == nullptr || d_w1s == nullptr || d_w2q == nullptr || d_w2s == nullptr || d_w3q == nullptr || d_w3s == nullptr || d_y == nullptr) return false;
     if (tokens <= 0 || topk <= 0 || routes < 0 || n_local_experts <= 0 || max_count <= 0 || dim <= 0 || inter_dim <= 0 || (dim % 32) != 0 || (inter_dim % 32) != 0) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-    float* d_x_sorted = nullptr;
-    int8_t* d_x_q = nullptr;
-    float* d_x_scale = nullptr;
-    int8_t* d_x_pad = nullptr;
-    float* d_x_scale_pad = nullptr;
-    float* d_gate = nullptr;
-    float* d_up = nullptr;
-    int8_t* d_hidden_q = nullptr;
-    float* d_hidden_scale = nullptr;
-    float* d_route_y = nullptr;
+    MoePrefillFp4GroupedWorkspace workspace;
+    workspace.dim = dim;
+    workspace.inter_dim = inter_dim;
+    workspace.routes_cap = routes;
+    workspace.padded_rows_cap = n_local_experts * max_count;
     if (cudaMemsetAsync(d_y, 0, static_cast<size_t>(tokens) * dim * sizeof(float), cuda_stream) != cudaSuccess) return false;
     if (routes == 0) return cudaGetLastError() == cudaSuccess;
     const size_t routes_dim = static_cast<size_t>(routes) * dim;
-    const size_t padded_dim = static_cast<size_t>(n_local_experts) * max_count * dim;
-    const size_t padded_inter = static_cast<size_t>(n_local_experts) * max_count * inter_dim;
-    const size_t route_y_dim = static_cast<size_t>(tokens) * topk * dim;
-    if (cudaMalloc(&d_x_sorted, routes_dim * sizeof(float)) != cudaSuccess) return false;
-    if (cudaMalloc(&d_x_q, routes_dim) != cudaSuccess) goto fail;
-    if (cudaMalloc(&d_x_scale, static_cast<size_t>(routes) * sizeof(float)) != cudaSuccess) goto fail;
-    if (cudaMalloc(&d_x_pad, padded_dim) != cudaSuccess) goto fail;
-    if (cudaMalloc(&d_x_scale_pad, static_cast<size_t>(n_local_experts) * max_count * sizeof(float)) != cudaSuccess) goto fail;
-    if (cudaMalloc(&d_gate, padded_inter * sizeof(float)) != cudaSuccess) goto fail;
-    if (cudaMalloc(&d_up, padded_inter * sizeof(float)) != cudaSuccess) goto fail;
-    if (cudaMalloc(&d_hidden_q, padded_inter) != cudaSuccess) goto fail;
-    if (cudaMalloc(&d_hidden_scale, static_cast<size_t>(n_local_experts) * max_count * sizeof(float)) != cudaSuccess) goto fail;
-    if (cudaMalloc(&d_route_y, route_y_dim * sizeof(float)) != cudaSuccess) goto fail;
-    if (cudaMemsetAsync(d_route_y, 0, route_y_dim * sizeof(float), cuda_stream) != cudaSuccess) goto fail;
+    const size_t padded_dim = static_cast<size_t>(workspace.padded_rows_cap) * dim;
+    const size_t padded_inter = static_cast<size_t>(workspace.padded_rows_cap) * inter_dim;
+    if (cudaMalloc(&workspace.d_x_sorted, routes_dim * sizeof(float)) != cudaSuccess) return false;
+    if (cudaMalloc(&workspace.d_x_q, routes_dim) != cudaSuccess) goto fail;
+    if (cudaMalloc(&workspace.d_x_scale, static_cast<size_t>(routes) * sizeof(float)) != cudaSuccess) goto fail;
+    if (cudaMalloc(&workspace.d_x_pad, padded_dim) != cudaSuccess) goto fail;
+    if (cudaMalloc(&workspace.d_x_scale_pad, static_cast<size_t>(workspace.padded_rows_cap) * sizeof(float)) != cudaSuccess) goto fail;
+    if (cudaMalloc(&workspace.d_gate, padded_inter * sizeof(float)) != cudaSuccess) goto fail;
+    if (cudaMalloc(&workspace.d_up, padded_inter * sizeof(float)) != cudaSuccess) goto fail;
+    if (cudaMalloc(&workspace.d_hidden_q, padded_inter) != cudaSuccess) goto fail;
+    if (cudaMalloc(&workspace.d_hidden_scale, static_cast<size_t>(workspace.padded_rows_cap) * sizeof(float)) != cudaSuccess) goto fail;
     {
-        const int threads = 256;
-        const int gather_blocks = static_cast<int>((routes_dim + threads - 1) / threads);
-        gather_routes_float_kernel<<<gather_blocks, threads, 0, cuda_stream>>>(d_x, d_route_tokens, d_x_sorted, routes, topk, dim);
-        quantize_float_rows_kernel<<<routes, kQuantThreads, 0, cuda_stream>>>(d_x_sorted, d_x_q, d_x_scale, routes, dim);
-        const int pad_blocks = static_cast<int>((padded_dim + threads - 1) / threads);
-        pad_q_rows_kernel<<<pad_blocks, threads, 0, cuda_stream>>>(d_x_q, d_x_scale, d_seg_starts, d_x_pad, d_x_scale_pad, n_local_experts, max_count, dim);
-        const dim3 gemm_block(kGemmThreads);
-        const dim3 w13_grid(ceil_div_int(inter_dim, kGemmThreads), ceil_div_int(max_count, kFp4GroupedRows), n_local_experts);
-        moe_prefill_fp4_grouped_w13_kernel<<<w13_grid, gemm_block, static_cast<size_t>(kFp4GroupedRows) * (dim / 4) * sizeof(int), cuda_stream>>>(
-            d_x_pad, d_x_scale_pad, d_seg_starts, d_w1q, d_w1s, d_w3q, d_w3s, d_gate, d_up, max_count, dim, inter_dim);
-        moe_prefill_swiglu_quant_fp4_kernel<<<dim3(n_local_experts, max_count), kQuantThreads, 0, cuda_stream>>>(
-            d_gate, d_up, d_seg_starts, d_route_weights, d_hidden_q, d_hidden_scale, max_count, inter_dim, swiglu_limit);
-        const dim3 w2_grid(ceil_div_int(dim, kGemmThreads), ceil_div_int(max_count, kFp4GroupedRows), n_local_experts);
-        moe_prefill_fp4_grouped_w2_kernel<<<w2_grid, gemm_block, static_cast<size_t>(kFp4GroupedRows) * (inter_dim / 4) * sizeof(int), cuda_stream>>>(
-            d_hidden_q, d_hidden_scale, d_route_tokens, d_seg_starts, d_w2q, d_w2s, d_route_y, max_count, dim, inter_dim);
-        sum_token_topk_kernel<<<ceil_div_int(static_cast<int>(static_cast<size_t>(tokens) * dim), 256), 256, 0, cuda_stream>>>(d_route_y, d_y, tokens, topk, dim);
-    }
-    {
-        const cudaError_t launch_err = cudaGetLastError();
-        cudaFree(d_x_sorted);
-        cudaFree(d_x_q);
-        cudaFree(d_x_scale);
-        cudaFree(d_x_pad);
-        cudaFree(d_x_scale_pad);
-        cudaFree(d_gate);
-        cudaFree(d_up);
-        cudaFree(d_hidden_q);
-        cudaFree(d_hidden_scale);
-        cudaFree(d_route_y);
-        return launch_err == cudaSuccess;
+        const bool ok = moe_prefill_fp4_grouped_cuda_with_workspace(
+            d_x, d_route_tokens, d_route_weights, d_seg_starts,
+            d_w1q, d_w1s, d_w2q, d_w2s, d_w3q, d_w3s,
+            d_y, tokens, topk, routes, n_local_experts, max_count, dim, inter_dim, swiglu_limit,
+            workspace, stream);
+        cudaFree(workspace.d_x_sorted);
+        cudaFree(workspace.d_x_q);
+        cudaFree(workspace.d_x_scale);
+        cudaFree(workspace.d_x_pad);
+        cudaFree(workspace.d_x_scale_pad);
+        cudaFree(workspace.d_gate);
+        cudaFree(workspace.d_up);
+        cudaFree(workspace.d_hidden_q);
+        cudaFree(workspace.d_hidden_scale);
+        return ok;
     }
 fail:
-    cudaFree(d_x_sorted);
-    cudaFree(d_x_q);
-    cudaFree(d_x_scale);
-    cudaFree(d_x_pad);
-    cudaFree(d_x_scale_pad);
-    cudaFree(d_gate);
-    cudaFree(d_up);
-    cudaFree(d_hidden_q);
-    cudaFree(d_hidden_scale);
-    cudaFree(d_route_y);
+    cudaFree(workspace.d_x_sorted);
+    cudaFree(workspace.d_x_q);
+    cudaFree(workspace.d_x_scale);
+    cudaFree(workspace.d_x_pad);
+    cudaFree(workspace.d_x_scale_pad);
+    cudaFree(workspace.d_gate);
+    cudaFree(workspace.d_up);
+    cudaFree(workspace.d_hidden_q);
+    cudaFree(workspace.d_hidden_scale);
     return false;
 }
 

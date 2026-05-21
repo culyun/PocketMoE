@@ -145,6 +145,48 @@ __global__ void gate_hash_finalize_kernel(const float* original, float* weights,
     for (int k = 0; k < topk; ++k) weights[k] = original[k] / denom * route_scale;
 }
 
+__global__ void gate_hash_rows_scores_kernel(
+    const float* x,
+    const uint16_t* w,
+    const int64_t* tid2eid,
+    const int* token_ids,
+    int64_t* indices,
+    float* weights,
+    int cols,
+    int table_topk,
+    int topk) {
+    const int k = blockIdx.x;
+    const int token = blockIdx.y;
+    if (k >= topk) return;
+    const int token_id = token_ids[token];
+    const int64_t expert = tid2eid[static_cast<size_t>(token_id) * table_topk + k];
+    const float* token_x = x + static_cast<size_t>(token) * cols;
+    float sum = 0.0f;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) sum += bf16_to_float(w[static_cast<size_t>(expert) * cols + c]) * token_x[c];
+    extern __shared__ float scratch[];
+    scratch[threadIdx.x] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const size_t out = static_cast<size_t>(token) * topk + k;
+        weights[out] = sqrt_softplus(scratch[0]);
+        indices[out] = expert;
+    }
+}
+
+__global__ void gate_hash_rows_finalize_kernel(float* weights, int topk, float route_scale) {
+    const int token = blockIdx.x;
+    if (threadIdx.x != 0) return;
+    float* token_weights = weights + static_cast<size_t>(token) * topk;
+    float denom = 0.0f;
+    for (int k = 0; k < topk; ++k) denom += token_weights[k];
+    denom = denom == 0.0f ? 1.0f : denom;
+    for (int k = 0; k < topk; ++k) token_weights[k] = token_weights[k] / denom * route_scale;
+}
+
 __global__ void gate_topk_finalize_kernel(const float* original, const float* scored, int64_t* indices, float* weights, int experts, int topk, float route_scale) {
     const int token = blockIdx.x;
     if (threadIdx.x != 0) return;
@@ -271,6 +313,26 @@ bool gate_hash_bf16_cuda(
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     gate_hash_scores_kernel<<<topk, 256, 256 * sizeof(float), cuda_stream>>>(d_x, d_w_bf16, d_tid2eid, d_original_scratch, d_indices, token, cols, table_topk, topk);
     gate_hash_finalize_kernel<<<1, 1, 0, cuda_stream>>>(d_original_scratch, d_weights, topk, route_scale);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool gate_hash_bf16_rows_cuda(
+    const float* d_x,
+    const uint16_t* d_w_bf16,
+    const int64_t* d_tid2eid,
+    const int* d_token_ids,
+    int64_t* d_indices,
+    float* d_weights,
+    int tokens,
+    int cols,
+    int table_topk,
+    int topk,
+    float route_scale,
+    void* stream) {
+    if (d_x == nullptr || d_w_bf16 == nullptr || d_tid2eid == nullptr || d_token_ids == nullptr || d_indices == nullptr || d_weights == nullptr || tokens <= 0 || cols <= 0 || table_topk <= 0 || topk <= 0 || topk > table_topk) return false;
+    auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
+    gate_hash_rows_scores_kernel<<<dim3(topk, tokens), 256, 256 * sizeof(float), cuda_stream>>>(d_x, d_w_bf16, d_tid2eid, d_token_ids, d_indices, d_weights, cols, table_topk, topk);
+    gate_hash_rows_finalize_kernel<<<tokens, 1, 0, cuda_stream>>>(d_weights, topk, route_scale);
     return cudaGetLastError() == cudaSuccess;
 }
 

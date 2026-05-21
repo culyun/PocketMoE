@@ -46,6 +46,16 @@ std::vector<float> make_input(int cols) {
     return x;
 }
 
+std::vector<float> make_input_rows(int batch, int cols) {
+    std::vector<float> x(static_cast<size_t>(batch) * cols);
+    for (int b = 0; b < batch; ++b) {
+        for (int i = 0; i < cols; ++i) {
+            x[static_cast<size_t>(b) * cols + i] = static_cast<float>(((b * 7 + i) % 29) - 14) * 0.015625f;
+        }
+    }
+    return x;
+}
+
 float fp8_e4m3_value(uint8_t code) {
     const int sign = (code >> 7) & 1;
     const int exp = (code >> 3) & 0xf;
@@ -72,6 +82,66 @@ std::vector<float> fp8_cpu_ref(const std::vector<float>& x, const uint8_t* w, co
         }
     }
     return ref;
+}
+
+std::vector<float> fp8_cpu_ref_rows(const std::vector<float>& x, const uint8_t* w, const uint8_t* scale, int batch, int rows, int cols) {
+    constexpr int block = 128;
+    const int scale_cols = cols / block;
+    std::vector<float> ref(static_cast<size_t>(batch) * rows, 0.0f);
+    for (int b = 0; b < batch; ++b) {
+        for (int r = 0; r < rows; ++r) {
+            const int rb = r / block;
+            float sum = 0.0f;
+            for (int c = 0; c < cols; ++c) {
+                const int cb = c / block;
+                sum += fp8_e4m3_value(w[static_cast<size_t>(r) * cols + c]) * e8m0_value(scale[static_cast<size_t>(rb) * scale_cols + cb]) * x[static_cast<size_t>(b) * cols + c];
+            }
+            ref[static_cast<size_t>(b) * rows + r] = sum;
+        }
+    }
+    return ref;
+}
+
+void run_matmul_case(const std::vector<float>& x, const uint8_t* w, const uint8_t* scale, int batch, int rows, int cols, const std::string& label) {
+    const size_t weight_bytes = static_cast<size_t>(rows) * cols;
+    const size_t scale_bytes = static_cast<size_t>((rows + 127) / 128) * (cols / 128);
+    auto ref = fp8_cpu_ref_rows(x, w, scale, batch, rows, cols);
+
+    float* d_x = nullptr;
+    uint8_t* d_w = nullptr;
+    uint8_t* d_scale = nullptr;
+    float* d_y = nullptr;
+    check_cuda(cudaMalloc(&d_x, x.size() * sizeof(float)), "cudaMalloc matmul x");
+    check_cuda(cudaMalloc(&d_w, weight_bytes), "cudaMalloc matmul weight");
+    check_cuda(cudaMalloc(&d_scale, scale_bytes), "cudaMalloc matmul scale");
+    check_cuda(cudaMalloc(&d_y, ref.size() * sizeof(float)), "cudaMalloc matmul y");
+    check_cuda(cudaMemcpy(d_x, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice), "copy matmul x");
+    check_cuda(cudaMemcpy(d_w, w, weight_bytes, cudaMemcpyHostToDevice), "copy matmul weight");
+    check_cuda(cudaMemcpy(d_scale, scale, scale_bytes, cudaMemcpyHostToDevice), "copy matmul scale");
+    if (!dsv4::fp8_e4m3_e8m0_matmul_cuda(d_x, d_w, d_scale, d_y, batch, rows, cols)) {
+        throw std::runtime_error("fp8_e4m3_e8m0_matmul_cuda launch failed");
+    }
+    check_cuda(cudaDeviceSynchronize(), "sync matmul kernel");
+    std::vector<float> got(ref.size());
+    check_cuda(cudaMemcpy(got.data(), d_y, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy matmul y");
+    cudaFree(d_x);
+    cudaFree(d_w);
+    cudaFree(d_scale);
+    cudaFree(d_y);
+
+    float max_abs = 0.0f;
+    float mean_abs = 0.0f;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const float diff = std::fabs(got[i] - ref[i]);
+        max_abs = std::max(max_abs, diff);
+        mean_abs += diff;
+    }
+    mean_abs /= std::max<size_t>(ref.size(), 1);
+    if (max_abs > 5e-2f) {
+        std::cerr << "[FAIL] " << label << " matmul max_abs=" << max_abs << " mean_abs=" << mean_abs << "\n";
+        std::exit(1);
+    }
+    std::cout << "[PASS] " << label << " matmul max_abs=" << max_abs << " mean_abs=" << mean_abs << " batch=" << batch << " rows=" << rows << " cols=" << cols << "\n";
 }
 
 void run_case(const std::vector<float>& x, const uint8_t* w, const uint8_t* scale, int rows, int cols, const std::string& label) {
@@ -155,6 +225,10 @@ int main(int argc, char** argv) {
         }
         auto x = make_input(cols);
         run_case(x, shard.tensor_data(*weight), shard.tensor_data(*scale), rows, cols, args.tensor);
+        if (static_cast<int>(weight->shape[0]) >= 128) {
+            auto x_rows = make_input_rows(16, cols);
+            run_matmul_case(x_rows, shard.tensor_data(*weight), shard.tensor_data(*scale), 16, rows, cols, args.tensor);
+        }
         return 0;
     } catch (const std::exception& ex) {
         std::cerr << "[FAIL] " << ex.what() << "\n";

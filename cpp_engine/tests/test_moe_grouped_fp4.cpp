@@ -129,7 +129,7 @@ int main() {
                 token_weights[t].push_back(w);
                 expert_routes[expert].push_back(t);
                 expert_token_weights[expert].push_back(w);
-                expert_ordinals[expert].push_back(static_cast<int64_t>(t * topk + k));
+                expert_ordinals[expert].push_back(static_cast<int64_t>(t));
             }
         }
 
