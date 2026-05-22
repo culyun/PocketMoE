@@ -93,19 +93,24 @@ __global__ void gate_scores_kernel(const float* x, const uint16_t* w, const floa
     const float* token_x = x + static_cast<size_t>(token) * cols;
     float* token_original = original + static_cast<size_t>(token) * experts;
     float* token_scored = scored + static_cast<size_t>(token) * experts;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    const int num_warps = blockDim.x >> 5;
     float sum = 0.0f;
-    for (int c = threadIdx.x; c < cols; c += blockDim.x) sum += bf16_to_float(w[static_cast<size_t>(row) * cols + c]) * token_x[c];
-    extern __shared__ float scratch[];
-    scratch[threadIdx.x] = sum;
+    for (int c = tid; c < cols; c += blockDim.x) sum += bf16_to_float(w[static_cast<size_t>(row) * cols + c]) * token_x[c];
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, off);
+    __shared__ float warp_partials[32];
+    if (lane == 0) warp_partials[warp_id] = sum;
     __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        const float orig = sqrt_softplus(scratch[0]);
-        token_original[row] = orig;
-        token_scored[row] = orig + (bias == nullptr ? 0.0f : bias[row]);
+    if (warp_id == 0) {
+        float val = lane < num_warps ? warp_partials[lane] : 0.0f;
+        for (int off = num_warps / 2; off > 0; off >>= 1) val += __shfl_xor_sync(0xffffffff, val, off);
+        if (lane == 0) {
+            const float orig = sqrt_softplus(val);
+            token_original[row] = orig;
+            token_scored[row] = orig + (bias == nullptr ? 0.0f : bias[row]);
+        }
     }
 }
 
@@ -122,18 +127,23 @@ __global__ void gate_hash_scores_kernel(
     const int k = blockIdx.x;
     if (k >= topk) return;
     const int64_t expert = tid2eid[static_cast<size_t>(token_id) * table_topk + k];
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    const int num_warps = blockDim.x >> 5;
     float sum = 0.0f;
-    for (int c = threadIdx.x; c < cols; c += blockDim.x) sum += bf16_to_float(w[static_cast<size_t>(expert) * cols + c]) * x[c];
-    extern __shared__ float scratch[];
-    scratch[threadIdx.x] = sum;
+    for (int c = tid; c < cols; c += blockDim.x) sum += bf16_to_float(w[static_cast<size_t>(expert) * cols + c]) * x[c];
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, off);
+    __shared__ float warp_partials[32];
+    if (lane == 0) warp_partials[warp_id] = sum;
     __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        original[k] = sqrt_softplus(scratch[0]);
-        indices[k] = expert;
+    if (warp_id == 0) {
+        float val = lane < num_warps ? warp_partials[lane] : 0.0f;
+        for (int off = num_warps / 2; off > 0; off >>= 1) val += __shfl_xor_sync(0xffffffff, val, off);
+        if (lane == 0) {
+            original[k] = sqrt_softplus(val);
+            indices[k] = expert;
+        }
     }
 }
 
@@ -161,19 +171,24 @@ __global__ void gate_hash_rows_scores_kernel(
     const int token_id = token_ids[token];
     const int64_t expert = tid2eid[static_cast<size_t>(token_id) * table_topk + k];
     const float* token_x = x + static_cast<size_t>(token) * cols;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    const int num_warps = blockDim.x >> 5;
     float sum = 0.0f;
-    for (int c = threadIdx.x; c < cols; c += blockDim.x) sum += bf16_to_float(w[static_cast<size_t>(expert) * cols + c]) * token_x[c];
-    extern __shared__ float scratch[];
-    scratch[threadIdx.x] = sum;
+    for (int c = tid; c < cols; c += blockDim.x) sum += bf16_to_float(w[static_cast<size_t>(expert) * cols + c]) * token_x[c];
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, off);
+    __shared__ float warp_partials[32];
+    if (lane == 0) warp_partials[warp_id] = sum;
     __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) scratch[threadIdx.x] += scratch[threadIdx.x + stride];
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        const size_t out = static_cast<size_t>(token) * topk + k;
-        weights[out] = sqrt_softplus(scratch[0]);
-        indices[out] = expert;
+    if (warp_id == 0) {
+        float val = lane < num_warps ? warp_partials[lane] : 0.0f;
+        for (int off = num_warps / 2; off > 0; off >>= 1) val += __shfl_xor_sync(0xffffffff, val, off);
+        if (lane == 0) {
+            const size_t out = static_cast<size_t>(token) * topk + k;
+            weights[out] = sqrt_softplus(val);
+            indices[out] = expert;
+        }
     }
 }
 
@@ -266,7 +281,7 @@ bool gate_topk_bf16_cuda_with_buffers(
     void* stream) {
     if (d_x == nullptr || d_w_bf16 == nullptr || d_original == nullptr || d_scored == nullptr || d_indices == nullptr || d_weights == nullptr || experts <= 0 || cols <= 0 || topk <= 0) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-    gate_scores_kernel<<<dim3(experts, 1), 256, 256 * sizeof(float), cuda_stream>>>(d_x, d_w_bf16, d_bias, d_original, d_scored, experts, cols);
+    gate_scores_kernel<<<dim3(experts, 1), 256, 0, cuda_stream>>>(d_x, d_w_bf16, d_bias, d_original, d_scored, experts, cols);
     gate_topk_finalize_kernel<<<1, 1, 0, cuda_stream>>>(d_original, d_scored, d_indices, d_weights, experts, topk, route_scale);
     return cudaGetLastError() == cudaSuccess;
 }
@@ -311,7 +326,7 @@ bool gate_hash_bf16_cuda(
     void* stream) {
     if (d_x == nullptr || d_w_bf16 == nullptr || d_tid2eid == nullptr || d_original_scratch == nullptr || d_indices == nullptr || d_weights == nullptr || token < 0 || cols <= 0 || table_topk <= 0 || topk <= 0 || topk > table_topk) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-    gate_hash_scores_kernel<<<topk, 256, 256 * sizeof(float), cuda_stream>>>(d_x, d_w_bf16, d_tid2eid, d_original_scratch, d_indices, token, cols, table_topk, topk);
+    gate_hash_scores_kernel<<<topk, 256, 0, cuda_stream>>>(d_x, d_w_bf16, d_tid2eid, d_original_scratch, d_indices, token, cols, table_topk, topk);
     gate_hash_finalize_kernel<<<1, 1, 0, cuda_stream>>>(d_original_scratch, d_weights, topk, route_scale);
     return cudaGetLastError() == cudaSuccess;
 }
@@ -331,7 +346,7 @@ bool gate_hash_bf16_rows_cuda(
     void* stream) {
     if (d_x == nullptr || d_w_bf16 == nullptr || d_tid2eid == nullptr || d_token_ids == nullptr || d_indices == nullptr || d_weights == nullptr || tokens <= 0 || cols <= 0 || table_topk <= 0 || topk <= 0 || topk > table_topk) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-    gate_hash_rows_scores_kernel<<<dim3(topk, tokens), 256, 256 * sizeof(float), cuda_stream>>>(d_x, d_w_bf16, d_tid2eid, d_token_ids, d_indices, d_weights, cols, table_topk, topk);
+    gate_hash_rows_scores_kernel<<<dim3(topk, tokens), 256, 0, cuda_stream>>>(d_x, d_w_bf16, d_tid2eid, d_token_ids, d_indices, d_weights, cols, table_topk, topk);
     gate_hash_rows_finalize_kernel<<<tokens, 1, 0, cuda_stream>>>(d_weights, topk, route_scale);
     return cudaGetLastError() == cudaSuccess;
 }
@@ -357,7 +372,7 @@ bool gate_topk_bf16_rows_cuda(
         return false;
     }
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-    gate_scores_kernel<<<dim3(experts, tokens), 256, 256 * sizeof(float), cuda_stream>>>(d_x, d_w_bf16, d_bias, d_original, d_scored, experts, cols);
+    gate_scores_kernel<<<dim3(experts, tokens), 256, 0, cuda_stream>>>(d_x, d_w_bf16, d_bias, d_original, d_scored, experts, cols);
     gate_topk_finalize_kernel<<<tokens, 1, 0, cuda_stream>>>(d_original, d_scored, d_indices, d_weights, experts, topk, route_scale);
     const cudaError_t err = cudaGetLastError();
     cudaFree(d_original);
