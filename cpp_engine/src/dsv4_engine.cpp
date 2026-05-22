@@ -2238,8 +2238,7 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
         stage_t = Clock::now();
 
         if (!hc_pre_float_rows_cuda(d_h4_rows, hc_cache.ffn_fn, hc_cache.ffn_scale, hc_cache.ffn_base, d_x_rows, d_hc_post_rows, d_hc_comb_rows, token_count, dim)) throw std::runtime_error("prefill hc ffn pre rows launch failed");
-        check_cuda(cudaMemcpy(d_ffn_gamma, ffn_norm_shard.tensor_data(*ffn_norm), ffn_norm->nbytes, cudaMemcpyHostToDevice), "copy prefill ffn gamma");
-        if (!rmsnorm_bf16_gamma_rows_cuda(d_x_rows, d_ffn_gamma, d_ffn_norm_rows, token_count, dim, 1e-6f)) throw std::runtime_error("prefill ffn norm rows launch failed");
+        if (!rmsnorm_bf16_gamma_rows_cuda(d_x_rows, attn_cache.ffn_norm, d_ffn_norm_rows, token_count, dim, 1e-6f)) throw std::runtime_error("prefill ffn norm rows launch failed");
         sync_prefill_profile("profile sync prefill hc ffn pre");
         total_prefill_ffn_pre_ms += elapsed_ms(stage_t, Clock::now());
         stage_t = Clock::now();
