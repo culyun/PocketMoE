@@ -1911,13 +1911,7 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
 #ifdef DSV4_HAVE_NCCL
             if (ctx.options.tp_world > 1) {
                 if (ctx.options.nccl_id_path.empty()) throw std::runtime_error("TP prefill attention all-reduce requires --nccl-id-path");
-                if (env_int_or_default("DSV4_CPP_PREFILL_BATCHED_ATTN_BULK_REDUCE", 0) != 0) {
-                    all_reduce_sum_fp32_via_bf16_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_attn_out_rows, static_cast<int>(token_dim), bf16_reduce_scratch);
-                } else {
-                    for (int t = 0; t < token_count; ++t) {
-                        all_reduce_sum_fp32_via_bf16_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_attn_out_rows + static_cast<size_t>(t) * dim, dim, bf16_reduce_scratch);
-                    }
-                }
+                all_reduce_sum_fp32_via_bf16_inplace(ctx.options.tp_world, ctx.options.tp_rank, ctx.options.device, ctx.options.nccl_id_path.c_str(), d_attn_out_rows, static_cast<int>(token_dim), bf16_reduce_scratch);
             }
 #endif
         } else {

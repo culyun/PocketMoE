@@ -1,5 +1,9 @@
 #include "cuda_ops.hpp"
 
+#include <chrono>
+#include <cstdlib>
+#include <iostream>
+
 #include <cuda_runtime.h>
 #include <mma.h>
 #include <sm_61_intrinsics.h>
@@ -1056,19 +1060,54 @@ bool moe_prefill_fp4_grouped_cuda_with_workspace(
     if (compact_tiles) {
         if (workspace.routes_cap < routes || workspace.tile_cap < workspace.tile_count) return false;
         if (workspace.d_x_sorted == nullptr || workspace.d_x_q == nullptr || workspace.d_x_scale == nullptr || workspace.d_gate == nullptr || workspace.d_up == nullptr || workspace.d_hidden_q == nullptr || workspace.d_hidden_scale == nullptr) return false;
+        const char* profile_env = std::getenv("DSV4_CPP_PROFILE_MOE_PREFILL");
+        const bool profile = profile_env != nullptr && profile_env[0] != '\0' && profile_env[0] != '0';
+        std::chrono::steady_clock::time_point stage;
+        if (profile) {
+            cudaStreamSynchronize(cuda_stream);
+            stage = std::chrono::steady_clock::now();
+        }
         gather_routes_float_kernel<<<gather_blocks, threads, 0, cuda_stream>>>(d_x, d_route_tokens, workspace.d_x_sorted, routes, topk, dim);
         quantize_float_rows_kernel<<<routes, kQuantThreads, 0, cuda_stream>>>(workspace.d_x_sorted, workspace.d_x_q, workspace.d_x_scale, routes, dim);
+        std::chrono::steady_clock::time_point after_quant;
+        if (profile) {
+            cudaStreamSynchronize(cuda_stream);
+            after_quant = std::chrono::steady_clock::now();
+        }
         const dim3 fp4_block(128);
         const size_t x_shared_bytes = 4096;
         const dim3 w13_grid(ceil_div_int(inter_dim, 16), workspace.tile_count);
         moe_prefill_fp4_grouped_w13_wmma_compact_kernel<<<w13_grid, fp4_block, x_shared_bytes, cuda_stream>>>(
             workspace.d_x_q, workspace.d_x_scale, d_seg_starts, workspace.d_tile_experts, workspace.d_tile_rows, d_w1q, d_w1s, d_w3q, d_w3s, workspace.d_gate, workspace.d_up, workspace.tile_count, dim, inter_dim);
+        std::chrono::steady_clock::time_point after_w13;
+        if (profile) {
+            cudaStreamSynchronize(cuda_stream);
+            after_w13 = std::chrono::steady_clock::now();
+        }
         moe_prefill_swiglu_quant_fp4_routes_kernel<<<routes, kQuantThreads, 0, cuda_stream>>>(
             workspace.d_gate, workspace.d_up, d_route_weights, workspace.d_hidden_q, workspace.d_hidden_scale, routes, inter_dim, swiglu_limit);
+        std::chrono::steady_clock::time_point after_swiglu;
+        if (profile) {
+            cudaStreamSynchronize(cuda_stream);
+            after_swiglu = std::chrono::steady_clock::now();
+        }
         const dim3 w2_grid(ceil_div_int(dim, 16), workspace.tile_count);
         const size_t h_shared_bytes = 4096;
         moe_prefill_fp4_grouped_w2_wmma_compact_kernel<<<w2_grid, fp4_block, h_shared_bytes, cuda_stream>>>(
             workspace.d_hidden_q, workspace.d_hidden_scale, d_route_tokens, d_seg_starts, workspace.d_tile_experts, workspace.d_tile_rows, d_w2q, d_w2s, d_y, workspace.tile_count, dim, inter_dim);
+        std::chrono::steady_clock::time_point after_w2;
+        if (profile) {
+            cudaStreamSynchronize(cuda_stream);
+            after_w2 = std::chrono::steady_clock::now();
+            using std::chrono::duration;
+            std::cerr << "CPP_MOE_PREFILL_STAGE routes=" << routes
+                      << " tiles=" << workspace.tile_count
+                      << " quant_ms=" << duration<double, std::milli>(after_quant - stage).count()
+                      << " w13_ms=" << duration<double, std::milli>(after_w13 - after_quant).count()
+                      << " swiglu_ms=" << duration<double, std::milli>(after_swiglu - after_w13).count()
+                      << " w2_ms=" << duration<double, std::milli>(after_w2 - after_swiglu).count()
+                      << "\n";
+        }
         return cudaGetLastError() == cudaSuccess;
     }
     const int padded_rows = n_local_experts * max_count;
