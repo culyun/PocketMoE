@@ -2130,9 +2130,16 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
             attn_t = Clock::now();
             const int window_topk = static_cast<int>(std::min<uint64_t>(static_cast<uint64_t>(token_count), std::max<uint64_t>(1, config.window_size == 0 ? 128 : config.window_size)));
             if (!build_prefill_window_indices_cuda(d_prefill_window_indices, token_count, attn_dims.window_size, window_topk)) throw std::runtime_error("prefill window indices launch failed");
+            attn_stage_sync("attn build window");
+            double attn_build_window_ms = profile_attn ? elapsed_ms(attn_t, Clock::now()) : 0.0;
+            auto attn_sparse_t = Clock::now();
             if (!prefill_sparse_attention_headpair_cuda(d_q_rows, d_kv_norm_rows, attn_cache.attn_sink, d_prefill_window_indices, d_attn_value_rows, token_count, attn_dims.heads, token_count, window_topk, attn_dims.head_dim, 1.0f / std::sqrt(static_cast<float>(attn_dims.head_dim)))) throw std::runtime_error("prefill sparse attention headpair launch failed");
+            attn_stage_sync("attn sparse kernel");
+            double attn_sparse_kernel_ms = profile_attn ? elapsed_ms(attn_sparse_t, Clock::now()) : 0.0;
+            auto attn_inv_rope_t = Clock::now();
             if (!head_rmsnorm_rope_freqs_rows_cuda(d_attn_value_rows, attn_dims.d_inv_freqs, token_count, attn_dims.heads, attn_dims.head_dim, attn_dims.rope_dim, 0, true, 0.0f)) throw std::runtime_error("prefill attn value inverse rope rows launch failed");
             attn_stage_sync("attn sparse");
+            double attn_inv_rope_ms = profile_attn ? elapsed_ms(attn_inv_rope_t, Clock::now()) : 0.0;
             double attn_sparse_ms = elapsed_ms(attn_t, Clock::now());
             attn_t = Clock::now();
             for (int g = 0; g < attn_dims.groups; ++g) {
@@ -2161,6 +2168,10 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
                           << " q_ms=" << attn_q_ms
                           << " kv_ms=" << attn_kv_ms
                           << " sparse_ms=" << attn_sparse_ms
+                          << " (window_ms=" << attn_build_window_ms
+                          << " sparse_kernel_ms=" << attn_sparse_kernel_ms
+                          << " inv_rope_ms=" << attn_inv_rope_ms
+                          << ")"
                           << " wo_ms=" << attn_wo_ms
                           << " reduce_ms=" << attn_reduce_ms << "\n";
             }
