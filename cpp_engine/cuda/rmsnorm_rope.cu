@@ -19,8 +19,10 @@ __global__ void rmsnorm_bf16_gamma_kernel(
     int cols,
     float eps) {
     const int row = blockIdx.x;
-    extern __shared__ float scratch[];
     const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    const int num_warps = blockDim.x >> 5;
     const float* row_x = x + static_cast<size_t>(row) * cols;
     float* row_y = y + static_cast<size_t>(row) * cols;
 
@@ -29,13 +31,18 @@ __global__ void rmsnorm_bf16_gamma_kernel(
         const float v = row_x[c];
         sum_sq += v * v;
     }
-    scratch[tid] = sum_sq;
+    for (int off = 16; off > 0; off >>= 1) sum_sq += __shfl_xor_sync(0xffffffff, sum_sq, off);
+    __shared__ float warp_partials[32];
+    if (lane == 0) warp_partials[warp_id] = sum_sq;
     __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) scratch[tid] += scratch[tid + stride];
-        __syncthreads();
+    __shared__ float inv_shared;
+    if (warp_id == 0) {
+        float val = lane < num_warps ? warp_partials[lane] : 0.0f;
+        for (int off = num_warps / 2; off > 0; off >>= 1) val += __shfl_xor_sync(0xffffffff, val, off);
+        if (lane == 0) inv_shared = rsqrtf(val / static_cast<float>(cols) + eps);
     }
-    const float inv = rsqrtf(scratch[0] / static_cast<float>(cols) + eps);
+    __syncthreads();
+    const float inv = inv_shared;
 
     for (int c = tid; c < cols; c += blockDim.x) {
         row_y[c] = row_x[c] * inv * bf16_to_float(gamma[c]);
@@ -55,7 +62,7 @@ bool rmsnorm_bf16_gamma_cuda(
     if (cols <= 0) return false;
     const int threads = 256;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-    rmsnorm_bf16_gamma_kernel<<<1, threads, threads * sizeof(float), cuda_stream>>>(d_x, d_gamma_bf16, d_y, cols, eps);
+    rmsnorm_bf16_gamma_kernel<<<1, threads, 0, cuda_stream>>>(d_x, d_gamma_bf16, d_y, cols, eps);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -71,7 +78,7 @@ bool rmsnorm_bf16_gamma_rows_cuda(
     if (rows <= 0 || cols <= 0) return false;
     const int threads = 256;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-    rmsnorm_bf16_gamma_kernel<<<rows, threads, threads * sizeof(float), cuda_stream>>>(d_x, d_gamma_bf16, d_y, cols, eps);
+    rmsnorm_bf16_gamma_kernel<<<rows, threads, 0, cuda_stream>>>(d_x, d_gamma_bf16, d_y, cols, eps);
     return cudaGetLastError() == cudaSuccess;
 }
 
