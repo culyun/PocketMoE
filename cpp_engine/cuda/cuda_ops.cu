@@ -610,24 +610,33 @@ __global__ void prefill_sparse_attention_headpair_kernel(
     for (int t = tid; t < topk; t += blockDim.x) idx_shared[t] = idx_base[t];
     __syncthreads();
 
-    for (int t = tid; t < topk; t += blockDim.x) {
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+    const int num_warps = blockDim.x >> 5;
+    for (int t = warp_id; t < topk; t += num_warps) {
         const int idx = idx_shared[t];
         float score0 = -INFINITY;
         float score1 = -INFINITY;
         if (idx >= 0 && idx < kv_len) {
+            const float* kv_ptr = kv_base + static_cast<size_t>(idx) * dim;
             float acc0 = 0.0f;
             float acc1 = 0.0f;
-            const float* kv_ptr = kv_base + static_cast<size_t>(idx) * dim;
-            for (int d = 0; d < dim; ++d) {
+            for (int d = lane; d < dim; d += 32) {
                 const float v = kv_ptr[d];
                 acc0 += q0_shared[d] * v;
                 if (has_h1) acc1 += q1_shared[d] * v;
             }
+            for (int off = 16; off > 0; off >>= 1) {
+                acc0 += __shfl_xor_sync(0xffffffff, acc0, off);
+                if (has_h1) acc1 += __shfl_xor_sync(0xffffffff, acc1, off);
+            }
             score0 = acc0 * softmax_scale;
             if (has_h1) score1 = acc1 * softmax_scale;
         }
-        scores0[t] = score0;
-        if (has_h1) scores1[t] = score1;
+        if (lane == 0) {
+            scores0[t] = score0;
+            if (has_h1) scores1[t] = score1;
+        }
     }
     __syncthreads();
 

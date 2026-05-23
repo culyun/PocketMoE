@@ -1906,6 +1906,15 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
         check_cuda(cudaStreamCreateWithFlags(&prefill_moe_copy_stream, cudaStreamNonBlocking), "create prefill moe copy stream");
         check_cuda(cudaEventCreateWithFlags(&prefill_moe_stage_event, cudaEventDisableTiming), "create prefill moe stage event");
     }
+    const bool prefill_shared_overlap_enabled = env_int_or_default("DSV4_CPP_PREFILL_SHARED_OVERLAP", 1) != 0;
+    cudaStream_t prefill_shared_stream = nullptr;
+    cudaEvent_t prefill_shared_ready_event = nullptr;
+    cudaEvent_t prefill_shared_done_event = nullptr;
+    if (prefill_shared_overlap_enabled) {
+        check_cuda(cudaStreamCreateWithFlags(&prefill_shared_stream, cudaStreamNonBlocking), "create prefill shared stream");
+        check_cuda(cudaEventCreateWithFlags(&prefill_shared_ready_event, cudaEventDisableTiming), "create prefill shared ready event");
+        check_cuda(cudaEventCreateWithFlags(&prefill_shared_done_event, cudaEventDisableTiming), "create prefill shared done event");
+    }
     std::vector<int> prev_layer_active_locals;
 
     auto stage_experts_for_layer = [&](int layer_idx, const std::vector<int>& locals, cudaStream_t stream) -> int {
@@ -2130,9 +2139,16 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
             attn_t = Clock::now();
             const int window_topk = static_cast<int>(std::min<uint64_t>(static_cast<uint64_t>(token_count), std::max<uint64_t>(1, config.window_size == 0 ? 128 : config.window_size)));
             if (!build_prefill_window_indices_cuda(d_prefill_window_indices, token_count, attn_dims.window_size, window_topk)) throw std::runtime_error("prefill window indices launch failed");
+            attn_stage_sync("attn build window");
+            double attn_build_window_ms = profile_attn ? elapsed_ms(attn_t, Clock::now()) : 0.0;
+            auto attn_sparse_t = Clock::now();
             if (!prefill_sparse_attention_headpair_cuda(d_q_rows, d_kv_norm_rows, attn_cache.attn_sink, d_prefill_window_indices, d_attn_value_rows, token_count, attn_dims.heads, token_count, window_topk, attn_dims.head_dim, 1.0f / std::sqrt(static_cast<float>(attn_dims.head_dim)))) throw std::runtime_error("prefill sparse attention headpair launch failed");
+            attn_stage_sync("attn sparse kernel");
+            double attn_sparse_kernel_ms = profile_attn ? elapsed_ms(attn_sparse_t, Clock::now()) : 0.0;
+            auto attn_inv_rope_t = Clock::now();
             if (!head_rmsnorm_rope_freqs_rows_cuda(d_attn_value_rows, attn_dims.d_inv_freqs, token_count, attn_dims.heads, attn_dims.head_dim, attn_dims.rope_dim, 0, true, 0.0f)) throw std::runtime_error("prefill attn value inverse rope rows launch failed");
             attn_stage_sync("attn sparse");
+            double attn_inv_rope_ms = profile_attn ? elapsed_ms(attn_inv_rope_t, Clock::now()) : 0.0;
             double attn_sparse_ms = elapsed_ms(attn_t, Clock::now());
             attn_t = Clock::now();
             for (int g = 0; g < attn_dims.groups; ++g) {
@@ -2161,6 +2177,10 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
                           << " q_ms=" << attn_q_ms
                           << " kv_ms=" << attn_kv_ms
                           << " sparse_ms=" << attn_sparse_ms
+                          << " (window_ms=" << attn_build_window_ms
+                          << " sparse_kernel_ms=" << attn_sparse_kernel_ms
+                          << " inv_rope_ms=" << attn_inv_rope_ms
+                          << ")"
                           << " wo_ms=" << attn_wo_ms
                           << " reduce_ms=" << attn_reduce_ms << "\n";
             }
@@ -2227,11 +2247,22 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
         stage_t = Clock::now();
 
         if (!hc_pre_float_rows_cuda(d_h4_rows, hc_cache.ffn_fn, hc_cache.ffn_scale, hc_cache.ffn_base, d_x_rows, d_hc_post_rows, d_hc_comb_rows, token_count, dim)) throw std::runtime_error("prefill hc ffn pre rows launch failed");
-        check_cuda(cudaMemcpy(d_ffn_gamma, ffn_norm_shard.tensor_data(*ffn_norm), ffn_norm->nbytes, cudaMemcpyHostToDevice), "copy prefill ffn gamma");
-        if (!rmsnorm_bf16_gamma_rows_cuda(d_x_rows, d_ffn_gamma, d_ffn_norm_rows, token_count, dim, 1e-6f)) throw std::runtime_error("prefill ffn norm rows launch failed");
+        if (!rmsnorm_bf16_gamma_rows_cuda(d_x_rows, attn_cache.ffn_norm, d_ffn_norm_rows, token_count, dim, 1e-6f)) throw std::runtime_error("prefill ffn norm rows launch failed");
         sync_prefill_profile("profile sync prefill hc ffn pre");
         total_prefill_ffn_pre_ms += elapsed_ms(stage_t, Clock::now());
         stage_t = Clock::now();
+
+        if (prefill_shared_overlap_enabled) {
+            DeviceSharedCache& shared = ctx.shared_device_cache(li, tp_world, tp_rank, dim);
+            const int shared_inter = inter;
+            check_cuda(cudaEventRecord(prefill_shared_ready_event, nullptr), "record prefill shared ready event");
+            check_cuda(cudaStreamWaitEvent(prefill_shared_stream, prefill_shared_ready_event, 0), "prefill shared stream wait ready");
+            if (!fp8_e4m3_e8m0_matmul_cuda(d_ffn_norm_rows, shared.w1, shared.s1, d_shared_gate, token_count, shared_inter, dim, prefill_shared_stream)) throw std::runtime_error("prefill shared w1 overlap launch failed");
+            if (!fp8_e4m3_e8m0_matmul_cuda(d_ffn_norm_rows, shared.w3, shared.s3, d_shared_up, token_count, shared_inter, dim, prefill_shared_stream)) throw std::runtime_error("prefill shared w3 overlap launch failed");
+            if (!silu_mul_rows_cuda(d_shared_gate, d_shared_up, d_shared_hidden, token_count, shared_inter, prefill_shared_stream)) throw std::runtime_error("prefill shared silu overlap launch failed");
+            if (!fp8_e4m3_e8m0_matmul_cuda(d_shared_hidden, shared.w2, shared.s2, d_shared_out, token_count, dim, shared_inter, prefill_shared_stream)) throw std::runtime_error("prefill shared w2 overlap launch failed");
+            check_cuda(cudaEventRecord(prefill_shared_done_event, prefill_shared_stream), "record prefill shared done event");
+        }
 
         DeviceGateCache& gate = ctx.gate_device_cache(li);
         const bool use_gpu_hash_gate = env_int_or_default("DSV4_CPP_PREFILL_GPU_HASH_GATE", 0) != 0;
@@ -2418,7 +2449,10 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
         sync_prefill_profile("profile sync prefill reduce");
         total_prefill_reduce_ms += elapsed_ms(stage_t, Clock::now());
         stage_t = Clock::now();
-        {
+        if (prefill_shared_overlap_enabled) {
+            check_cuda(cudaStreamWaitEvent(nullptr, prefill_shared_done_event, 0), "default stream wait shared done");
+            if (!vector_accum_rows_cuda(d_shared_out, d_moe_rows, token_count, dim, 1.0f)) throw std::runtime_error("prefill shared accum overlap failed");
+        } else {
             DeviceSharedCache& shared = ctx.shared_device_cache(li, tp_world, tp_rank, dim);
             const int shared_inter = inter;
             if (!fp8_e4m3_e8m0_matmul_cuda(d_ffn_norm_rows, shared.w1, shared.s1, d_shared_gate, token_count, shared_inter, dim)) throw std::runtime_error("prefill shared w1 launch failed");
@@ -2479,6 +2513,11 @@ ForwardSmokeResult run_safetensors_prompt_prefill_impl(SafeForwardContext& ctx, 
     if (prefill_moe_copy_stream_enabled) {
         cudaEventDestroy(prefill_moe_stage_event);
         cudaStreamDestroy(prefill_moe_copy_stream);
+    }
+    if (prefill_shared_overlap_enabled) {
+        cudaEventDestroy(prefill_shared_ready_event);
+        cudaEventDestroy(prefill_shared_done_event);
+        cudaStreamDestroy(prefill_shared_stream);
     }
     return ForwardSmokeResult{last_token, dim, inter, head_rows, layer_count, top_token, top_logit, checksum};
 }
