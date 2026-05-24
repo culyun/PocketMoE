@@ -204,6 +204,10 @@ struct GgufRoutedMoeResult {
     int moe_inter_dim = 0;
     int n_active = 0;          // number of active experts (top-k)
     int expert_ids[8] = {0,0,0,0,0,0,0,0};
+    // Real route weights from sqrt_softplus(W gate · x_normed), gathered at
+    // the hash-selected expert ids, normalized to sum=1, then ×route_scale.
+    float route_weights[8] = {0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f};
+    float route_weights_sum = 0.0f; // sanity: should equal route_scale (1.5 for DSV4-Flash)
     float ffn_normed_rms = 0.0f;
     float moe_out_rms = 0.0f;
     float moe_out_first[4] = {0.0f, 0.0f, 0.0f, 0.0f};

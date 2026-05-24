@@ -3464,6 +3464,41 @@ std::vector<uint16_t> f32_to_bf16_host(const float* src, size_t n) {
     return out;
 }
 
+// F16 (IEEE binary16) -> BF16 via F32 intermediate. F16 has 10-bit mantissa,
+// BF16 has 7-bit mantissa, so this drops 3 bits of fraction. Used for staging
+// GGUF F16 weights into the existing BF16 matvec kernels (e.g., gate scoring).
+std::vector<uint16_t> f16_to_bf16_host(const uint16_t* src, size_t n) {
+    std::vector<uint16_t> out(n);
+    for (size_t i = 0; i < n; ++i) {
+        const uint16_t h = src[i];
+        const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
+        const uint32_t exp16 = (h >> 10) & 0x1Fu;
+        const uint32_t man16 = h & 0x3FFu;
+        uint32_t f32_bits;
+        if (exp16 == 0) {
+            if (man16 == 0) {
+                f32_bits = sign;
+            } else {
+                // Subnormal F16 -> normalized F32: shift mantissa until top bit is set.
+                uint32_t m = man16;
+                int e = -1;
+                while ((m & 0x400u) == 0) { m <<= 1; --e; }
+                m &= 0x3FFu;
+                const uint32_t exp32 = static_cast<uint32_t>(127 - 15 + e);
+                f32_bits = sign | (exp32 << 23) | (m << 13);
+            }
+        } else if (exp16 == 0x1Fu) {
+            // Inf or NaN.
+            f32_bits = sign | (0xFFu << 23) | (man16 << 13);
+        } else {
+            const uint32_t exp32 = exp16 + (127 - 15);
+            f32_bits = sign | (exp32 << 23) | (man16 << 13);
+        }
+        out[i] = static_cast<uint16_t>(f32_bits >> 16);
+    }
+    return out;
+}
+
 float device_vector_rms(const float* d_x, int n) {
     std::vector<float> h(n);
     check_cuda(cudaMemcpy(h.data(), d_x, n * sizeof(float), cudaMemcpyDeviceToHost),
@@ -4532,11 +4567,60 @@ GgufRoutedMoeResult run_gguf_routed_moe_smoke(const std::string& ckpt_path, int 
     // Staged expert buffer holds K experts back-to-back; slots index 0..K-1.
     std::vector<int64_t> h_slots(routes);
     for (int k = 0; k < routes; ++k) h_slots[k] = k;
-    std::vector<float> h_weights(routes, 1.0f / static_cast<float>(routes));
     check_cuda(cudaMemcpy(d_route_slots, h_slots.data(), routes * sizeof(int64_t),
                           cudaMemcpyHostToDevice), "copy slots");
-    check_cuda(cudaMemcpy(d_route_weights, h_weights.data(), routes * sizeof(float),
-                          cudaMemcpyHostToDevice), "copy weights");
+
+    // ----- Hash-gate route weights: gate W matvec → sqrt_softplus → gather →
+    // normalize → ×route_scale. PyTorch reference at runtime/transformer.py:1682
+    // computes the same gather+normalize for hash layers (where indices come
+    // from tid2eid). Gate W is stored F16 in this GGUF; convert to BF16 once
+    // and reuse the existing gate_hash_bf16_cuda kernel pair. -----
+    WeightView gate_w = gws.require("layers.0.ffn.gate.weight");
+    if (gate_w.dtype != DType::F16) {
+        throw std::runtime_error("gate.weight dtype expected F16");
+    }
+    // Native GGUF shape [dim, n_experts]; bf16_matvec_cuda treats the bytes
+    // as [n_experts, dim] row-major which matches the logical layout because
+    // dim is the fast (innermost) GGUF dimension.
+    const int n_experts = static_cast<int>(ctx.config.n_routed_experts);
+    if (static_cast<int>(gate_w.shape[0]) != dim ||
+        static_cast<int>(gate_w.shape[1]) != n_experts) {
+        throw std::runtime_error("gate.weight shape mismatch");
+    }
+    auto gate_w_bf16 = f16_to_bf16_host(
+        reinterpret_cast<const uint16_t*>(gate_w.data),
+        static_cast<size_t>(dim) * static_cast<size_t>(n_experts));
+    uint16_t* d_gate_w_bf16 = nullptr;
+    int64_t* d_tid2eid_i64 = nullptr;
+    float* d_gate_scores_scratch = nullptr;
+    int64_t* d_gate_indices = nullptr;
+    check_cuda(cudaMalloc(&d_gate_w_bf16, gate_w_bf16.size() * sizeof(uint16_t)),
+               "alloc d_gate_w_bf16");
+    check_cuda(cudaMemcpy(d_gate_w_bf16, gate_w_bf16.data(),
+                          gate_w_bf16.size() * sizeof(uint16_t),
+                          cudaMemcpyHostToDevice), "copy gate_w_bf16");
+    // Stage just the per-token tid2eid slice as int64[topk]; kernel will
+    // index it with token=0, table_topk=topk so it reads positions [0..topk).
+    std::vector<int64_t> h_tid2eid_slice(topk);
+    for (int k = 0; k < topk; ++k) h_tid2eid_slice[k] = h_expert_ids[k];
+    check_cuda(cudaMalloc(&d_tid2eid_i64, topk * sizeof(int64_t)),
+               "alloc d_tid2eid_i64");
+    check_cuda(cudaMemcpy(d_tid2eid_i64, h_tid2eid_slice.data(),
+                          topk * sizeof(int64_t), cudaMemcpyHostToDevice),
+               "copy d_tid2eid_i64");
+    check_cuda(cudaMalloc(&d_gate_scores_scratch, topk * sizeof(float)),
+               "alloc d_gate_scores_scratch");
+    check_cuda(cudaMalloc(&d_gate_indices, topk * sizeof(int64_t)),
+               "alloc d_gate_indices");
+    const float route_scale = static_cast<float>(ctx.config.route_scale);
+    if (!gate_hash_bf16_cuda(d_x_normed, d_gate_w_bf16, d_tid2eid_i64,
+                             d_gate_scores_scratch, d_gate_indices,
+                             d_route_weights,
+                             /*token=*/0, /*cols=*/dim,
+                             /*table_topk=*/topk, /*topk=*/topk,
+                             route_scale)) {
+        throw std::runtime_error("gate_hash_bf16_cuda failed");
+    }
 
     // ----- Quantize x once (the w13 kernel reads x_q without per-route stride) -----
     if (!q2_quantize_x_q8_1_cuda(d_x_normed, d_x_q, d_x_scale, /*routes=*/1, dim)) {
@@ -4579,6 +4663,15 @@ GgufRoutedMoeResult run_gguf_routed_moe_smoke(const std::string& ckpt_path, int 
     check_cuda(cudaMemcpy(first.data(), d_y, 4 * sizeof(float),
                           cudaMemcpyDeviceToHost), "copy moe_out first");
     for (int i = 0; i < 4; ++i) r.moe_out_first[i] = first[i];
+    std::vector<float> h_rw(topk);
+    check_cuda(cudaMemcpy(h_rw.data(), d_route_weights, topk * sizeof(float),
+                          cudaMemcpyDeviceToHost), "copy route_weights");
+    float sum = 0.0f;
+    for (int k = 0; k < topk; ++k) {
+        r.route_weights[k] = h_rw[k];
+        sum += h_rw[k];
+    }
+    r.route_weights_sum = sum;
 
     cudaFree(d_row_f16);
     cudaFree(d_x);
@@ -4596,6 +4689,10 @@ GgufRoutedMoeResult run_gguf_routed_moe_smoke(const std::string& ckpt_path, int 
     cudaFree(d_hidden_q);
     cudaFree(d_hidden_scale);
     cudaFree(d_y);
+    cudaFree(d_gate_w_bf16);
+    cudaFree(d_tid2eid_i64);
+    cudaFree(d_gate_scores_scratch);
+    cudaFree(d_gate_indices);
     return r;
 }
 

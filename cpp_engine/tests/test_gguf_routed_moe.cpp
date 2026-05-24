@@ -30,6 +30,12 @@ int main(int argc, char** argv) {
         std::printf("moe_out[0..3]  = %.4f %.4f %.4f %.4f\n",
                     r.moe_out_first[0], r.moe_out_first[1],
                     r.moe_out_first[2], r.moe_out_first[3]);
+        std::printf("route_weights  = [");
+        for (int k = 0; k < r.n_active; ++k) {
+            std::printf("%.4f%s", r.route_weights[k],
+                        k + 1 < r.n_active ? ", " : "");
+        }
+        std::printf("] sum=%.4f\n", r.route_weights_sum);
 
         if (!(r.n_active >= 1 && r.n_active <= 8)) {
             std::cerr << "[FAIL] n_active range\n"; return 1;
@@ -54,6 +60,20 @@ int main(int argc, char** argv) {
         }
         if (!(r.moe_out_rms > 1e-6f && r.moe_out_rms < 1000.0f)) {
             std::cerr << "[FAIL] moe_out_rms out of range\n"; return 1;
+        }
+        // Route weights: normalized to sum=1, ×route_scale=1.5 in DSV4-Flash.
+        // Accept any sum in (0.5, 5.0) — any sensible scaling.
+        if (!(r.route_weights_sum > 0.5f && r.route_weights_sum < 5.0f)) {
+            std::cerr << "[FAIL] route_weights_sum out of plausible range: "
+                      << r.route_weights_sum << "\n";
+            return 1;
+        }
+        for (int k = 0; k < r.n_active; ++k) {
+            if (!(r.route_weights[k] >= 0.0f && r.route_weights[k] < 5.0f)) {
+                std::cerr << "[FAIL] route_weights[" << k << "] = "
+                          << r.route_weights[k] << "\n";
+                return 1;
+            }
         }
         std::cout << "[PASS] gguf routed multi-active MoE smoke\n";
         return 0;
