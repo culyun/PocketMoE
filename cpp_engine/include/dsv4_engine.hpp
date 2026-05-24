@@ -215,4 +215,32 @@ struct GgufRoutedMoeResult {
 
 GgufRoutedMoeResult run_gguf_routed_moe_smoke(const std::string& ckpt_path, int token);
 
+// Phase 3 step: full layer-0 forward composition with residuals.
+// Embed -> save x_pre_attn -> attn_norm -> Q/KV path -> sparse attention ->
+// inverse RoPE -> grouped wo_a -> wo_b -> +x_pre_attn (residual)
+// -> save x_pre_ffn -> ffn_norm -> shared expert (Q8_0 w1/w3 + silu_mul + Q8_0 w2)
+// -> hash-gate scores via gate W -> stage top-k Q2 experts -> Q8_1 quantize x
+// -> batched IQ2_XXS w1/w3 -> SwiGLU + route_weight + Q8_1 quantize hidden
+// -> batched Q2_K w2 (atomicAdd) -> +x_pre_ffn (residual) -> x_out.
+// Validates the residual flow through one full layer (attention + FFN).
+struct GgufLayer0FullResult {
+    int dim = 0;
+    int moe_inter_dim = 0;
+    int heads = 0;
+    int head_dim = 0;
+    int n_active = 0;
+    int expert_ids[8] = {0,0,0,0,0,0,0,0};
+    float embed_rms = 0.0f;
+    float attn_out_rms = 0.0f;        // wo_b output (before residual)
+    float x_post_attn_rms = 0.0f;     // x_pre_attn + attn_out
+    float shared_out_rms = 0.0f;
+    float moe_out_rms = 0.0f;
+    float ffn_combined_rms = 0.0f;    // shared_out + moe_out (before residual)
+    float x_post_ffn_rms = 0.0f;      // x_post_attn + ffn_combined
+    float route_weights_sum = 0.0f;   // sanity: should equal route_scale (1.5)
+    float x_post_ffn_first[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+};
+
+GgufLayer0FullResult run_gguf_layer0_full_smoke(const std::string& ckpt_path, int token, int position);
+
 }  // namespace dsv4
