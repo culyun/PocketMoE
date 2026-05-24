@@ -114,6 +114,43 @@ void nccl_all_reduce_sum_bf16_inplace(int world, int rank, int device, const cha
     check_nccl(ncclAllReduce(d_values, d_values, count, ncclBfloat16, ncclSum, comm, nullptr), "ncclAllReduce bf16 inplace");
 }
 
+void nccl_broadcast_int32(int world, int rank, int device, const char* id_path, int32_t* buf, int count, int root) {
+    if (world <= 0 || rank < 0 || rank >= world || buf == nullptr || count <= 0) throw std::runtime_error("invalid NCCL bcast args");
+    if (root < 0 || root >= world) throw std::runtime_error("invalid NCCL bcast root");
+    ncclComm_t comm = cached_comm(world, rank, device, id_path);
+    int32_t* d_buf = nullptr;
+    check_cuda(cudaMalloc(&d_buf, static_cast<size_t>(count) * sizeof(int32_t)), "cudaMalloc nccl bcast");
+    if (rank == root) {
+        check_cuda(cudaMemcpy(d_buf, buf, static_cast<size_t>(count) * sizeof(int32_t), cudaMemcpyHostToDevice), "copy bcast input");
+    }
+    check_nccl(ncclBroadcast(d_buf, d_buf, count, ncclInt32, root, comm, nullptr), "ncclBroadcast int32");
+    check_cuda(cudaDeviceSynchronize(), "sync nccl bcast");
+    if (rank != root) {
+        check_cuda(cudaMemcpy(buf, d_buf, static_cast<size_t>(count) * sizeof(int32_t), cudaMemcpyDeviceToHost), "copy bcast output");
+    }
+    cudaFree(d_buf);
+}
+
+void nccl_gather_floats_to_root(int world, int rank, int device, const char* id_path, const float* h_local, int local_count, float* h_root_out, int root) {
+    if (world <= 0 || rank < 0 || rank >= world || h_local == nullptr || local_count <= 0) throw std::runtime_error("invalid NCCL gather args");
+    if (root < 0 || root >= world) throw std::runtime_error("invalid NCCL gather root");
+    ncclComm_t comm = cached_comm(world, rank, device, id_path);
+    float* d_local = nullptr;
+    float* d_all = nullptr;
+    check_cuda(cudaMalloc(&d_local, static_cast<size_t>(local_count) * sizeof(float)), "cudaMalloc gather local");
+    check_cuda(cudaMalloc(&d_all, static_cast<size_t>(world) * static_cast<size_t>(local_count) * sizeof(float)), "cudaMalloc gather all");
+    check_cuda(cudaMemcpy(d_local, h_local, static_cast<size_t>(local_count) * sizeof(float), cudaMemcpyHostToDevice), "copy gather input");
+    // Use AllGather so we don't need a separate Gather symbol. The receive
+    // buffer is meaningful on all ranks; non-root callers ignore it.
+    check_nccl(ncclAllGather(d_local, d_all, local_count, ncclFloat, comm, nullptr), "ncclAllGather logits");
+    check_cuda(cudaDeviceSynchronize(), "sync gather");
+    if (rank == root && h_root_out != nullptr) {
+        check_cuda(cudaMemcpy(h_root_out, d_all, static_cast<size_t>(world) * static_cast<size_t>(local_count) * sizeof(float), cudaMemcpyDeviceToHost), "copy gather output");
+    }
+    cudaFree(d_local);
+    cudaFree(d_all);
+}
+
 TpTopResult nccl_global_top1(int world, int rank, int device, const char* id_path, int local_token, float local_logit) {
     if (world <= 0 || rank < 0 || rank >= world) throw std::runtime_error("invalid NCCL world/rank");
     ncclComm_t comm = cached_comm(world, rank, device, id_path);

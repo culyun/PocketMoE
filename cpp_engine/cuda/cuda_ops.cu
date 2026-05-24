@@ -468,10 +468,10 @@ __global__ void fp8_act_quant_dequant_rows_strided_kernel(float* x, int cols, in
     for (int i = threadIdx.x; i < block_size; i += blockDim.x) row_x[start + i] = fp8_e4m3_quant_dequant(row_x[start + i], scale);
 }
 
-__global__ void copy_rows_to_kv_cache_kernel(const float* rows, float* cache, int rows_count, int cols, int window_size) {
+__global__ void copy_rows_to_kv_cache_kernel(const float* rows, float* cache, int rows_count, int cols, int window_size, int start_position) {
     const int row = blockIdx.x;
     if (row >= rows_count) return;
-    const int slot = row % window_size;
+    const int slot = (row + start_position) % window_size;
     const float* src = rows + static_cast<size_t>(row) * cols;
     float* dst = cache + static_cast<size_t>(slot) * cols;
     for (int c = threadIdx.x; c < cols; c += blockDim.x) dst[c] = src[c];
@@ -1498,10 +1498,10 @@ bool fp8_act_quant_dequant_rows_strided_cuda(float* d_x, int rows, int cols, int
     return cudaGetLastError() == cudaSuccess;
 }
 
-bool copy_rows_to_kv_cache_cuda(const float* d_rows, float* d_cache, int rows, int cols, int window_size, void* stream) {
+bool copy_rows_to_kv_cache_cuda(const float* d_rows, float* d_cache, int rows, int cols, int window_size, int start_position, void* stream) {
     if (d_rows == nullptr || d_cache == nullptr || rows <= 0 || cols <= 0 || window_size <= 0) return false;
     auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-    copy_rows_to_kv_cache_kernel<<<rows, 256, 0, cuda_stream>>>(d_rows, d_cache, rows, cols, window_size);
+    copy_rows_to_kv_cache_kernel<<<rows, 256, 0, cuda_stream>>>(d_rows, d_cache, rows, cols, window_size, start_position);
     return cudaGetLastError() == cudaSuccess;
 }
 
