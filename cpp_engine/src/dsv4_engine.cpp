@@ -7,6 +7,7 @@
 #include "sampler.hpp"
 #include "tokenizer.hpp"
 #include "tp_comm.hpp"
+#include "weight_source.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -36,6 +37,21 @@ const SafeTensorInfo* require_tensor(const SafeTensorsShard& shard, const std::s
     const auto* info = shard.find_tensor(name);
     if (info == nullptr) throw std::runtime_error("missing tensor: " + name);
     return info;
+}
+
+// Guards the safetensors-only forward path against GGUF checkpoints. Returns
+// `dir` unchanged for the common safetensors case so it can be chained into
+// SafeForwardContext::ckpt_dir's initializer. GGUF dense forward is not yet
+// wired into SafeForwardContext; we surface that here instead of crashing on
+// model.safetensors.index.json open.
+const std::string& check_safetensors_path(const std::string& dir) {
+    if (is_gguf_path(dir)) {
+        throw std::runtime_error(
+            "cpp_engine: safetensors entry point received a GGUF path '" + dir +
+            "'. GGUF Q2 dense forward is not yet wired up — use the FP4 "
+            "safetensors directory for now.");
+    }
+    return dir;
 }
 
 struct Fp4Handle {
@@ -833,7 +849,7 @@ struct DeviceGateCache {
 
 struct SafeForwardContext {
     explicit SafeForwardContext(const std::string& dir)
-        : ckpt_dir(dir),
+        : ckpt_dir(check_safetensors_path(dir)),
           index(dir),
           config(ModelConfig::from_hf_config(dir)),
           embed_shard(index.shard_path(require_shard_name(index, "embed.weight"))),
