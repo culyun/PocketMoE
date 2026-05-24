@@ -111,4 +111,20 @@ struct GgufAttnQPathResult {
 
 GgufAttnQPathResult run_gguf_attn_q_path_smoke(const std::string& ckpt_path, int token, int position);
 
+// Phase 3 step: attention KV path for layer 0. Embed -> attn_norm -> wkv Q8_0
+// projection (dim -> kv_dim) -> kv_norm RMSNorm -> head_rmsnorm_rope with
+// heads=1, head_dim=kv_dim, rope_dim. RoPE is a rotation so the final L2 norm
+// equals the post-rmsnorm L2 norm (sqrt(kv_dim) for unit-RMS output).
+struct GgufAttnKvPathResult {
+    int dim = 0;
+    int kv_dim = 0;
+    int rope_dim = 0;
+    float kv_a_rms = 0.0f;       // RMS of kv_a after wkv (before rmsnorm)
+    float kv_norm_rms = 0.0f;    // RMS of kv after rmsnorm with kv_norm gamma
+    float kv_post_rope_rms = 0.0f; // RMS of kv after RoPE; rotation preserves L2
+    float kv_first[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+};
+
+GgufAttnKvPathResult run_gguf_attn_kv_path_smoke(const std::string& ckpt_path, int token, int position);
+
 }  // namespace dsv4

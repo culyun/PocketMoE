@@ -3710,6 +3710,125 @@ GgufAttnQPathResult run_gguf_attn_q_path_smoke(const std::string& ckpt_path,
     return r;
 }
 
+GgufAttnKvPathResult run_gguf_attn_kv_path_smoke(const std::string& ckpt_path,
+                                                  int token,
+                                                  int position) {
+    if (!is_gguf_path(ckpt_path)) {
+        throw std::runtime_error("run_gguf_attn_kv_path_smoke: not a GGUF path: " + ckpt_path);
+    }
+    if (token < 0) throw std::runtime_error("token must be >= 0");
+    if (position < 0) throw std::runtime_error("position must be >= 0");
+
+    GgufForwardContext ctx(ckpt_path);
+    WeightSource& ws = *ctx.weight_source;
+
+    WeightView embed = ws.require("embed.weight");
+    WeightView attn_norm = ws.require("layers.0.attn_norm.weight");
+    WeightView wkv = ws.require("layers.0.attn.wkv.weight");
+    WeightView kv_norm = ws.require("layers.0.attn.kv_norm.weight");
+
+    if (embed.dtype != DType::F16) throw std::runtime_error("embed dtype");
+    if (attn_norm.dtype != DType::F32) throw std::runtime_error("attn_norm dtype");
+    if (kv_norm.dtype != DType::F32) throw std::runtime_error("kv_norm dtype");
+    if (wkv.dtype != DType::Q8_0) throw std::runtime_error("wkv dtype");
+
+    const int dim = static_cast<int>(embed.shape[0]);
+    // wkv stored [dim, kv_dim] with cols fastest varying.
+    if (static_cast<int>(wkv.shape[0]) != dim) {
+        throw std::runtime_error("wkv inner dim != dim");
+    }
+    const int kv_dim = static_cast<int>(wkv.shape[1]);
+    if (static_cast<int>(kv_norm.shape[0]) != kv_dim) {
+        throw std::runtime_error("kv_norm gamma length != kv_dim");
+    }
+    const int rope_dim = static_cast<int>(ctx.config.rope_dim);
+    if (rope_dim <= 0 || rope_dim > kv_dim) {
+        throw std::runtime_error("rope_dim out of range");
+    }
+
+    // ----- Embed -----
+    const uint16_t* host_row =
+        reinterpret_cast<const uint16_t*>(embed.data) +
+        static_cast<size_t>(token) * dim;
+    uint16_t* d_row_f16 = nullptr;
+    float* d_x = nullptr;
+    check_cuda(cudaMalloc(&d_row_f16, dim * sizeof(uint16_t)), "alloc d_row_f16");
+    check_cuda(cudaMalloc(&d_x, dim * sizeof(float)), "alloc d_x");
+    check_cuda(cudaMemcpy(d_row_f16, host_row, dim * sizeof(uint16_t),
+                          cudaMemcpyHostToDevice), "copy embed row");
+    if (!f16_row_to_float_cuda(d_row_f16, d_x, /*row=*/0, dim)) {
+        throw std::runtime_error("f16_row_to_float_cuda failed");
+    }
+
+    // ----- attn_norm gamma -----
+    auto attn_bf16 = f32_to_bf16_host(reinterpret_cast<const float*>(attn_norm.data), dim);
+    uint16_t* d_attn_gamma = nullptr;
+    check_cuda(cudaMalloc(&d_attn_gamma, dim * sizeof(uint16_t)), "alloc d_attn_gamma");
+    check_cuda(cudaMemcpy(d_attn_gamma, attn_bf16.data(), dim * sizeof(uint16_t),
+                          cudaMemcpyHostToDevice), "copy attn_gamma");
+    float* d_x_normed = nullptr;
+    check_cuda(cudaMalloc(&d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
+    if (!rmsnorm_bf16_gamma_cuda(d_x, d_attn_gamma, d_x_normed, dim, 1e-6f)) {
+        throw std::runtime_error("rmsnorm attn failed");
+    }
+
+    // ----- wkv: dim -> kv_dim -----
+    uint8_t* d_wkv = nullptr;
+    check_cuda(cudaMalloc(&d_wkv, wkv.nbytes), "alloc d_wkv");
+    check_cuda(cudaMemcpy(d_wkv, wkv.data, wkv.nbytes, cudaMemcpyHostToDevice), "copy wkv");
+    float* d_kv_a = nullptr;
+    check_cuda(cudaMalloc(&d_kv_a, kv_dim * sizeof(float)), "alloc d_kv_a");
+    if (!q8_0_matvec_cuda(d_x_normed, d_wkv, d_kv_a, kv_dim, dim)) {
+        throw std::runtime_error("q8_0 wkv failed");
+    }
+
+    // ----- kv_norm RMSNorm (full kv_dim gamma) -----
+    auto kv_bf16 = f32_to_bf16_host(reinterpret_cast<const float*>(kv_norm.data), kv_dim);
+    uint16_t* d_kv_gamma = nullptr;
+    check_cuda(cudaMalloc(&d_kv_gamma, kv_dim * sizeof(uint16_t)), "alloc d_kv_gamma");
+    check_cuda(cudaMemcpy(d_kv_gamma, kv_bf16.data(), kv_dim * sizeof(uint16_t),
+                          cudaMemcpyHostToDevice), "copy kv_gamma");
+    float* d_kv = nullptr;
+    check_cuda(cudaMalloc(&d_kv, kv_dim * sizeof(float)), "alloc d_kv");
+    if (!rmsnorm_bf16_gamma_cuda(d_kv_a, d_kv_gamma, d_kv, kv_dim, 1e-6f)) {
+        throw std::runtime_error("rmsnorm kv failed");
+    }
+    check_cuda(cudaDeviceSynchronize(), "sync after kv rmsnorm");
+
+    GgufAttnKvPathResult r;
+    r.dim = dim;
+    r.kv_dim = kv_dim;
+    r.rope_dim = rope_dim;
+    r.kv_a_rms = device_vector_rms(d_kv_a, kv_dim);
+    r.kv_norm_rms = device_vector_rms(d_kv, kv_dim);
+
+    // ----- RoPE on the last rope_dim elements (heads=1, head_dim=kv_dim) -----
+    // Pass do_rmsnorm=false because rmsnorm was already done with gamma above.
+    if (!head_rmsnorm_rope_cuda(d_kv, /*heads=*/1, kv_dim, rope_dim,
+                                position,
+                                static_cast<float>(ctx.config.rope_theta),
+                                false, 0.0f)) {
+        throw std::runtime_error("head_rmsnorm_rope kv failed");
+    }
+    check_cuda(cudaDeviceSynchronize(), "sync after kv rope");
+
+    r.kv_post_rope_rms = device_vector_rms(d_kv, kv_dim);
+    std::vector<float> first(4);
+    check_cuda(cudaMemcpy(first.data(), d_kv, 4 * sizeof(float), cudaMemcpyDeviceToHost),
+               "copy kv first");
+    for (int i = 0; i < 4; ++i) r.kv_first[i] = first[i];
+
+    cudaFree(d_row_f16);
+    cudaFree(d_x);
+    cudaFree(d_attn_gamma);
+    cudaFree(d_x_normed);
+    cudaFree(d_wkv);
+    cudaFree(d_kv_a);
+    cudaFree(d_kv_gamma);
+    cudaFree(d_kv);
+    return r;
+}
+
 // --- PersistentEngine implementation ---------------------------------------
 
 struct PersistentEngine::State {
