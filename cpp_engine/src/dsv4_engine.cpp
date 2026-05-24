@@ -3604,6 +3604,13 @@ struct GgufLayerScratch {
     float* d_gate_scores_scratch = nullptr; // hash:[topk]; non-hash:[n_experts]
     float* d_gate_scored_scratch = nullptr; // non-hash only: [n_experts]
     int64_t* d_gate_indices = nullptr;    // [topk]
+    // Per-layer KV cache [cache_capacity, head_dim] float. If non-null, the
+    // attention helper writes the current step's kv_norm into slot `position`
+    // and runs cached_single_token_attention on the [0..cache_len) prefix.
+    // If null, falls back to single_token_sparse_attention on d_kv only
+    // (legacy path used by the layer-0 smoke).
+    float* d_kv_cache = nullptr;
+    int cache_capacity = 0;
 };
 
 // Phase 1: attention residual + ffn_norm + shared expert + gate scoring.
@@ -3636,9 +3643,23 @@ void gguf_layer_forward_attn_to_gate(const GgufLayerDeviceWeights& w,
                                 d.rope_theta, false, 0.0f))
         throw std::runtime_error("kv head rope failed");
     const float scale = 1.0f / std::sqrt(static_cast<float>(d.head_dim));
-    if (!single_token_sparse_attention_cuda(s.d_q, s.d_kv, w.d_attn_sink,
-                                            s.d_attn_value, d.heads, d.head_dim, scale))
-        throw std::runtime_error("sparse_attention failed");
+    if (s.d_kv_cache != nullptr) {
+        if (position < 0 || position >= s.cache_capacity)
+            throw std::runtime_error("position out of KV cache capacity");
+        // Write current step's MLA latent K/V into the per-layer cache at slot
+        // `position`, then run cached attention over [0..position] + attn_sink.
+        check_cuda(cudaMemcpy(s.d_kv_cache + static_cast<size_t>(position) * d.kv_dim,
+                              s.d_kv, static_cast<size_t>(d.kv_dim) * sizeof(float),
+                              cudaMemcpyDeviceToDevice), "write kv to cache");
+        if (!cached_single_token_attention_cuda(s.d_q, s.d_kv_cache, w.d_attn_sink,
+                                                s.d_attn_value, d.heads, d.head_dim,
+                                                position + 1, scale))
+            throw std::runtime_error("cached attention failed");
+    } else {
+        if (!single_token_sparse_attention_cuda(s.d_q, s.d_kv, w.d_attn_sink,
+                                                s.d_attn_value, d.heads, d.head_dim, scale))
+            throw std::runtime_error("sparse_attention failed");
+    }
     if (!head_rmsnorm_rope_cuda(s.d_attn_value, d.heads, d.head_dim, d.rope_dim,
                                 position, d.rope_theta, /*inverse=*/true, 0.0f))
         throw std::runtime_error("inverse rope failed");
@@ -5530,6 +5551,24 @@ GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path,
     check_cuda(cudaMalloc(&d_routed_w2, per_w2_bytes * topk), "alloc routed_w2");
     check_cuda(cudaMalloc(&d_routed_w3, per_w3_bytes * topk), "alloc routed_w3");
 
+    // ===== per-layer KV cache buffers (sized for this smoke's single step) =====
+    // Cache capacity = position + 1: enough to write the current step's KV into
+    // slot `position` and run cached attention over [0..position]. At
+    // position=0 this is equivalent to the legacy single_token_sparse_attention
+    // path and exercises the cached_single_token_attention helper end-to-end.
+    const int cache_capacity = position + 1;
+    std::vector<float*> d_kv_cache(n_layers, nullptr);
+    for (int L = 0; L < n_layers; ++L) {
+        check_cuda(cudaMalloc(&d_kv_cache[L],
+                              static_cast<size_t>(cache_capacity) *
+                                  static_cast<size_t>(kv_dim) * sizeof(float)),
+                   "alloc d_kv_cache");
+        check_cuda(cudaMemset(d_kv_cache[L], 0,
+                              static_cast<size_t>(cache_capacity) *
+                                  static_cast<size_t>(kv_dim) * sizeof(float)),
+                   "memset d_kv_cache");
+    }
+
     // ===== activation + scratch buffers (allocated once, reused per layer) =====
     const int x_groups = (dim + 31) / 32;
     const int hidden_groups = (moe_inter + 15) / 16;
@@ -5668,6 +5707,9 @@ GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path,
         lw.is_hash = is_hash;
         lw.d_routed_w1 = d_routed_w1; lw.d_routed_w2 = d_routed_w2; lw.d_routed_w3 = d_routed_w3;
 
+        ls.d_kv_cache = d_kv_cache[L];
+        ls.cache_capacity = cache_capacity;
+
         if (is_hash) {
             // Upload per-token tid2eid row, converted to int64 (kernel expects i64).
             const int32_t* row = h_tid2eid_table[L] + static_cast<size_t>(token) * topk;
@@ -5759,6 +5801,7 @@ GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path,
     free_vec_u16(d_gate_w); free_vec_f32(d_gate_bias);
     cudaFree(d_final_norm_gamma); cudaFree(d_head);
     cudaFree(d_routed_w1); cudaFree(d_routed_w2); cudaFree(d_routed_w3);
+    free_vec_f32(d_kv_cache);
     cudaFree(d_x); cudaFree(d_x_pre_attn); cudaFree(d_x_normed);
     cudaFree(d_q_a); cudaFree(d_q_normed); cudaFree(d_q);
     cudaFree(d_kv_a); cudaFree(d_kv); cudaFree(d_attn_value);
