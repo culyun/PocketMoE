@@ -90,6 +90,74 @@ Resident OpenAI-compatible benchmark，无显式 warmup，`CASE=all REPEAT=2`，
 
 当前 GGUF Q2 结论：在这个 checkpoint 和硬件上，prefill 路径已经接近当前架构能达到的最好结果。重复请求或后续请求的 prefill/TTFC 会明显变快，因为 staged GGUF expert 路径以及 OS/GPU cache 已经变热；但 decode 仍受 active-expert cache miss/H2D copy、TP all-reduce/finalize 和长上下文 attention 成本限制。短请求 warm-cache decode 可以达到约 4.8 tok/s，而真实异构 streaming 和长输出 decode 通常在 3.7-3.9 tok/s。后续若要继续大幅提升，更可能需要优化 decode 侧 active-expert cache 调度或降低通信/copy 成本，而不是继续优化 prefill kernel。
 
+## C++ 引擎（cpp_engine）
+
+除了上面的 PyTorch runtime，本仓库还提供一个原生 C++/CUDA 推理引擎，位于 `cpp_engine/`。它加载同样的 DeepSeek-V4-Flash FP4 checkpoint，但用独立二进制驱动模型，避免 Python/PyTorch 的每步开销。rank 0 内置 OpenAI 兼容 HTTP 服务（cpp-httplib + SSE）；ranks 1-3 是 NCCL worker，通过 CPU 命令通道驱动。tokenize 和 chat template 在常驻 Python sidecar 中执行，sidecar 复用 `src/encoding/dsv4.py`，因此 prompt 模板、tool-call 格式和 reasoning-effort 行为与 Python 服务一致。
+
+同一台 4 x RTX 2080 Ti 机器上验证过的 FP4 性能（TP=4，全部使用默认值）：
+
+| 场景 | Prompt tokens | Prefill | Prefill TPS | Decode TPS | 单卡峰值显存 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 短 prompt | 2,101 | ~7.6s | ~275 tok/s | ~3.7 tok/s | ~7 GiB |
+| 32K 上下文 | 32,768 | ~82s | ~402 tok/s | n/a | ~11.2 GiB |
+| 64K 上下文（已验证最大） | 65,536 | ~164s | ~401 tok/s | ~3.7 tok/s | ~14.5 GiB |
+
+目前已端到端验证的最大上下文是 64K；14.5 GiB 单卡峰值在 22 GiB 卡上仍有余量。在 64K 上，prefill 大约比上面的 PyTorch FP4 路径快 1.6 倍（164s vs 257s）。FP4 decode TPS 与 PyTorch 接近，因为 decode 瓶颈在 PCIe expert staging，而不是 host overhead。
+
+长上下文 prefill 默认启用两个路径：
+
+- **Chunked prefill**（`DSV4_CPP_PREFILL_CHUNK_TOKENS`，默认 `4096`）：把每层 body 包在 chunk loop 中，让 scratch buffer 是 chunk 大小而不是 `token_count` 大小。否则 64K prompt 会在约 22 GiB 的 attention scratch 分配处 OOM。
+- **Batched sparse attention**（`DSV4_CPP_PREFILL_BATCHED_ATTN`，默认 `1`）：把 per-token attention kernel 改为单个 batched kernel；64K 上快约 8.6 倍（1415s → 164s）。设 `=0` 切回 per-token 路径（仅用于调试）。
+
+### 编译
+
+需要 CUDA Toolkit 和 NCCL（NCCL 自动检测；如果不在默认搜索路径，通过 `-DNCCL_ROOT=/path/to/nccl` 显式指定）：
+
+```bash
+cmake -S cpp_engine -B build/cpp_engine -DCMAKE_BUILD_TYPE=Release
+cmake --build build/cpp_engine -j
+```
+
+生成的二进制位于 `build/cpp_engine/dsv4_cpp_engine`。
+
+### 启动 OpenAI 兼容服务
+
+启动脚本会 fork 4 个 rank（每卡一个），在 `$PORT` 暴露 OpenAI API：
+
+```bash
+CKPT=/path/to/DeepSeek-V4-Flash \
+PORT=8000 \
+MAX_CONTEXT=8192 \
+PYTHON=/path/to/python \
+bash scripts/run_cpp_serve_tp4.sh
+```
+
+`CKPT` 需要指向原始的 DeepSeek-V4-Flash FP4 safetensors 目录（不是 PyTorch 路径使用的 W8A8 转换版本）。`PYTHON` 只要装了 `transformers` 即可；sidecar 会直接从仓库 import `src/encoding/dsv4`。
+
+要支持 64K-token prompt，把 `MAX_CONTEXT` 提到至少 `65536 + max_completion_tokens`（例如 `73728`）：
+
+```bash
+CKPT=/path/to/DeepSeek-V4-Flash \
+MAX_CONTEXT=73728 \
+bash scripts/run_cpp_serve_tp4.sh
+```
+
+每个 rank 的日志默认在 `/tmp/dsv4_cpp_serve_rank{0..3}.log`（`LOG_DIR=/some/dir` 可覆盖）。API 接口与上面 [快速开始](#快速开始) 中的 OpenAI chat-completions 子集一致；客户端访问 `http://<host>:$PORT/v1/chat/completions`。
+
+`scripts/run_cpp_serve_tp4.sh` 接受的常用环境变量：
+
+| 变量 | 默认值 | 作用 |
+| --- | --- | --- |
+| `CKPT` | 本地路径 | DeepSeek-V4-Flash FP4 safetensors 目录。 |
+| `PORT` | `8000` | rank 0 HTTP 端口。 |
+| `MAX_CONTEXT` | `8192` | 最大 prompt+completion 长度（决定 KV cache 容量）。 |
+| `PYTHON` | `python` | tokenizer sidecar 使用的 Python。 |
+| `SIDECAR` | `src/server/cpp_sidecar.py` | tokenizer/template sidecar 脚本。 |
+| `BIN` | `build/cpp_engine/dsv4_cpp_engine` | C++ 引擎二进制路径。 |
+| `NCCL_ID` | `/tmp/dsv4_cpp_serve_nccl.id` | NCCL rendezvous 文件。 |
+| `LOG_DIR` | `/tmp` | 各 rank 日志目录。 |
+| `EXTRA_ENV` | 未设置 | 注入到每个 rank 的额外 env，例如 `EXTRA_ENV='DSV4_CPP_PREFILL_CHUNK_TOKENS=8192'`。 |
+
 ## 快速开始
 
 ```bash
