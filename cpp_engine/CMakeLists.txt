@@ -41,6 +41,10 @@ add_library(dsv4_cpp_core STATIC
     src/tp_comm.cpp
     src/dsv4_engine.cpp
     src/sampler.cpp
+    src/cmd_channel.cpp
+    src/python_sidecar.cpp
+    src/openai_server.cpp
+    third_party/httplib.cpp
     cuda/cuda_ops.cu
     cuda/bf16_ops.cu
     cuda/quant_gemm.cu
@@ -51,6 +55,7 @@ add_library(dsv4_cpp_core STATIC
 
 target_include_directories(dsv4_cpp_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party
 )
 
 target_link_libraries(dsv4_cpp_core PUBLIC CUDA::cudart CUDA::cublas)
@@ -127,3 +132,7 @@ set_target_properties(test_min_layer_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY $
 add_executable(test_nccl_smoke tests/test_nccl_smoke.cpp)
 target_link_libraries(test_nccl_smoke PRIVATE dsv4_cpp_core)
 set_target_properties(test_nccl_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_persistent_engine tests/test_persistent_engine.cpp)
+target_link_libraries(test_persistent_engine PRIVATE dsv4_cpp_core)
+set_target_properties(test_persistent_engine PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)

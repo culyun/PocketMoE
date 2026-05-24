@@ -1,6 +1,9 @@
 #include "cuda_ops.hpp"
 #include "dsv4_engine.hpp"
 #include "model_config.hpp"
+#include "openai_server.hpp"
+#include "persistent_engine.hpp"
+#include "python_sidecar.hpp"
 #include "safetensors_reader.hpp"
 #include "tokenizer.hpp"
 #include "tp_comm.hpp"
@@ -36,6 +39,13 @@ struct Args {
     bool dump_config = false;
     bool inspect = false;
     bool smoke_forward = false;
+    bool use_persistent = false;
+    int max_context = 0;
+    bool serve = false;
+    int port = 8000;
+    std::string host = "0.0.0.0";
+    std::string python_bin = "python";
+    std::string sidecar_script;
 };
 
 bool path_exists(const std::string& path) {
@@ -101,6 +111,20 @@ Args parse_args(int argc, char** argv) {
             args.device = std::stoi(argv[++i]);
         } else if (arg == "--nccl-id-path" && i + 1 < argc) {
             args.nccl_id_path = argv[++i];
+        } else if (arg == "--use-persistent") {
+            args.use_persistent = true;
+        } else if (arg == "--max-context" && i + 1 < argc) {
+            args.max_context = std::stoi(argv[++i]);
+        } else if (arg == "--serve") {
+            args.serve = true;
+        } else if (arg == "--port" && i + 1 < argc) {
+            args.port = std::stoi(argv[++i]);
+        } else if (arg == "--host" && i + 1 < argc) {
+            args.host = argv[++i];
+        } else if (arg == "--python" && i + 1 < argc) {
+            args.python_bin = argv[++i];
+        } else if (arg == "--sidecar" && i + 1 < argc) {
+            args.sidecar_script = argv[++i];
         } else {
             throw std::runtime_error("unknown or incomplete argument: " + arg);
         }
@@ -163,6 +187,35 @@ int main(int argc, char** argv) {
         if (args.tp_world > 1) {
             std::cout << "tp_world=" << args.tp_world << " tp_rank=" << args.tp_rank
                       << " device=" << (args.device >= 0 ? args.device : args.tp_rank) << "\n";
+        }
+        if (args.serve) {
+            if (args.ckpt.empty()) throw std::runtime_error("--serve requires --ckpt");
+            const int layer_count = args.smoke_layers > 0 ? args.smoke_layers : 43;
+            const int max_context = args.max_context > 0 ? args.max_context : 8192;
+            dsv4::ForwardSmokeOptions opts;
+            opts.tp_world = args.tp_world;
+            opts.tp_rank = args.tp_rank;
+            opts.device = args.device >= 0 ? args.device : args.tp_rank;
+            opts.nccl_id_path = args.nccl_id_path;
+            dsv4::PersistentEngine engine(args.ckpt, opts, layer_count, max_context);
+            engine.warmup_tp();
+            if (args.tp_rank > 0) {
+                // Worker rank: park on the NCCL command channel until rank 0
+                // sends SHUTDOWN.
+                engine.run_worker_loop();
+                return 0;
+            }
+            const std::string sidecar_script = args.sidecar_script.empty()
+                ? std::string("src/server/cpp_sidecar.py")
+                : args.sidecar_script;
+            dsv4::PythonSidecar sidecar(args.python_bin, sidecar_script, args.ckpt);
+            dsv4::OpenAIServerConfig cfg;
+            cfg.port = args.port;
+            cfg.host = args.host;
+            dsv4::OpenAIServer server(engine, sidecar, cfg);
+            server.run();
+            engine.worker_command_shutdown();
+            return 0;
         }
         if (!args.ckpt.empty()) {
             dsv4::SafeTensorsIndex index(args.ckpt);
@@ -249,6 +302,70 @@ int main(int argc, char** argv) {
                     opts.tp_rank = args.tp_rank;
                     opts.device = args.device >= 0 ? args.device : args.tp_rank;
                     opts.nccl_id_path = args.nccl_id_path;
+                    if (args.use_persistent) {
+                        const int max_context = args.max_context > 0
+                            ? args.max_context
+                            : static_cast<int>(prompt_ids.size()) + args.max_new_tokens;
+                        dsv4::PersistentEngine engine(args.ckpt, opts, args.smoke_layers, max_context);
+                        if (args.tp_rank > 0) {
+                            engine.run_worker_loop();
+                            return 0;
+                        }
+                        dsv4::SamplingParams sp;
+                        sp.greedy = true;
+                        std::vector<int> generated_ids;
+                        generated_ids.reserve(static_cast<size_t>(args.max_new_tokens));
+                        using Clock = std::chrono::steady_clock;
+                        const auto t_total0 = Clock::now();
+                        engine.worker_command_reset();
+                        engine.reset_session();
+                        const auto t_prefill0 = Clock::now();
+                        engine.worker_command_prefill(prompt_ids);
+                        int token = engine.prefill(prompt_ids, sp);
+                        const auto t_prefill1 = Clock::now();
+                        generated_ids.push_back(token);
+                        int position = static_cast<int>(prompt_ids.size());
+                        const auto t_decode0 = Clock::now();
+                        for (int step = 1; step < args.max_new_tokens; ++step) {
+                            engine.worker_command_decode(token, position + step - 1);
+                            token = engine.decode_step(token, position + step - 1, sp);
+                            generated_ids.push_back(token);
+                        }
+                        const auto t_decode1 = Clock::now();
+                        engine.worker_command_shutdown();
+                        auto sec = [](auto a, auto b) {
+                            return std::chrono::duration<double>(b - a).count();
+                        };
+                        for (size_t step = 0; step < generated_ids.size(); ++step) {
+                            std::cout << "generate_step=" << step
+                                      << " token=" << generated_ids[step]
+                                      << " token_text=" << tokenizer.decode_tokens({generated_ids[step]})
+                                      << " decoded=" << tokenizer.decode_tokens(std::vector<int>(generated_ids.begin(), generated_ids.begin() + step + 1)) << "\n";
+                        }
+                        if (args.resident_bench) {
+                            const double wall = sec(t_total0, t_decode1);
+                            const double prefill = sec(t_prefill0, t_prefill1);
+                            const double decode = sec(t_decode0, t_decode1);
+                            const double prefill_tps = prefill > 0.0 ? static_cast<double>(prompt_ids.size()) / prefill : 0.0;
+                            const int decoded = args.max_new_tokens > 1 ? args.max_new_tokens - 1 : 0;
+                            const double decode_tps = decode > 0.0 ? static_cast<double>(decoded) / decode : 0.0;
+                            const double total_tokens = static_cast<double>(prompt_ids.size() + generated_ids.size());
+                            const double tps = wall > 0.0 ? total_tokens / wall : 0.0;
+                            std::cout << "resident_bench=1 prompt_tokens=" << prompt_ids.size()
+                                      << " generated_tokens=" << generated_ids.size()
+                                      << " wall=" << wall
+                                      << " tokens_per_s=" << tps
+                                      << " prefill_seconds=" << prefill
+                                      << " prefill_tokens_per_s=" << prefill_tps
+                                      << " decode_seconds=" << decode
+                                      << " decode_tokens_per_s=" << decode_tps
+                                      << " decode_token_count=" << decoded
+                                      << " tp_world=" << args.tp_world
+                                      << " tp_rank=" << args.tp_rank
+                                      << " use_persistent=1\n";
+                        }
+                        return 0;
+                    }
                     auto timed = dsv4::run_safetensors_generate_tokens_timed_with_options(args.ckpt, prompt_ids, args.smoke_layers, args.max_new_tokens, opts);
                     auto& results = timed.tokens;
                     std::vector<int> generated_ids;

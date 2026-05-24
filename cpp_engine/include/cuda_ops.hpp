@@ -566,6 +566,7 @@ bool copy_rows_to_kv_cache_cuda(
     int rows,
     int cols,
     int window_size,
+    int start_position = 0,
     void* stream = nullptr);
 
 bool fp32_to_bf16_cuda(
