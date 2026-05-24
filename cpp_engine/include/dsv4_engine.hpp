@@ -127,4 +127,31 @@ struct GgufAttnKvPathResult {
 
 GgufAttnKvPathResult run_gguf_attn_kv_path_smoke(const std::string& ckpt_path, int token, int position);
 
+// Phase 3 step: full single-token dense attention for layer 0.
+// Embed -> attn_norm -> Q-path (wq_a, q_norm, wq_b, head_rmsnorm_rope) ||
+// KV-path (wkv, kv_norm, head_rmsnorm_rope) -> single_token_sparse_attention
+// (with attn_sink) -> inverse RoPE on rope tail of each head -> grouped wo_a
+// Q8_0 (o_groups separate matvecs) -> wo_b Q8_0 (-> dim).
+// Output `attn_out` is the per-layer attention residual (length dim).
+struct GgufAttnFullResult {
+    int dim = 0;
+    int q_a_dim = 0;
+    int heads = 0;
+    int head_dim = 0;
+    int kv_dim = 0;
+    int rope_dim = 0;
+    int o_groups = 0;
+    int o_lora_rank = 0;
+    int attn_mid = 0;
+    float q_rms = 0.0f;
+    float kv_rms = 0.0f;
+    float attn_value_rms = 0.0f;       // RMS of sparse-attention output
+    float attn_value_post_inv_rms = 0.0f; // after inverse RoPE
+    float attn_mid_rms = 0.0f;
+    float attn_out_rms = 0.0f;
+    float attn_out_first[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+};
+
+GgufAttnFullResult run_gguf_attn_full_smoke(const std::string& ckpt_path, int token, int position);
+
 }  // namespace dsv4

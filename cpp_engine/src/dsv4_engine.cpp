@@ -3829,6 +3829,263 @@ GgufAttnKvPathResult run_gguf_attn_kv_path_smoke(const std::string& ckpt_path,
     return r;
 }
 
+GgufAttnFullResult run_gguf_attn_full_smoke(const std::string& ckpt_path,
+                                             int token,
+                                             int position) {
+    if (!is_gguf_path(ckpt_path)) {
+        throw std::runtime_error("run_gguf_attn_full_smoke: not a GGUF path: " + ckpt_path);
+    }
+    if (token < 0) throw std::runtime_error("token must be >= 0");
+    if (position < 0) throw std::runtime_error("position must be >= 0");
+
+    GgufForwardContext ctx(ckpt_path);
+    WeightSource& ws = *ctx.weight_source;
+
+    // ----- weights -----
+    WeightView embed = ws.require("embed.weight");
+    WeightView attn_norm = ws.require("layers.0.attn_norm.weight");
+    WeightView wq_a = ws.require("layers.0.attn.wq_a.weight");
+    WeightView q_norm = ws.require("layers.0.attn.q_norm.weight");
+    WeightView wq_b = ws.require("layers.0.attn.wq_b.weight");
+    WeightView wkv = ws.require("layers.0.attn.wkv.weight");
+    WeightView kv_norm = ws.require("layers.0.attn.kv_norm.weight");
+    WeightView attn_sink = ws.require("layers.0.attn.attn_sink");
+    WeightView wo_a = ws.require("layers.0.attn.wo_a.weight");
+    WeightView wo_b = ws.require("layers.0.attn.wo_b.weight");
+
+    if (embed.dtype != DType::F16) throw std::runtime_error("embed dtype");
+    if (attn_norm.dtype != DType::F32) throw std::runtime_error("attn_norm dtype");
+    if (q_norm.dtype != DType::F32) throw std::runtime_error("q_norm dtype");
+    if (kv_norm.dtype != DType::F32) throw std::runtime_error("kv_norm dtype");
+    if (attn_sink.dtype != DType::F32) throw std::runtime_error("attn_sink dtype");
+    if (wq_a.dtype != DType::Q8_0 || wq_b.dtype != DType::Q8_0 ||
+        wkv.dtype != DType::Q8_0 || wo_a.dtype != DType::Q8_0 ||
+        wo_b.dtype != DType::Q8_0) {
+        throw std::runtime_error("attention projections must be Q8_0");
+    }
+
+    const int dim = static_cast<int>(embed.shape[0]);
+    const int q_a_dim = static_cast<int>(wq_a.shape[1]);
+    const int heads = static_cast<int>(ctx.config.n_heads);
+    const int q_full = static_cast<int>(wq_b.shape[1]);
+    if (q_full % heads != 0) throw std::runtime_error("wq_b cols % heads != 0");
+    const int head_dim = q_full / heads;
+    const int kv_dim = static_cast<int>(wkv.shape[1]);
+    const int rope_dim = static_cast<int>(ctx.config.rope_dim);
+    if (kv_dim != head_dim) {
+        throw std::runtime_error("expected kv_dim == head_dim for single KV head");
+    }
+    const int o_groups = static_cast<int>(ctx.config.o_groups);
+    const int o_lora_rank = static_cast<int>(ctx.config.o_lora_rank);
+    if (o_groups <= 0 || o_lora_rank <= 0) {
+        throw std::runtime_error("o_groups / o_lora_rank not set");
+    }
+    if (q_full % o_groups != 0) {
+        throw std::runtime_error("q_full not divisible by o_groups");
+    }
+    const int group_in_dim = q_full / o_groups;            // 32768 / 8 = 4096
+    const int attn_mid = o_groups * o_lora_rank;            // 8 * 1024 = 8192
+    if (static_cast<int>(wo_a.shape[0]) != group_in_dim ||
+        static_cast<int>(wo_a.shape[1]) != attn_mid) {
+        throw std::runtime_error("wo_a shape mismatch with o_groups/o_lora_rank");
+    }
+    if (static_cast<int>(wo_b.shape[0]) != attn_mid ||
+        static_cast<int>(wo_b.shape[1]) != dim) {
+        throw std::runtime_error("wo_b shape mismatch");
+    }
+    if (static_cast<int>(attn_sink.shape[0]) != heads) {
+        throw std::runtime_error("attn_sink length != heads");
+    }
+
+    // ----- upload all weights / norms -----
+    auto upload_u8 = [](const void* src, size_t bytes) {
+        uint8_t* d = nullptr;
+        check_cuda(cudaMalloc(&d, bytes), "alloc");
+        check_cuda(cudaMemcpy(d, src, bytes, cudaMemcpyHostToDevice), "copy");
+        return d;
+    };
+    auto upload_f32 = [](const void* src, size_t n) {
+        float* d = nullptr;
+        check_cuda(cudaMalloc(&d, n * sizeof(float)), "alloc f32");
+        check_cuda(cudaMemcpy(d, src, n * sizeof(float), cudaMemcpyHostToDevice), "copy f32");
+        return d;
+    };
+    auto upload_bf16_from_f32 = [&](const void* src, size_t n) {
+        auto bf = f32_to_bf16_host(reinterpret_cast<const float*>(src), n);
+        uint16_t* d = nullptr;
+        check_cuda(cudaMalloc(&d, n * sizeof(uint16_t)), "alloc bf16");
+        check_cuda(cudaMemcpy(d, bf.data(), n * sizeof(uint16_t), cudaMemcpyHostToDevice),
+                   "copy bf16");
+        return d;
+    };
+
+    const uint16_t* host_row =
+        reinterpret_cast<const uint16_t*>(embed.data) +
+        static_cast<size_t>(token) * dim;
+    uint16_t* d_row_f16 = nullptr;
+    check_cuda(cudaMalloc(&d_row_f16, dim * sizeof(uint16_t)), "alloc d_row_f16");
+    check_cuda(cudaMemcpy(d_row_f16, host_row, dim * sizeof(uint16_t),
+                          cudaMemcpyHostToDevice), "copy embed row");
+
+    uint16_t* d_attn_gamma = upload_bf16_from_f32(attn_norm.data, dim);
+    uint16_t* d_q_gamma = upload_bf16_from_f32(q_norm.data, q_a_dim);
+    uint16_t* d_kv_gamma = upload_bf16_from_f32(kv_norm.data, kv_dim);
+
+    uint8_t* d_wq_a = upload_u8(wq_a.data, wq_a.nbytes);
+    uint8_t* d_wq_b = upload_u8(wq_b.data, wq_b.nbytes);
+    uint8_t* d_wkv = upload_u8(wkv.data, wkv.nbytes);
+    uint8_t* d_wo_a = upload_u8(wo_a.data, wo_a.nbytes);
+    uint8_t* d_wo_b = upload_u8(wo_b.data, wo_b.nbytes);
+    float* d_attn_sink = upload_f32(attn_sink.data, heads);
+
+    // ----- activation buffers -----
+    float* d_x = nullptr;
+    float* d_x_normed = nullptr;
+    float* d_q_a = nullptr;
+    float* d_q_normed = nullptr;
+    float* d_q = nullptr;
+    float* d_kv_a = nullptr;
+    float* d_kv = nullptr;
+    float* d_attn_value = nullptr;
+    float* d_attn_mid = nullptr;
+    float* d_attn_out = nullptr;
+    check_cuda(cudaMalloc(&d_x, dim * sizeof(float)), "alloc d_x");
+    check_cuda(cudaMalloc(&d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
+    check_cuda(cudaMalloc(&d_q_a, q_a_dim * sizeof(float)), "alloc d_q_a");
+    check_cuda(cudaMalloc(&d_q_normed, q_a_dim * sizeof(float)), "alloc d_q_normed");
+    check_cuda(cudaMalloc(&d_q, q_full * sizeof(float)), "alloc d_q");
+    check_cuda(cudaMalloc(&d_kv_a, kv_dim * sizeof(float)), "alloc d_kv_a");
+    check_cuda(cudaMalloc(&d_kv, kv_dim * sizeof(float)), "alloc d_kv");
+    check_cuda(cudaMalloc(&d_attn_value, q_full * sizeof(float)), "alloc d_attn_value");
+    check_cuda(cudaMalloc(&d_attn_mid, attn_mid * sizeof(float)), "alloc d_attn_mid");
+    check_cuda(cudaMalloc(&d_attn_out, dim * sizeof(float)), "alloc d_attn_out");
+
+    // ----- compute -----
+    if (!f16_row_to_float_cuda(d_row_f16, d_x, /*row=*/0, dim)) {
+        throw std::runtime_error("f16 embed failed");
+    }
+    if (!rmsnorm_bf16_gamma_cuda(d_x, d_attn_gamma, d_x_normed, dim, 1e-6f)) {
+        throw std::runtime_error("attn_norm failed");
+    }
+
+    // Q path
+    if (!q8_0_matvec_cuda(d_x_normed, d_wq_a, d_q_a, q_a_dim, dim)) {
+        throw std::runtime_error("wq_a failed");
+    }
+    if (!rmsnorm_bf16_gamma_cuda(d_q_a, d_q_gamma, d_q_normed, q_a_dim, 1e-6f)) {
+        throw std::runtime_error("q_norm failed");
+    }
+    if (!q8_0_matvec_cuda(d_q_normed, d_wq_b, d_q, q_full, q_a_dim)) {
+        throw std::runtime_error("wq_b failed");
+    }
+    if (!head_rmsnorm_rope_cuda(d_q, heads, head_dim, rope_dim,
+                                position,
+                                static_cast<float>(ctx.config.rope_theta),
+                                false, 1e-6f)) {
+        throw std::runtime_error("q head rope failed");
+    }
+
+    // KV path
+    if (!q8_0_matvec_cuda(d_x_normed, d_wkv, d_kv_a, kv_dim, dim)) {
+        throw std::runtime_error("wkv failed");
+    }
+    if (!rmsnorm_bf16_gamma_cuda(d_kv_a, d_kv_gamma, d_kv, kv_dim, 1e-6f)) {
+        throw std::runtime_error("kv_norm failed");
+    }
+    if (!head_rmsnorm_rope_cuda(d_kv, /*heads=*/1, kv_dim, rope_dim,
+                                position,
+                                static_cast<float>(ctx.config.rope_theta),
+                                false, 0.0f)) {
+        throw std::runtime_error("kv head rope failed");
+    }
+    check_cuda(cudaDeviceSynchronize(), "sync after q/kv");
+
+    GgufAttnFullResult r;
+    r.dim = dim;
+    r.q_a_dim = q_a_dim;
+    r.heads = heads;
+    r.head_dim = head_dim;
+    r.kv_dim = kv_dim;
+    r.rope_dim = rope_dim;
+    r.o_groups = o_groups;
+    r.o_lora_rank = o_lora_rank;
+    r.attn_mid = attn_mid;
+    r.q_rms = device_vector_rms(d_q, q_full);
+    r.kv_rms = device_vector_rms(d_kv, kv_dim);
+
+    // Sparse single-token attention against the (single) current KV vector.
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    if (!single_token_sparse_attention_cuda(d_q, d_kv, d_attn_sink, d_attn_value,
+                                            heads, head_dim, scale)) {
+        throw std::runtime_error("single_token_sparse_attention failed");
+    }
+    check_cuda(cudaDeviceSynchronize(), "sync after attn");
+    r.attn_value_rms = device_vector_rms(d_attn_value, q_full);
+
+    // Inverse RoPE on the rope-tail of each head (V was rope-rotated as part of
+    // KV; undo it before output projection so subsequent layers see consistent
+    // representations). do_rmsnorm=false (just inverse rope).
+    if (!head_rmsnorm_rope_cuda(d_attn_value, heads, head_dim, rope_dim,
+                                position,
+                                static_cast<float>(ctx.config.rope_theta),
+                                /*inverse=*/true, 0.0f)) {
+        throw std::runtime_error("inverse rope failed");
+    }
+    check_cuda(cudaDeviceSynchronize(), "sync after inverse rope");
+    r.attn_value_post_inv_rms = device_vector_rms(d_attn_value, q_full);
+
+    // Grouped wo_a: per-group matvec [group_in_dim] -> [o_lora_rank].
+    // wo_a Q8_0 is laid out [output=attn_mid, input=group_in_dim] row-major,
+    // so group g occupies rows [g*o_lora_rank, (g+1)*o_lora_rank) which is a
+    // contiguous byte range of o_lora_rank * (group_in_dim/32) * 34 bytes.
+    const size_t group_w_bytes =
+        static_cast<size_t>(o_lora_rank) *
+        static_cast<size_t>((group_in_dim + 31) / 32) * 34;
+    for (int g = 0; g < o_groups; ++g) {
+        const float* group_x = d_attn_value + static_cast<size_t>(g) * group_in_dim;
+        const uint8_t* group_w = d_wo_a + static_cast<size_t>(g) * group_w_bytes;
+        float* group_y = d_attn_mid + static_cast<size_t>(g) * o_lora_rank;
+        if (!q8_0_matvec_cuda(group_x, group_w, group_y, o_lora_rank, group_in_dim)) {
+            throw std::runtime_error("wo_a group matvec failed");
+        }
+    }
+
+    // wo_b: [attn_mid] -> [dim]
+    if (!q8_0_matvec_cuda(d_attn_mid, d_wo_b, d_attn_out, dim, attn_mid)) {
+        throw std::runtime_error("wo_b failed");
+    }
+    check_cuda(cudaDeviceSynchronize(), "sync after wo_b");
+
+    r.attn_mid_rms = device_vector_rms(d_attn_mid, attn_mid);
+    r.attn_out_rms = device_vector_rms(d_attn_out, dim);
+    std::vector<float> first(4);
+    check_cuda(cudaMemcpy(first.data(), d_attn_out, 4 * sizeof(float),
+                          cudaMemcpyDeviceToHost), "copy attn_out first");
+    for (int i = 0; i < 4; ++i) r.attn_out_first[i] = first[i];
+
+    cudaFree(d_row_f16);
+    cudaFree(d_attn_gamma);
+    cudaFree(d_q_gamma);
+    cudaFree(d_kv_gamma);
+    cudaFree(d_wq_a);
+    cudaFree(d_wq_b);
+    cudaFree(d_wkv);
+    cudaFree(d_wo_a);
+    cudaFree(d_wo_b);
+    cudaFree(d_attn_sink);
+    cudaFree(d_x);
+    cudaFree(d_x_normed);
+    cudaFree(d_q_a);
+    cudaFree(d_q_normed);
+    cudaFree(d_q);
+    cudaFree(d_kv_a);
+    cudaFree(d_kv);
+    cudaFree(d_attn_value);
+    cudaFree(d_attn_mid);
+    cudaFree(d_attn_out);
+    return r;
+}
+
 // --- PersistentEngine implementation ---------------------------------------
 
 struct PersistentEngine::State {
