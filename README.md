@@ -89,6 +89,74 @@ Real HTTP `stream=true` SSE test with different realistic prompts and no warmup:
 
 Current GGUF Q2 conclusion: the prefill path is close to the best result reached by the current architecture for this checkpoint and hardware. Repeated or later requests become much faster in prefill/TTFC because the staged GGUF expert path and OS/GPU caches are hot, but decode remains limited by active-expert cache misses/H2D copies plus TP all-reduce/finalize and long-context attention cost. Short warm-cache decode can reach about 4.8 tok/s, while realistic heterogeneous streaming and long-output decode are typically about 3.7-3.9 tok/s. Further large gains likely require decode-side work such as better active-expert cache scheduling or reducing communication/copy cost, not more prefill kernel tuning.
 
+## C++ engine (cpp_engine)
+
+In addition to the PyTorch runtime above, this repository ships a native C++/CUDA inference engine under `cpp_engine/`. It loads the same DeepSeek-V4-Flash FP4 checkpoint but drives the model from a standalone binary, removing Python/PyTorch per-step overhead. Rank 0 embeds an OpenAI-compatible HTTP server (cpp-httplib + SSE); ranks 1-3 are NCCL workers driven over a CPU command channel. Tokenization and chat templating run inside a long-lived Python sidecar that reuses `src/encoding/dsv4.py`, so prompt template, tool-call format, and reasoning-effort handling match the Python server.
+
+Validated FP4 performance on the same 4 x RTX 2080 Ti machine, TP=4, with all defaults:
+
+| Scenario | Prompt tokens | Prefill | Prefill TPS | Decode TPS | Peak GPU/rank |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Short prompt | 2,101 | ~7.6s | ~275 tok/s | ~3.7 tok/s | ~7 GiB |
+| 32K context | 32,768 | ~82s | ~402 tok/s | n/a | ~11.2 GiB |
+| 64K context (max validated) | 65,536 | ~164s | ~401 tok/s | ~3.7 tok/s | ~14.5 GiB |
+
+64K is the maximum context validated end-to-end so far; the 14.5 GiB peak per rank still leaves room on 22 GiB cards. At 64K, prefill is roughly 1.6x faster than the PyTorch FP4 path (164s vs 257s). Decode TPS at FP4 is similar to PyTorch because the bottleneck is PCIe expert staging, not host overhead.
+
+Long-context prefill relies on two paths that are on by default:
+
+- **Chunked prefill** (`DSV4_CPP_PREFILL_CHUNK_TOKENS`, default `4096`): wraps each layer's body in a chunk loop so scratch stays chunk-sized instead of `token_count`-sized. Without it, 64K prompts OOM at the ~22 GiB attention-scratch allocation.
+- **Batched sparse attention** (`DSV4_CPP_PREFILL_BATCHED_ATTN`, default `1`): replaces the per-token attention kernel with a single batched kernel; ~8.6x faster on 64K (1415s → 164s). Set `=0` to fall back to the per-token path (kept for debugging).
+
+### Build
+
+CUDA Toolkit and NCCL are required (NCCL is auto-detected; pass `-DNCCL_ROOT=/path/to/nccl` if it lives outside the default search path):
+
+```bash
+cmake -S cpp_engine -B build/cpp_engine -DCMAKE_BUILD_TYPE=Release
+cmake --build build/cpp_engine -j
+```
+
+The resulting binary is `build/cpp_engine/dsv4_cpp_engine`.
+
+### Run the OpenAI-compatible server
+
+The launch script forks 4 ranks (one per GPU) and exposes the OpenAI API on `$PORT`:
+
+```bash
+CKPT=/path/to/DeepSeek-V4-Flash \
+PORT=8000 \
+MAX_CONTEXT=8192 \
+PYTHON=/path/to/python \
+bash scripts/run_cpp_serve_tp4.sh
+```
+
+`CKPT` should point at the original DeepSeek-V4-Flash FP4 safetensors directory (not the W8A8 conversion used by the PyTorch path). `PYTHON` just needs `transformers` installed; the sidecar imports `src/encoding/dsv4` directly from the repo.
+
+To serve 64K-token prompts, raise `MAX_CONTEXT` to at least `65536 + max_completion_tokens` (e.g. `73728`):
+
+```bash
+CKPT=/path/to/DeepSeek-V4-Flash \
+MAX_CONTEXT=73728 \
+bash scripts/run_cpp_serve_tp4.sh
+```
+
+Per-rank logs land at `/tmp/dsv4_cpp_serve_rank{0..3}.log` by default (`LOG_DIR=/some/dir` to override). The API surface is the same OpenAI chat-completions subset described in [Quickstart](#quickstart); point clients at `http://<host>:$PORT/v1/chat/completions`.
+
+Common overrides for `scripts/run_cpp_serve_tp4.sh`:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CKPT` | local path | DeepSeek-V4-Flash FP4 safetensors directory. |
+| `PORT` | `8000` | HTTP port on rank 0. |
+| `MAX_CONTEXT` | `8192` | Maximum prompt + completion length; sizes the KV cache. |
+| `PYTHON` | `python` | Python for the tokenizer sidecar. |
+| `SIDECAR` | `src/server/cpp_sidecar.py` | Tokenizer / template sidecar script. |
+| `BIN` | `build/cpp_engine/dsv4_cpp_engine` | C++ engine binary path. |
+| `NCCL_ID` | `/tmp/dsv4_cpp_serve_nccl.id` | NCCL rendezvous file. |
+| `LOG_DIR` | `/tmp` | Per-rank log directory. |
+| `EXTRA_ENV` | unset | Extra env injected per rank, e.g. `EXTRA_ENV='DSV4_CPP_PREFILL_CHUNK_TOKENS=8192'`. |
+
 ## Quickstart
 
 ```bash
