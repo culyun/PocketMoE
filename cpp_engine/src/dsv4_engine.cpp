@@ -3572,6 +3572,144 @@ GgufAttnNormWqaResult run_gguf_attn_norm_wq_a_smoke(const std::string& ckpt_path
     return r;
 }
 
+GgufAttnQPathResult run_gguf_attn_q_path_smoke(const std::string& ckpt_path,
+                                                int token,
+                                                int position) {
+    if (!is_gguf_path(ckpt_path)) {
+        throw std::runtime_error("run_gguf_attn_q_path_smoke: not a GGUF path: " + ckpt_path);
+    }
+    if (token < 0) throw std::runtime_error("token must be >= 0");
+    if (position < 0) throw std::runtime_error("position must be >= 0");
+
+    GgufForwardContext ctx(ckpt_path);
+    WeightSource& ws = *ctx.weight_source;
+
+    WeightView embed = ws.require("embed.weight");
+    WeightView attn_norm = ws.require("layers.0.attn_norm.weight");
+    WeightView wq_a = ws.require("layers.0.attn.wq_a.weight");
+    WeightView q_norm = ws.require("layers.0.attn.q_norm.weight");
+    WeightView wq_b = ws.require("layers.0.attn.wq_b.weight");
+
+    if (embed.dtype != DType::F16) throw std::runtime_error("embed dtype");
+    if (attn_norm.dtype != DType::F32) throw std::runtime_error("attn_norm dtype");
+    if (q_norm.dtype != DType::F32) throw std::runtime_error("q_norm dtype");
+    if (wq_a.dtype != DType::Q8_0) throw std::runtime_error("wq_a dtype");
+    if (wq_b.dtype != DType::Q8_0) throw std::runtime_error("wq_b dtype");
+
+    const int dim = static_cast<int>(embed.shape[0]);
+    const int q_a_dim = static_cast<int>(wq_a.shape[1]);
+    // wq_b is stored [q_a_dim, heads*head_dim] in GGUF (cols fastest).
+    if (static_cast<int>(wq_b.shape[0]) != q_a_dim) {
+        throw std::runtime_error("wq_b inner dim != q_a_dim");
+    }
+    const int q_full = static_cast<int>(wq_b.shape[1]);
+    const int heads = static_cast<int>(ctx.config.n_heads);
+    if (heads <= 0) throw std::runtime_error("n_heads not set");
+    if (q_full % heads != 0) {
+        throw std::runtime_error("wq_b output cols not divisible by n_heads");
+    }
+    const int head_dim = q_full / heads;
+    const int rope_dim = static_cast<int>(ctx.config.rope_dim);
+    if (rope_dim <= 0 || rope_dim > head_dim) {
+        throw std::runtime_error("rope_dim out of range");
+    }
+
+    // ----- Embed -----
+    const uint16_t* host_row =
+        reinterpret_cast<const uint16_t*>(embed.data) +
+        static_cast<size_t>(token) * dim;
+    uint16_t* d_row_f16 = nullptr;
+    float* d_x = nullptr;
+    check_cuda(cudaMalloc(&d_row_f16, dim * sizeof(uint16_t)), "alloc d_row_f16");
+    check_cuda(cudaMalloc(&d_x, dim * sizeof(float)), "alloc d_x");
+    check_cuda(cudaMemcpy(d_row_f16, host_row, dim * sizeof(uint16_t),
+                          cudaMemcpyHostToDevice), "copy embed row");
+    if (!f16_row_to_float_cuda(d_row_f16, d_x, /*row=*/0, dim)) {
+        throw std::runtime_error("f16_row_to_float_cuda failed");
+    }
+
+    // ----- attn_norm gamma -----
+    auto attn_bf16 = f32_to_bf16_host(reinterpret_cast<const float*>(attn_norm.data), dim);
+    uint16_t* d_attn_gamma = nullptr;
+    check_cuda(cudaMalloc(&d_attn_gamma, dim * sizeof(uint16_t)), "alloc d_attn_gamma");
+    check_cuda(cudaMemcpy(d_attn_gamma, attn_bf16.data(), dim * sizeof(uint16_t),
+                          cudaMemcpyHostToDevice), "copy attn_gamma");
+    float* d_x_normed = nullptr;
+    check_cuda(cudaMalloc(&d_x_normed, dim * sizeof(float)), "alloc d_x_normed");
+    if (!rmsnorm_bf16_gamma_cuda(d_x, d_attn_gamma, d_x_normed, dim, 1e-6f)) {
+        throw std::runtime_error("rmsnorm attn failed");
+    }
+
+    // ----- wq_a -----
+    uint8_t* d_wq_a = nullptr;
+    check_cuda(cudaMalloc(&d_wq_a, wq_a.nbytes), "alloc d_wq_a");
+    check_cuda(cudaMemcpy(d_wq_a, wq_a.data, wq_a.nbytes, cudaMemcpyHostToDevice), "copy wq_a");
+    float* d_q_a = nullptr;
+    check_cuda(cudaMalloc(&d_q_a, q_a_dim * sizeof(float)), "alloc d_q_a");
+    if (!q8_0_matvec_cuda(d_x_normed, d_wq_a, d_q_a, q_a_dim, dim)) {
+        throw std::runtime_error("q8_0 wq_a failed");
+    }
+
+    // ----- q_norm gamma -----
+    auto q_bf16 = f32_to_bf16_host(reinterpret_cast<const float*>(q_norm.data), q_a_dim);
+    uint16_t* d_q_gamma = nullptr;
+    check_cuda(cudaMalloc(&d_q_gamma, q_a_dim * sizeof(uint16_t)), "alloc d_q_gamma");
+    check_cuda(cudaMemcpy(d_q_gamma, q_bf16.data(), q_a_dim * sizeof(uint16_t),
+                          cudaMemcpyHostToDevice), "copy q_gamma");
+    float* d_q_normed = nullptr;
+    check_cuda(cudaMalloc(&d_q_normed, q_a_dim * sizeof(float)), "alloc d_q_normed");
+    if (!rmsnorm_bf16_gamma_cuda(d_q_a, d_q_gamma, d_q_normed, q_a_dim, 1e-6f)) {
+        throw std::runtime_error("rmsnorm q failed");
+    }
+
+    // ----- wq_b -> q[heads*head_dim] -----
+    uint8_t* d_wq_b = nullptr;
+    check_cuda(cudaMalloc(&d_wq_b, wq_b.nbytes), "alloc d_wq_b");
+    check_cuda(cudaMemcpy(d_wq_b, wq_b.data, wq_b.nbytes, cudaMemcpyHostToDevice), "copy wq_b");
+    float* d_q = nullptr;
+    check_cuda(cudaMalloc(&d_q, q_full * sizeof(float)), "alloc d_q");
+    if (!q8_0_matvec_cuda(d_q_normed, d_wq_b, d_q, q_full, q_a_dim)) {
+        throw std::runtime_error("q8_0 wq_b failed");
+    }
+    check_cuda(cudaDeviceSynchronize(), "sync after wq_b");
+
+    GgufAttnQPathResult r;
+    r.dim = dim;
+    r.q_a_dim = q_a_dim;
+    r.heads = heads;
+    r.head_dim = head_dim;
+    r.rope_dim = rope_dim;
+    r.q_normed_rms = device_vector_rms(d_q_normed, q_a_dim);
+    r.q_pre_rope_rms = device_vector_rms(d_q, q_full);
+
+    // ----- head-wise RMSNorm + RoPE -----
+    if (!head_rmsnorm_rope_cuda(d_q, heads, head_dim, rope_dim,
+                                position,
+                                static_cast<float>(ctx.config.rope_theta),
+                                false, 1e-6f)) {
+        throw std::runtime_error("head_rmsnorm_rope failed");
+    }
+    check_cuda(cudaDeviceSynchronize(), "sync after head rope");
+
+    r.q_post_rope_rms = device_vector_rms(d_q, q_full);
+    std::vector<float> first(4);
+    check_cuda(cudaMemcpy(first.data(), d_q, 4 * sizeof(float), cudaMemcpyDeviceToHost),
+               "copy q first");
+    for (int i = 0; i < 4; ++i) r.q_first[i] = first[i];
+
+    cudaFree(d_row_f16);
+    cudaFree(d_x);
+    cudaFree(d_attn_gamma);
+    cudaFree(d_x_normed);
+    cudaFree(d_wq_a);
+    cudaFree(d_q_a);
+    cudaFree(d_q_gamma);
+    cudaFree(d_q_normed);
+    cudaFree(d_wq_b);
+    cudaFree(d_q);
+    return r;
+}
+
 // --- PersistentEngine implementation ---------------------------------------
 
 struct PersistentEngine::State {

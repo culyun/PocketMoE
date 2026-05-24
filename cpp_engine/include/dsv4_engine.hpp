@@ -94,4 +94,21 @@ struct GgufAttnNormWqaResult {
 
 GgufAttnNormWqaResult run_gguf_attn_norm_wq_a_smoke(const std::string& ckpt_path, int token);
 
+// Phase 3 step: full attention Q path for layer 0. Extends the q_a smoke
+// through q_norm RMSNorm, wq_b Q8_0 projection, and head_rmsnorm_rope.
+// Output is the final per-head Q tensor ready to feed attention compute.
+struct GgufAttnQPathResult {
+    int dim = 0;
+    int q_a_dim = 0;
+    int heads = 0;
+    int head_dim = 0;
+    int rope_dim = 0;
+    float q_normed_rms = 0.0f;     // RMS of q_a after q_norm
+    float q_pre_rope_rms = 0.0f;   // RMS of q (heads*head_dim) after wq_b, before head norm/rope
+    float q_post_rope_rms = 0.0f;  // RMS of q after head_rmsnorm_rope
+    float q_first[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+};
+
+GgufAttnQPathResult run_gguf_attn_q_path_smoke(const std::string& ckpt_path, int token, int position);
+
 }  // namespace dsv4
