@@ -3508,6 +3508,223 @@ float device_vector_rms(const float* d_x, int n) {
     return n > 0 ? static_cast<float>(std::sqrt(s / n)) : 0.0f;
 }
 
+// ---- Per-layer GGUF forward helper -----------------------------------------
+//
+// Inputs:
+//   - GgufLayerDeviceWeights: all dense weights already staged on device
+//     (attention Q8_0 + norms BF16 + shared experts Q8_0 + gate W BF16 + EITHER
+//     tid2eid_i64 [topk] for hash layers OR exp_probs_b bias F32 [n_experts]
+//     for non-hash) + top-k routed Q2 experts packed into 3 device buffers.
+//   - GgufLayerScratch: pre-allocated activation + staging buffers.
+//   - GgufLayerDims: dim/heads/etc.
+//   - token: used by hash gate's tid2eid lookup; ignored otherwise.
+//   - position: for RoPE.
+// In-place: reads s.d_x [dim], writes back s.d_x [dim] after both residuals.
+// For non-hash layers, the chosen expert ids land in s.d_gate_indices.
+
+struct GgufLayerDeviceWeights {
+    const uint16_t* d_attn_gamma = nullptr;
+    const uint16_t* d_q_gamma = nullptr;
+    const uint16_t* d_kv_gamma = nullptr;
+    const uint8_t* d_wq_a = nullptr;
+    const uint8_t* d_wq_b = nullptr;
+    const uint8_t* d_wkv = nullptr;
+    const uint8_t* d_wo_a = nullptr;
+    const uint8_t* d_wo_b = nullptr;
+    const float* d_attn_sink = nullptr;
+
+    const uint16_t* d_ffn_gamma = nullptr;
+    const uint8_t* d_shared_w1 = nullptr;
+    const uint8_t* d_shared_w2 = nullptr;
+    const uint8_t* d_shared_w3 = nullptr;
+
+    const uint16_t* d_gate_w_bf16 = nullptr;
+    bool is_hash = false;
+    const int64_t* d_tid2eid_i64 = nullptr;  // hash only: [topk] for this token
+    const float* d_gate_bias_f32 = nullptr;  // non-hash only: [n_experts]
+
+    const uint8_t* d_routed_w1 = nullptr;
+    const uint8_t* d_routed_w2 = nullptr;
+    const uint8_t* d_routed_w3 = nullptr;
+};
+
+struct GgufLayerDims {
+    int dim = 0;
+    int q_a_dim = 0;
+    int heads = 0;
+    int head_dim = 0;
+    int q_full = 0;          // heads * head_dim
+    int kv_dim = 0;
+    int rope_dim = 0;
+    int o_groups = 0;
+    int o_lora_rank = 0;
+    int group_in_dim = 0;
+    int attn_mid = 0;
+    int moe_inter = 0;
+    int n_experts = 0;
+    int topk = 0;
+    float rope_theta = 0.0f;
+    float swiglu_limit = 0.0f;
+    float route_scale = 0.0f;
+};
+
+struct GgufLayerScratch {
+    // hidden state (read at entry, written at exit)
+    float* d_x = nullptr;
+    // attention scratch
+    float* d_x_pre_attn = nullptr;
+    float* d_x_normed = nullptr;
+    float* d_q_a = nullptr;
+    float* d_q_normed = nullptr;
+    float* d_q = nullptr;
+    float* d_kv_a = nullptr;
+    float* d_kv = nullptr;
+    float* d_attn_value = nullptr;
+    float* d_attn_mid = nullptr;
+    float* d_attn_out = nullptr;
+    // FFN scratch
+    float* d_x_pre_ffn = nullptr;
+    float* d_x_normed_ffn = nullptr;
+    float* d_shared_gate = nullptr;
+    float* d_shared_up = nullptr;
+    float* d_shared_hidden = nullptr;
+    float* d_shared_out = nullptr;
+    float* d_moe_out = nullptr;
+    float* d_ffn_combined = nullptr;
+    // routed MoE staging
+    int8_t* d_x_q = nullptr;
+    float* d_x_scale = nullptr;
+    int64_t* d_route_slots = nullptr;     // [topk] = {0,1,..k-1}
+    float* d_route_weights = nullptr;     // [topk]
+    float* d_route_gate = nullptr;        // [topk, moe_inter]
+    float* d_route_up = nullptr;          // [topk, moe_inter]
+    int8_t* d_route_hidden_q = nullptr;   // [topk, moe_inter]
+    float* d_route_hidden_scale = nullptr; // [topk, hidden_groups]
+    // gate scratch
+    float* d_gate_scores_scratch = nullptr; // hash:[topk]; non-hash:[n_experts]
+    float* d_gate_scored_scratch = nullptr; // non-hash only: [n_experts]
+    int64_t* d_gate_indices = nullptr;    // [topk]
+};
+
+void gguf_layer_forward(const GgufLayerDeviceWeights& w,
+                        GgufLayerScratch& s,
+                        const GgufLayerDims& d,
+                        int token,
+                        int position) {
+    const int routes = d.topk;
+
+    // ===== Attention =====
+    check_cuda(cudaMemcpy(s.d_x_pre_attn, s.d_x, d.dim * sizeof(float),
+                          cudaMemcpyDeviceToDevice), "save x_pre_attn");
+    if (!rmsnorm_bf16_gamma_cuda(s.d_x, w.d_attn_gamma, s.d_x_normed, d.dim, 1e-6f))
+        throw std::runtime_error("attn_norm failed");
+    if (!q8_0_matvec_cuda(s.d_x_normed, w.d_wq_a, s.d_q_a, d.q_a_dim, d.dim))
+        throw std::runtime_error("wq_a failed");
+    if (!rmsnorm_bf16_gamma_cuda(s.d_q_a, w.d_q_gamma, s.d_q_normed, d.q_a_dim, 1e-6f))
+        throw std::runtime_error("q_norm failed");
+    if (!q8_0_matvec_cuda(s.d_q_normed, w.d_wq_b, s.d_q, d.q_full, d.q_a_dim))
+        throw std::runtime_error("wq_b failed");
+    if (!head_rmsnorm_rope_cuda(s.d_q, d.heads, d.head_dim, d.rope_dim, position,
+                                d.rope_theta, false, 1e-6f))
+        throw std::runtime_error("q head rope failed");
+    if (!q8_0_matvec_cuda(s.d_x_normed, w.d_wkv, s.d_kv_a, d.kv_dim, d.dim))
+        throw std::runtime_error("wkv failed");
+    if (!rmsnorm_bf16_gamma_cuda(s.d_kv_a, w.d_kv_gamma, s.d_kv, d.kv_dim, 1e-6f))
+        throw std::runtime_error("kv_norm failed");
+    if (!head_rmsnorm_rope_cuda(s.d_kv, /*heads=*/1, d.kv_dim, d.rope_dim, position,
+                                d.rope_theta, false, 0.0f))
+        throw std::runtime_error("kv head rope failed");
+    const float scale = 1.0f / std::sqrt(static_cast<float>(d.head_dim));
+    if (!single_token_sparse_attention_cuda(s.d_q, s.d_kv, w.d_attn_sink,
+                                            s.d_attn_value, d.heads, d.head_dim, scale))
+        throw std::runtime_error("sparse_attention failed");
+    if (!head_rmsnorm_rope_cuda(s.d_attn_value, d.heads, d.head_dim, d.rope_dim,
+                                position, d.rope_theta, /*inverse=*/true, 0.0f))
+        throw std::runtime_error("inverse rope failed");
+    const size_t group_w_bytes =
+        static_cast<size_t>(d.o_lora_rank) *
+        static_cast<size_t>((d.group_in_dim + 31) / 32) * 34;
+    for (int g = 0; g < d.o_groups; ++g) {
+        const float* group_x = s.d_attn_value + static_cast<size_t>(g) * d.group_in_dim;
+        const uint8_t* group_w = w.d_wo_a + static_cast<size_t>(g) * group_w_bytes;
+        float* group_y = s.d_attn_mid + static_cast<size_t>(g) * d.o_lora_rank;
+        if (!q8_0_matvec_cuda(group_x, group_w, group_y, d.o_lora_rank, d.group_in_dim))
+            throw std::runtime_error("wo_a group matvec failed");
+    }
+    if (!q8_0_matvec_cuda(s.d_attn_mid, w.d_wo_b, s.d_attn_out, d.dim, d.attn_mid))
+        throw std::runtime_error("wo_b failed");
+    // Attention residual.
+    if (!vector_add_cuda(s.d_x_pre_attn, s.d_attn_out, s.d_x, d.dim))
+        throw std::runtime_error("attn residual add failed");
+
+    // ===== FFN =====
+    check_cuda(cudaMemcpy(s.d_x_pre_ffn, s.d_x, d.dim * sizeof(float),
+                          cudaMemcpyDeviceToDevice), "save x_pre_ffn");
+    if (!rmsnorm_bf16_gamma_cuda(s.d_x, w.d_ffn_gamma, s.d_x_normed_ffn, d.dim, 1e-6f))
+        throw std::runtime_error("ffn_norm failed");
+
+    // Shared expert (Q8_0 w1/w3 + silu_mul + Q8_0 w2).
+    if (!q8_0_matvec_cuda(s.d_x_normed_ffn, w.d_shared_w1, s.d_shared_gate,
+                          d.moe_inter, d.dim))
+        throw std::runtime_error("shared w1 failed");
+    if (!q8_0_matvec_cuda(s.d_x_normed_ffn, w.d_shared_w3, s.d_shared_up,
+                          d.moe_inter, d.dim))
+        throw std::runtime_error("shared w3 failed");
+    if (!silu_mul_cuda(s.d_shared_gate, s.d_shared_up, s.d_shared_hidden, d.moe_inter))
+        throw std::runtime_error("shared silu_mul failed");
+    if (!q8_0_matvec_cuda(s.d_shared_hidden, w.d_shared_w2, s.d_shared_out,
+                          d.dim, d.moe_inter))
+        throw std::runtime_error("shared w2 failed");
+
+    // Gate scoring → route weights + indices.
+    if (w.is_hash) {
+        // tid2eid lookup happens inside kernel; we pre-staged the per-token slice.
+        if (!gate_hash_bf16_cuda(s.d_x_normed_ffn, w.d_gate_w_bf16, w.d_tid2eid_i64,
+                                 s.d_gate_scores_scratch, s.d_gate_indices,
+                                 s.d_route_weights,
+                                 /*token=*/0, /*cols=*/d.dim,
+                                 /*table_topk=*/d.topk, /*topk=*/d.topk,
+                                 d.route_scale))
+            throw std::runtime_error("gate_hash_bf16_cuda failed");
+    } else {
+        if (!gate_topk_bf16_cuda_with_buffers(
+                s.d_x_normed_ffn, w.d_gate_w_bf16, w.d_gate_bias_f32,
+                s.d_gate_scores_scratch, s.d_gate_scored_scratch,
+                s.d_gate_indices, s.d_route_weights,
+                d.n_experts, d.dim, d.topk, d.route_scale))
+            throw std::runtime_error("gate_topk_bf16_cuda failed");
+    }
+
+    // Routed Q2 MoE: q8_1 x → IQ2_XXS w13 → SwiGLU + route_weight + q8_1 hidden
+    // → Q2_K w2 (atomicAdd across routes).
+    check_cuda(cudaMemset(s.d_moe_out, 0, d.dim * sizeof(float)), "zero moe_out");
+    if (!q2_quantize_x_q8_1_cuda(s.d_x_normed_ffn, s.d_x_q, s.d_x_scale,
+                                  /*routes=*/1, d.dim))
+        throw std::runtime_error("q2_quantize_x_q8_1 failed");
+    if (!q2_moe_single_w13_iq2_xxs_cuda(s.d_x_q, s.d_x_scale, s.d_route_slots,
+                                         w.d_routed_w1, w.d_routed_w3,
+                                         s.d_route_gate, s.d_route_up,
+                                         routes, /*n_experts=*/routes,
+                                         d.dim, d.moe_inter))
+        throw std::runtime_error("q2 w13 iq2_xxs failed");
+    if (!q2_route_swiglu_quantize_hidden_q8_1_cuda(
+            s.d_route_gate, s.d_route_up, s.d_route_weights,
+            s.d_route_hidden_q, s.d_route_hidden_scale,
+            routes, d.moe_inter, d.swiglu_limit))
+        throw std::runtime_error("q2 swiglu + quantize failed");
+    if (!q2_moe_single_w2_q2k_cuda(s.d_route_hidden_q, s.d_route_hidden_scale,
+                                    s.d_route_slots, w.d_routed_w2, s.d_moe_out,
+                                    routes, /*n_experts=*/routes,
+                                    d.dim, d.moe_inter))
+        throw std::runtime_error("q2 w2 q2k failed");
+
+    // FFN residual: x = x_pre_ffn + (shared_out + moe_out).
+    if (!vector_add_cuda(s.d_shared_out, s.d_moe_out, s.d_ffn_combined, d.dim))
+        throw std::runtime_error("ffn combined add failed");
+    if (!vector_add_cuda(s.d_x_pre_ffn, s.d_ffn_combined, s.d_x, d.dim))
+        throw std::runtime_error("ffn residual add failed");
+}
+
 }  // namespace
 
 GgufAttnNormWqaResult run_gguf_attn_norm_wq_a_smoke(const std::string& ckpt_path, int token) {
@@ -4963,150 +5180,86 @@ GgufLayer0FullResult run_gguf_layer0_full_smoke(const std::string& ckpt_path,
 
     // ===== compute =====
 
-    // 1. Embed.
+    // 1. Embed (runs once before the first layer's forward).
     if (!f16_row_to_float_cuda(d_row_f16, d_x, /*row=*/0, dim)) {
         throw std::runtime_error("f16 embed failed");
     }
-    // Save x_pre_attn = d_x for attention residual.
-    check_cuda(cudaMemcpy(d_x_pre_attn, d_x, dim * sizeof(float),
-                          cudaMemcpyDeviceToDevice), "save x_pre_attn");
 
-    // 2. Attention.
-    if (!rmsnorm_bf16_gamma_cuda(d_x, d_attn_gamma, d_x_normed, dim, 1e-6f)) {
-        throw std::runtime_error("attn_norm failed");
-    }
-    // Q-path.
-    if (!q8_0_matvec_cuda(d_x_normed, d_wq_a, d_q_a, q_a_dim, dim)) {
-        throw std::runtime_error("wq_a failed");
-    }
-    if (!rmsnorm_bf16_gamma_cuda(d_q_a, d_q_gamma, d_q_normed, q_a_dim, 1e-6f)) {
-        throw std::runtime_error("q_norm failed");
-    }
-    if (!q8_0_matvec_cuda(d_q_normed, d_wq_b, d_q, q_full, q_a_dim)) {
-        throw std::runtime_error("wq_b failed");
-    }
-    if (!head_rmsnorm_rope_cuda(d_q, heads, head_dim, rope_dim, position,
-                                static_cast<float>(ctx.config.rope_theta),
-                                false, 1e-6f)) {
-        throw std::runtime_error("q head rope failed");
-    }
-    // KV-path.
-    if (!q8_0_matvec_cuda(d_x_normed, d_wkv, d_kv_a, kv_dim, dim)) {
-        throw std::runtime_error("wkv failed");
-    }
-    if (!rmsnorm_bf16_gamma_cuda(d_kv_a, d_kv_gamma, d_kv, kv_dim, 1e-6f)) {
-        throw std::runtime_error("kv_norm failed");
-    }
-    if (!head_rmsnorm_rope_cuda(d_kv, /*heads=*/1, kv_dim, rope_dim, position,
-                                static_cast<float>(ctx.config.rope_theta),
-                                false, 0.0f)) {
-        throw std::runtime_error("kv head rope failed");
-    }
-    // Sparse attention.
-    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    if (!single_token_sparse_attention_cuda(d_q, d_kv, d_attn_sink, d_attn_value,
-                                            heads, head_dim, scale)) {
-        throw std::runtime_error("single_token_sparse_attention failed");
-    }
-    // Inverse RoPE on V tail.
-    if (!head_rmsnorm_rope_cuda(d_attn_value, heads, head_dim, rope_dim, position,
-                                static_cast<float>(ctx.config.rope_theta),
-                                /*inverse=*/true, 0.0f)) {
-        throw std::runtime_error("inverse rope failed");
-    }
-    // Grouped wo_a.
-    const size_t group_w_bytes =
-        static_cast<size_t>(o_lora_rank) *
-        static_cast<size_t>((group_in_dim + 31) / 32) * 34;
-    for (int g = 0; g < o_groups; ++g) {
-        const float* group_x = d_attn_value + static_cast<size_t>(g) * group_in_dim;
-        const uint8_t* group_w = d_wo_a + static_cast<size_t>(g) * group_w_bytes;
-        float* group_y = d_attn_mid + static_cast<size_t>(g) * o_lora_rank;
-        if (!q8_0_matvec_cuda(group_x, group_w, group_y, o_lora_rank, group_in_dim)) {
-            throw std::runtime_error("wo_a group matvec failed");
-        }
-    }
-    if (!q8_0_matvec_cuda(d_attn_mid, d_wo_b, d_attn_out, dim, attn_mid)) {
-        throw std::runtime_error("wo_b failed");
-    }
+    // 2-9. Per-layer forward via shared helper (attention + FFN + residuals).
+    GgufLayerDeviceWeights lw;
+    lw.d_attn_gamma = d_attn_gamma;
+    lw.d_q_gamma = d_q_gamma;
+    lw.d_kv_gamma = d_kv_gamma;
+    lw.d_wq_a = d_wq_a;
+    lw.d_wq_b = d_wq_b;
+    lw.d_wkv = d_wkv;
+    lw.d_wo_a = d_wo_a;
+    lw.d_wo_b = d_wo_b;
+    lw.d_attn_sink = d_attn_sink;
+    lw.d_ffn_gamma = d_ffn_gamma;
+    lw.d_shared_w1 = d_shared_w1;
+    lw.d_shared_w2 = d_shared_w2;
+    lw.d_shared_w3 = d_shared_w3;
+    lw.d_gate_w_bf16 = d_gate_w_bf16;
+    lw.is_hash = true;
+    lw.d_tid2eid_i64 = d_tid2eid_i64;
+    lw.d_gate_bias_f32 = nullptr;
+    lw.d_routed_w1 = d_routed_w1;
+    lw.d_routed_w2 = d_routed_w2;
+    lw.d_routed_w3 = d_routed_w3;
 
-    // 3. Attention residual: d_x = d_x_pre_attn + d_attn_out.
-    if (!vector_add_cuda(d_x_pre_attn, d_attn_out, d_x, dim)) {
-        throw std::runtime_error("attn residual add failed");
-    }
-    // Save x_pre_ffn = d_x for FFN residual.
-    check_cuda(cudaMemcpy(d_x_pre_ffn, d_x, dim * sizeof(float),
-                          cudaMemcpyDeviceToDevice), "save x_pre_ffn");
+    GgufLayerDims ld;
+    ld.dim = dim;
+    ld.q_a_dim = q_a_dim;
+    ld.heads = heads;
+    ld.head_dim = head_dim;
+    ld.q_full = q_full;
+    ld.kv_dim = kv_dim;
+    ld.rope_dim = rope_dim;
+    ld.o_groups = o_groups;
+    ld.o_lora_rank = o_lora_rank;
+    ld.group_in_dim = group_in_dim;
+    ld.attn_mid = attn_mid;
+    ld.moe_inter = moe_inter;
+    ld.n_experts = n_experts;
+    ld.topk = topk;
+    ld.rope_theta = static_cast<float>(ctx.config.rope_theta);
+    ld.swiglu_limit = static_cast<float>(ctx.config.swiglu_limit);
+    ld.route_scale = static_cast<float>(ctx.config.route_scale);
 
-    // 4. FFN norm.
-    if (!rmsnorm_bf16_gamma_cuda(d_x, d_ffn_gamma, d_x_normed_ffn, dim, 1e-6f)) {
-        throw std::runtime_error("ffn_norm failed");
-    }
+    GgufLayerScratch ls;
+    ls.d_x = d_x;
+    ls.d_x_pre_attn = d_x_pre_attn;
+    ls.d_x_normed = d_x_normed;
+    ls.d_q_a = d_q_a;
+    ls.d_q_normed = d_q_normed;
+    ls.d_q = d_q;
+    ls.d_kv_a = d_kv_a;
+    ls.d_kv = d_kv;
+    ls.d_attn_value = d_attn_value;
+    ls.d_attn_mid = d_attn_mid;
+    ls.d_attn_out = d_attn_out;
+    ls.d_x_pre_ffn = d_x_pre_ffn;
+    ls.d_x_normed_ffn = d_x_normed_ffn;
+    ls.d_shared_gate = d_shared_gate;
+    ls.d_shared_up = d_shared_up;
+    ls.d_shared_hidden = d_shared_hidden;
+    ls.d_shared_out = d_shared_out;
+    ls.d_moe_out = d_moe_out;
+    ls.d_ffn_combined = d_ffn_combined;
+    ls.d_x_q = d_x_q;
+    ls.d_x_scale = d_x_scale;
+    ls.d_route_slots = d_route_slots;
+    ls.d_route_weights = d_route_weights;
+    ls.d_route_gate = d_route_gate;
+    ls.d_route_up = d_route_up;
+    ls.d_route_hidden_q = d_route_hidden_q;
+    ls.d_route_hidden_scale = d_route_hidden_scale;
+    ls.d_gate_scores_scratch = d_gate_scores_scratch;
+    ls.d_gate_scored_scratch = nullptr;  // hash gate path doesn't need this
+    ls.d_gate_indices = d_gate_indices;
 
-    // 5. Shared expert (Q8_0 w1/w3 + silu_mul + Q8_0 w2).
-    if (!q8_0_matvec_cuda(d_x_normed_ffn, d_shared_w1, d_shared_gate,
-                          moe_inter, dim)) {
-        throw std::runtime_error("shared w1 failed");
-    }
-    if (!q8_0_matvec_cuda(d_x_normed_ffn, d_shared_w3, d_shared_up,
-                          moe_inter, dim)) {
-        throw std::runtime_error("shared w3 failed");
-    }
-    const float swiglu_limit = static_cast<float>(ctx.config.swiglu_limit);
-    if (!silu_mul_cuda(d_shared_gate, d_shared_up, d_shared_hidden,
-                       moe_inter)) {
-        throw std::runtime_error("shared silu_mul failed");
-    }
-    if (!q8_0_matvec_cuda(d_shared_hidden, d_shared_w2, d_shared_out,
-                          dim, moe_inter)) {
-        throw std::runtime_error("shared w2 failed");
-    }
-
-    // 6. Hash-gate route weights.
-    const float route_scale = static_cast<float>(ctx.config.route_scale);
-    if (!gate_hash_bf16_cuda(d_x_normed_ffn, d_gate_w_bf16, d_tid2eid_i64,
-                             d_gate_scores_scratch, d_gate_indices,
-                             d_route_weights,
-                             /*token=*/0, /*cols=*/dim,
-                             /*table_topk=*/topk, /*topk=*/topk,
-                             route_scale)) {
-        throw std::runtime_error("gate_hash_bf16_cuda failed");
-    }
-
-    // 7. Routed MoE (Q2): q8_1 x -> IQ2_XXS w1/w3 -> SwiGLU + route_weight ->
-    // q8_1 hidden -> Q2_K w2 (atomicAdd across routes).
-    if (!q2_quantize_x_q8_1_cuda(d_x_normed_ffn, d_x_q, d_x_scale,
-                                  /*routes=*/1, dim)) {
-        throw std::runtime_error("q2_quantize_x_q8_1 failed");
-    }
-    if (!q2_moe_single_w13_iq2_xxs_cuda(d_x_q, d_x_scale, d_route_slots,
-                                         d_routed_w1, d_routed_w3,
-                                         d_route_gate, d_route_up,
-                                         routes, /*n_experts=*/routes,
-                                         dim, moe_inter)) {
-        throw std::runtime_error("q2 w13 iq2_xxs failed");
-    }
-    if (!q2_route_swiglu_quantize_hidden_q8_1_cuda(
-            d_route_gate, d_route_up, d_route_weights,
-            d_route_hidden_q, d_route_hidden_scale,
-            routes, moe_inter, swiglu_limit)) {
-        throw std::runtime_error("q2 swiglu + quantize failed");
-    }
-    if (!q2_moe_single_w2_q2k_cuda(d_route_hidden_q, d_route_hidden_scale,
-                                    d_route_slots, d_routed_w2, d_moe_out,
-                                    routes, /*n_experts=*/routes,
-                                    dim, moe_inter)) {
-        throw std::runtime_error("q2 w2 q2k failed");
-    }
-
-    // 8. FFN combined: d_ffn_combined = d_shared_out + d_moe_out.
-    if (!vector_add_cuda(d_shared_out, d_moe_out, d_ffn_combined, dim)) {
-        throw std::runtime_error("ffn combined add failed");
-    }
-    // 9. FFN residual: d_x = d_x_pre_ffn + d_ffn_combined.
-    if (!vector_add_cuda(d_x_pre_ffn, d_ffn_combined, d_x, dim)) {
-        throw std::runtime_error("ffn residual add failed");
-    }
+    gguf_layer_forward(lw, ls, ld, token, position);
     check_cuda(cudaDeviceSynchronize(), "sync after layer-0 forward");
 
     GgufLayer0FullResult r;
