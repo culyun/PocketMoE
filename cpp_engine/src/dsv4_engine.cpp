@@ -162,6 +162,38 @@ void all_reduce_sum_fp32_via_bf16_inplace(
 }
 #endif
 
+struct GgufReduceContext {
+    int world = 1;
+    int rank = 0;
+    int device = 0;
+    const char* id_path = nullptr;
+#ifdef DSV4_HAVE_NCCL
+    BF16AllReduceScratch* scratch = nullptr;
+#endif
+};
+
+void gguf_all_reduce_sum_fp32_inplace(float* d_values, int count, const GgufReduceContext* ctx, const char* what) {
+    if (ctx == nullptr || ctx->world <= 1) return;
+#ifdef DSV4_HAVE_NCCL
+    if (ctx->id_path == nullptr || ctx->id_path[0] == '\0') throw std::runtime_error(std::string(what) + " requires NCCL id path");
+    static const bool use_fp32_reduce = [] {
+        const char* v = std::getenv("DSV4_GGUF_REDUCE_FP32");
+        if (v == nullptr) return true;  // default fp32 for Q2 (bf16 round-trip compounds noise)
+        try { return std::stoi(v) != 0; } catch (...) { return true; }
+    }();
+    if (use_fp32_reduce) {
+        nccl_all_reduce_sum_float_inplace(ctx->world, ctx->rank, ctx->device, ctx->id_path, d_values, count);
+        return;
+    }
+    if (ctx->scratch == nullptr) throw std::runtime_error(std::string(what) + " requires BF16 reduce scratch");
+    all_reduce_sum_fp32_via_bf16_inplace(ctx->world, ctx->rank, ctx->device, ctx->id_path, d_values, count, *ctx->scratch);
+#else
+    (void)d_values;
+    (void)count;
+    throw std::runtime_error(std::string(what) + " requires DSV4_HAVE_NCCL");
+#endif
+}
+
 struct WoAInt8Host {
     std::vector<int8_t> weight;
     std::vector<float> scale;
@@ -217,10 +249,37 @@ std::vector<uint8_t> slice_cols_u8(const uint8_t* src, int rows, int cols, int c
     return out;
 }
 
+size_t q8_0_row_bytes(int cols) {
+    return static_cast<size_t>((cols + 31) / 32) * 34;
+}
+
+std::vector<uint8_t> slice_q8_0_rows(const uint8_t* src, int row_start, int rows, int cols) {
+    const size_t row_bytes = q8_0_row_bytes(cols);
+    std::vector<uint8_t> out(static_cast<size_t>(rows) * row_bytes);
+    std::memcpy(out.data(), src + static_cast<size_t>(row_start) * row_bytes, out.size());
+    return out;
+}
+
+std::vector<uint8_t> slice_q8_0_cols(const uint8_t* src, int rows, int cols, int col_start, int col_count) {
+    if ((col_start % 32) != 0 || (col_count % 32) != 0) {
+        throw std::runtime_error("Q8_0 column slices must align to 32 columns");
+    }
+    const int src_blocks = (cols + 31) / 32;
+    const int dst_blocks = (col_count + 31) / 32;
+    std::vector<uint8_t> out(static_cast<size_t>(rows) * static_cast<size_t>(dst_blocks) * 34);
+    for (int r = 0; r < rows; ++r) {
+        const uint8_t* src_row = src + static_cast<size_t>(r) * static_cast<size_t>(src_blocks) * 34 + static_cast<size_t>(col_start / 32) * 34;
+        uint8_t* dst_row = out.data() + static_cast<size_t>(r) * static_cast<size_t>(dst_blocks) * 34;
+        std::memcpy(dst_row, src_row, static_cast<size_t>(dst_blocks) * 34);
+    }
+    return out;
+}
+
 struct RoutedExpert {
     int id = 0;
     float weight = 0.0f;
 };
+
 
 struct HcPreResult {
     std::vector<float> x;
@@ -3620,7 +3679,8 @@ struct GgufLayerScratch {
 void gguf_layer_forward_attn_to_gate(const GgufLayerDeviceWeights& w,
                                      GgufLayerScratch& s,
                                      const GgufLayerDims& d,
-                                     int position) {
+                                     int position,
+                                     const GgufReduceContext* reduce_ctx) {
     // ===== Attention =====
     check_cuda(cudaMemcpy(s.d_x_pre_attn, s.d_x, d.dim * sizeof(float),
                           cudaMemcpyDeviceToDevice), "save x_pre_attn");
@@ -3675,6 +3735,7 @@ void gguf_layer_forward_attn_to_gate(const GgufLayerDeviceWeights& w,
     }
     if (!q8_0_matvec_cuda(s.d_attn_mid, w.d_wo_b, s.d_attn_out, d.dim, d.attn_mid))
         throw std::runtime_error("wo_b failed");
+    gguf_all_reduce_sum_fp32_inplace(s.d_attn_out, d.dim, reduce_ctx, "GGUF attention all-reduce");
     // Attention residual.
     if (!vector_add_cuda(s.d_x_pre_attn, s.d_attn_out, s.d_x, d.dim))
         throw std::runtime_error("attn residual add failed");
@@ -3722,7 +3783,8 @@ void gguf_layer_forward_attn_to_gate(const GgufLayerDeviceWeights& w,
 // into w.d_routed_w1/w2/w3 before this call.
 void gguf_layer_forward_moe(const GgufLayerDeviceWeights& w,
                             GgufLayerScratch& s,
-                            const GgufLayerDims& d) {
+                            const GgufLayerDims& d,
+                            const GgufReduceContext* reduce_ctx) {
     const int routes = d.topk;
 
     check_cuda(cudaMemset(s.d_moe_out, 0, d.dim * sizeof(float)), "zero moe_out");
@@ -3746,6 +3808,8 @@ void gguf_layer_forward_moe(const GgufLayerDeviceWeights& w,
                                     d.dim, d.moe_inter))
         throw std::runtime_error("q2 w2 q2k failed");
 
+    gguf_all_reduce_sum_fp32_inplace(s.d_moe_out, d.dim, reduce_ctx, "GGUF MoE all-reduce");
+
     if (!vector_add_cuda(s.d_shared_out, s.d_moe_out, s.d_ffn_combined, d.dim))
         throw std::runtime_error("ffn combined add failed");
     if (!vector_add_cuda(s.d_x_pre_ffn, s.d_ffn_combined, s.d_x, d.dim))
@@ -3760,8 +3824,8 @@ void gguf_layer_forward(const GgufLayerDeviceWeights& w,
                         const GgufLayerDims& d,
                         int /*token*/,
                         int position) {
-    gguf_layer_forward_attn_to_gate(w, s, d, position);
-    gguf_layer_forward_moe(w, s, d);
+    gguf_layer_forward_attn_to_gate(w, s, d, position, nullptr);
+    gguf_layer_forward_moe(w, s, d, nullptr);
 }
 
 }  // namespace
@@ -5725,7 +5789,7 @@ GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path,
         }
 
         // Phase A: attention + ffn_norm + shared + gate.
-        gguf_layer_forward_attn_to_gate(lw, ls, ld, position);
+        gguf_layer_forward_attn_to_gate(lw, ls, ld, position, nullptr);
 
         // Read gate's chosen expert ids, then stage those experts H2D.
         check_cuda(cudaMemcpy(h_gate_indices.data(), d_gate_indices, topk * sizeof(int64_t),
@@ -5752,7 +5816,7 @@ GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path,
         }
 
         // Phase B: routed MoE + FFN residual.
-        gguf_layer_forward_moe(lw, ls, ld);
+        gguf_layer_forward_moe(lw, ls, ld, nullptr);
     }
 
     // ===== final norm + head =====
@@ -5820,13 +5884,20 @@ GgufFullForwardResult run_gguf_full_forward_smoke(const std::string& ckpt_path,
 
 GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                                           const std::vector<int>& seed_tokens,
-                                          int max_new_tokens) {
+                                          int max_new_tokens,
+                                          const ForwardSmokeOptions& options) {
     if (!is_gguf_path(ckpt_path))
         throw std::runtime_error("run_gguf_generate_smoke: not a GGUF path: " + ckpt_path);
     if (seed_tokens.empty()) throw std::runtime_error("seed_tokens must be non-empty");
     if (max_new_tokens < 0) throw std::runtime_error("max_new_tokens must be >= 0");
 
     auto t_load_start = std::chrono::steady_clock::now();
+    const int tp_world = std::max(1, options.tp_world);
+    const int tp_rank = std::max(0, options.tp_rank);
+    const int tp_device = options.device >= 0 ? options.device : tp_rank;
+    if (tp_rank >= tp_world) throw std::runtime_error("run_gguf_generate_smoke: invalid TP rank");
+    if (tp_world > 1 && options.nccl_id_path.empty())
+        throw std::runtime_error("run_gguf_generate_smoke: TP requires --nccl-id-path");
     GgufForwardContext ctx(ckpt_path);
     GGUFWeightSource& gws = *ctx.weight_source;
 
@@ -5853,31 +5924,47 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     const int n_layers = static_cast<int>(ctx.config.n_layers);
     const int n_hash = static_cast<int>(ctx.config.n_hash_layers);
     const int dim = static_cast<int>(ctx.config.dim);
-    const int heads = static_cast<int>(ctx.config.n_heads);
+    const int global_heads = static_cast<int>(ctx.config.n_heads);
     const int n_experts = static_cast<int>(ctx.config.n_routed_experts);
     const int topk = static_cast<int>(ctx.config.n_activated_experts);
     const int rope_dim = static_cast<int>(ctx.config.rope_dim);
-    const int o_groups = static_cast<int>(ctx.config.o_groups);
+    const int global_o_groups = static_cast<int>(ctx.config.o_groups);
     const int o_lora_rank = static_cast<int>(ctx.config.o_lora_rank);
     const int moe_inter = static_cast<int>(ctx.config.moe_inter_dim);
     if (topk <= 0 || topk > 8) throw std::runtime_error("topk out of supported range");
+    if ((global_heads % tp_world) != 0 || (global_o_groups % tp_world) != 0)
+        throw std::runtime_error("GGUF TP requires heads and o_groups divisible by tp_world");
 
     WeightView wq_a0 = gws.require("layers.0.attn.wq_a.weight");
     WeightView wq_b0 = gws.require("layers.0.attn.wq_b.weight");
     WeightView wkv0 = gws.require("layers.0.attn.wkv.weight");
     const int q_a_dim = static_cast<int>(wq_a0.shape[1]);
-    const int q_full = static_cast<int>(wq_b0.shape[1]);
-    if (q_full % heads != 0) throw std::runtime_error("wq_b cols % heads");
-    const int head_dim = q_full / heads;
+    const int global_q_full = static_cast<int>(wq_b0.shape[1]);
+    if (global_q_full % global_heads != 0) throw std::runtime_error("wq_b cols % heads");
+    const int head_dim = global_q_full / global_heads;
+    const int heads = global_heads / tp_world;
+    const int q_full = heads * head_dim;
     const int kv_dim = static_cast<int>(wkv0.shape[1]);
-    if (q_full % o_groups != 0) throw std::runtime_error("q_full % o_groups");
+    const int o_groups = global_o_groups / tp_world;
+    if (global_q_full % global_o_groups != 0) throw std::runtime_error("q_full % o_groups");
     const int group_in_dim = q_full / o_groups;
     const int attn_mid = o_groups * o_lora_rank;
+    const int local_head_start = tp_rank * heads;
+    const int local_q_row_start = local_head_start * head_dim;
+    const int local_group_start = tp_rank * o_groups;
+    const int local_wo_a_row_start = local_group_start * o_lora_rank;
 
     WeightView embed = gws.require("embed.weight");
     if (embed.dtype != DType::F16 || embed.shape.size() != 2 || static_cast<int>(embed.shape[0]) != dim)
         throw std::runtime_error("embed shape/dtype mismatch");
     const int vocab = static_cast<int>(embed.shape[1]);
+    if (vocab % tp_world != 0) throw std::runtime_error("GGUF TP requires vocab divisible by tp_world");
+    const int local_vocab = vocab / tp_world;
+    const int local_vocab_start = tp_rank * local_vocab;
+    const int experts_per_rank = tp_world > 1 ? n_experts / tp_world : n_experts;
+    if ((n_experts % tp_world) != 0) throw std::runtime_error("GGUF TP requires experts divisible by tp_world");
+    const int expert_start = tp_rank * experts_per_rank;
+    const int expert_end = tp_world > 1 ? expert_start + experts_per_rank : n_experts;
     for (int t : seed_tokens) if (t < 0 || t >= vocab)
         throw std::runtime_error("seed token id out of vocab range");
 
@@ -5932,7 +6019,7 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         d_q_gamma[L] = upload_bf16_from_f32(gws.require(lp + ".attn.q_norm.weight").data, q_a_dim);
         d_kv_gamma[L] = upload_bf16_from_f32(gws.require(lp + ".attn.kv_norm.weight").data, kv_dim);
         d_ffn_gamma[L] = upload_bf16_from_f32(gws.require(lp + ".ffn_norm.weight").data, dim);
-        d_attn_sink[L] = upload_f32(gws.require(lp + ".attn.attn_sink").data, heads);
+        d_attn_sink[L] = upload_f32(reinterpret_cast<const float*>(gws.require(lp + ".attn.attn_sink").data) + local_head_start, heads);
         WeightView wq_a = gws.require(lp + ".attn.wq_a.weight");
         WeightView wq_b = gws.require(lp + ".attn.wq_b.weight");
         WeightView wkv = gws.require(lp + ".attn.wkv.weight");
@@ -5942,11 +6029,15 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         WeightView shared_w2 = gws.require(lp + ".ffn.shared_experts.w2.weight");
         WeightView shared_w3 = gws.require(lp + ".ffn.shared_experts.w3.weight");
         WeightView gate_w = gws.require(lp + ".ffn.gate.weight");
+        auto wq_b_local = slice_q8_0_rows(wq_b.data, local_q_row_start, q_full, q_a_dim);
+        auto wo_a_local = slice_q8_0_rows(wo_a.data, local_wo_a_row_start, attn_mid, group_in_dim);
+        auto wo_b_local = slice_q8_0_cols(wo_b.data, dim, global_o_groups * o_lora_rank,
+                                          local_wo_a_row_start, attn_mid);
         d_wq_a[L] = upload_u8(wq_a.data, wq_a.nbytes);
-        d_wq_b[L] = upload_u8(wq_b.data, wq_b.nbytes);
+        d_wq_b[L] = upload_u8(wq_b_local.data(), wq_b_local.size());
         d_wkv[L] = upload_u8(wkv.data, wkv.nbytes);
-        d_wo_a[L] = upload_u8(wo_a.data, wo_a.nbytes);
-        d_wo_b[L] = upload_u8(wo_b.data, wo_b.nbytes);
+        d_wo_a[L] = upload_u8(wo_a_local.data(), wo_a_local.size());
+        d_wo_b[L] = upload_u8(wo_b_local.data(), wo_b_local.size());
         d_shared_w1[L] = upload_u8(shared_w1.data, shared_w1.nbytes);
         d_shared_w2[L] = upload_u8(shared_w2.data, shared_w2.nbytes);
         d_shared_w3[L] = upload_u8(shared_w3.data, shared_w3.nbytes);
@@ -5974,7 +6065,8 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         static_cast<int>(head.shape[1]) != vocab)
         throw std::runtime_error("head.weight shape/dtype (expected Q8_0 [dim, vocab])");
     uint16_t* d_final_norm_gamma = upload_bf16_from_f32(final_norm.data, dim);
-    uint8_t* d_head = upload_u8(head.data, head.nbytes);
+    auto head_local = slice_q8_0_rows(head.data, local_vocab_start, local_vocab, dim);
+    uint8_t* d_head = upload_u8(head_local.data(), head_local.size());
 
     // ===== routed expert staging buffers (reused per layer per step) =====
     auto first_w1 = gws.get_expert("layers.0.ffn.experts.routed.w1",
@@ -6086,13 +6178,20 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     check_cuda(cudaMalloc(&d_gate_indices, topk * sizeof(int64_t)), "alloc d_gate_indices");
     check_cuda(cudaMalloc(&d_tid2eid_i64, topk * sizeof(int64_t)), "alloc d_tid2eid_i64");
     check_cuda(cudaMalloc(&d_embed_row_f16, dim * sizeof(uint16_t)), "alloc d_embed_row_f16");
-    check_cuda(cudaMalloc(&d_logits, vocab * sizeof(float)), "alloc d_logits");
+    check_cuda(cudaMalloc(&d_logits, local_vocab * sizeof(float)), "alloc d_logits");
 
-    std::vector<int64_t> h_route_slots(topk);
-    for (int k = 0; k < topk; ++k) h_route_slots[k] = k;
-    check_cuda(cudaMemcpy(d_route_slots, h_route_slots.data(),
-                          topk * sizeof(int64_t), cudaMemcpyHostToDevice),
-               "copy d_route_slots");
+#ifdef DSV4_HAVE_NCCL
+    BF16AllReduceScratch bf16_reduce_scratch;
+#endif
+    GgufReduceContext reduce_ctx;
+    reduce_ctx.world = tp_world;
+    reduce_ctx.rank = tp_rank;
+    reduce_ctx.device = tp_device;
+    reduce_ctx.id_path = options.nccl_id_path.empty() ? nullptr : options.nccl_id_path.c_str();
+#ifdef DSV4_HAVE_NCCL
+    reduce_ctx.scratch = &bf16_reduce_scratch;
+#endif
+    const GgufReduceContext* reduce_ctx_ptr = (tp_world > 1) ? &reduce_ctx : nullptr;
 
     GgufLayerDims ld;
     ld.dim = dim; ld.q_a_dim = q_a_dim; ld.heads = heads; ld.head_dim = head_dim;
@@ -6127,7 +6226,8 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
 
     // ===== per-step forward (embed + 43 layers + final norm + head + argmax) =====
     std::vector<int64_t> h_gate_indices(topk);
-    std::vector<float> h_logits(vocab);
+    std::vector<int64_t> h_route_slots(topk);
+    std::vector<float> h_logits(local_vocab);
     auto run_step = [&](int token, int position) -> std::pair<int, float> {
         const uint16_t* host_embed_row =
             reinterpret_cast<const uint16_t*>(embed.data) +
@@ -6161,7 +6261,7 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                 lw.d_tid2eid_i64 = nullptr;
                 lw.d_gate_bias_f32 = d_gate_bias[L];
             }
-            gguf_layer_forward_attn_to_gate(lw, ls, ld, position);
+            gguf_layer_forward_attn_to_gate(lw, ls, ld, position, reduce_ctx_ptr);
             check_cuda(cudaMemcpy(h_gate_indices.data(), d_gate_indices, topk * sizeof(int64_t),
                                   cudaMemcpyDeviceToHost), "copy gate indices");
             const std::string lp = "layers." + std::to_string(L);
@@ -6172,6 +6272,9 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                 const int eid = static_cast<int>(h_gate_indices[k]);
                 if (eid < 0 || eid >= n_experts)
                     throw std::runtime_error("gate produced out-of-range expert id");
+                const bool is_local = (eid >= expert_start && eid < expert_end);
+                h_route_slots[k] = is_local ? static_cast<int64_t>(k) : -1;
+                if (!is_local) continue;
                 auto wv1 = gws.get_expert(w1_name, w1_name, eid);
                 auto wv2 = gws.get_expert(w2_name, w2_name, eid);
                 auto wv3 = gws.get_expert(w3_name, w3_name, eid);
@@ -6184,20 +6287,35 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                 check_cuda(cudaMemcpyAsync(d_routed_w3 + per_w3_bytes * k, wv3.data, per_w3_bytes,
                                       cudaMemcpyHostToDevice, 0), "stage routed_w3");
             }
-            gguf_layer_forward_moe(lw, ls, ld);
+            check_cuda(cudaMemcpyAsync(d_route_slots, h_route_slots.data(),
+                                       topk * sizeof(int64_t),
+                                       cudaMemcpyHostToDevice, 0),
+                       "copy d_route_slots");
+            gguf_layer_forward_moe(lw, ls, ld, reduce_ctx_ptr);
         }
         if (!rmsnorm_bf16_gamma_cuda(d_x, d_final_norm_gamma, d_x_normed, dim, 1e-6f))
             throw std::runtime_error("final norm failed");
-        if (!q8_0_matvec_cuda(d_x_normed, d_head, d_logits, vocab, dim))
+        if (!q8_0_matvec_cuda(d_x_normed, d_head, d_logits, local_vocab, dim))
             throw std::runtime_error("head matvec failed");
         check_cuda(cudaDeviceSynchronize(), "sync after head");
-        check_cuda(cudaMemcpy(h_logits.data(), d_logits, vocab * sizeof(float),
+        check_cuda(cudaMemcpy(h_logits.data(), d_logits, local_vocab * sizeof(float),
                               cudaMemcpyDeviceToHost), "copy logits");
-        int top_t = 0;
-        float top_l = -INFINITY;
-        for (int i = 0; i < vocab; ++i) {
-            if (h_logits[i] > top_l) { top_l = h_logits[i]; top_t = i; }
+        int local_t = 0;
+        float local_l = -INFINITY;
+        for (int i = 0; i < local_vocab; ++i) {
+            if (h_logits[i] > local_l) { local_l = h_logits[i]; local_t = i; }
         }
+        int top_t = local_t + local_vocab_start;
+        float top_l = local_l;
+#ifdef DSV4_HAVE_NCCL
+        if (tp_world > 1 && !options.nccl_id_path.empty()) {
+            TpTopResult global = nccl_global_top1(tp_world, tp_rank, tp_device,
+                                                   options.nccl_id_path.c_str(),
+                                                   top_t, top_l);
+            top_t = global.token;
+            top_l = global.logit;
+        }
+#endif
         return {top_t, top_l};
     };
 
@@ -6260,7 +6378,11 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     return r;
 }
 
-// --- PersistentEngine implementation ---------------------------------------
+GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
+                                          const std::vector<int>& seed_tokens,
+                                          int max_new_tokens) {
+    return run_gguf_generate_smoke(ckpt_path, seed_tokens, max_new_tokens, ForwardSmokeOptions{});
+}
 
 struct PersistentEngine::State {
     std::unique_ptr<SafeForwardContext> ctx;

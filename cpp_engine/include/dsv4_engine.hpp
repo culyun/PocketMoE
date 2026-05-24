@@ -285,6 +285,10 @@ struct GgufDecodeResult {
 
 GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                                           const std::vector<int>& seed_tokens,
+                                          int max_new_tokens,
+                                          const ForwardSmokeOptions& options);
+GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
+                                          const std::vector<int>& seed_tokens,
                                           int max_new_tokens);
 
 }  // namespace dsv4
