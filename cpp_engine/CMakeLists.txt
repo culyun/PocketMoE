@@ -35,6 +35,7 @@ add_library(dsv4_cpp_core STATIC
     src/gguf_reader.cpp
     src/safetensors_reader.cpp
     src/safetensors_model.cpp
+    src/weight_source.cpp
     src/model_config.cpp
     src/tokenizer.cpp
     src/tensor.cpp
@@ -50,6 +51,7 @@ add_library(dsv4_cpp_core STATIC
     cuda/quant_gemm.cu
     cuda/fp4_ops.cu
     cuda/fp8_ops.cu
+    cuda/q2_ops.cu
     cuda/rmsnorm_rope.cu
 )
 
@@ -88,6 +90,66 @@ set_target_properties(test_safetensors_reader PROPERTIES RUNTIME_OUTPUT_DIRECTOR
 add_executable(test_safetensors_model tests/test_safetensors_model.cpp)
 target_link_libraries(test_safetensors_model PRIVATE dsv4_cpp_core)
 set_target_properties(test_safetensors_model PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_weight_source tests/test_weight_source.cpp)
+target_link_libraries(test_weight_source PRIVATE dsv4_cpp_core)
+set_target_properties(test_weight_source PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_q2_matvec tests/test_q2_matvec.cpp)
+target_link_libraries(test_q2_matvec PRIVATE dsv4_cpp_core)
+set_target_properties(test_q2_matvec PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_gguf_dense_smoke tests/test_gguf_dense_smoke.cpp)
+target_link_libraries(test_gguf_dense_smoke PRIVATE dsv4_cpp_core)
+set_target_properties(test_gguf_dense_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_gguf_min_layer_smoke tests/test_gguf_min_layer_smoke.cpp)
+target_link_libraries(test_gguf_min_layer_smoke PRIVATE dsv4_cpp_core)
+set_target_properties(test_gguf_min_layer_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_gguf_attn_norm_wqa tests/test_gguf_attn_norm_wqa.cpp)
+target_link_libraries(test_gguf_attn_norm_wqa PRIVATE dsv4_cpp_core)
+set_target_properties(test_gguf_attn_norm_wqa PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_gguf_attn_q_path tests/test_gguf_attn_q_path.cpp)
+target_link_libraries(test_gguf_attn_q_path PRIVATE dsv4_cpp_core)
+set_target_properties(test_gguf_attn_q_path PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_gguf_attn_kv_path tests/test_gguf_attn_kv_path.cpp)
+target_link_libraries(test_gguf_attn_kv_path PRIVATE dsv4_cpp_core)
+set_target_properties(test_gguf_attn_kv_path PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_gguf_attn_full tests/test_gguf_attn_full.cpp)
+target_link_libraries(test_gguf_attn_full PRIVATE dsv4_cpp_core)
+set_target_properties(test_gguf_attn_full PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_gguf_shared_expert tests/test_gguf_shared_expert.cpp)
+target_link_libraries(test_gguf_shared_expert PRIVATE dsv4_cpp_core)
+set_target_properties(test_gguf_shared_expert PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_gguf_routed_expert tests/test_gguf_routed_expert.cpp)
+target_link_libraries(test_gguf_routed_expert PRIVATE dsv4_cpp_core)
+set_target_properties(test_gguf_routed_expert PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_gguf_routed_moe tests/test_gguf_routed_moe.cpp)
+target_link_libraries(test_gguf_routed_moe PRIVATE dsv4_cpp_core)
+set_target_properties(test_gguf_routed_moe PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_gguf_layer0_full tests/test_gguf_layer0_full.cpp)
+target_link_libraries(test_gguf_layer0_full PRIVATE dsv4_cpp_core)
+set_target_properties(test_gguf_layer0_full PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_gguf_full_forward tests/test_gguf_full_forward.cpp)
+target_link_libraries(test_gguf_full_forward PRIVATE dsv4_cpp_core)
+set_target_properties(test_gguf_full_forward PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(test_gguf_generate tests/test_gguf_generate.cpp)
+target_link_libraries(test_gguf_generate PRIVATE dsv4_cpp_core)
+set_target_properties(test_gguf_generate PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
+
+add_executable(probe_host_register tests/probe_host_register.cpp)
+target_link_libraries(probe_host_register PRIVATE dsv4_cpp_core)
+set_target_properties(probe_host_register PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests)
 
 add_executable(test_quant_gemm tests/test_quant_gemm.cpp)
 target_link_libraries(test_quant_gemm PRIVATE dsv4_cpp_core)
