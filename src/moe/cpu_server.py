@@ -13,9 +13,9 @@ from safetensors import safe_open
 
 from src.moe.ipc import CPUMoESharedMemory
 from src.moe.shared_weights import SharedCPUMoEWeightArena, SharedCPUMoEWeightSet
-from src.runtime import transformer as model_module
+from src.models.deepseek_v4 import transformer as model_module
 from src.moe.cpu_backend import CPURoutedExpertsBackend, _load_native_mod
-from src.runtime.transformer import Expert, ModelArgs
+from src.models.deepseek_v4.transformer import Expert, ModelArgs
 
 
 def _env_enabled(name: str) -> bool:

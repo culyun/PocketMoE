@@ -14,18 +14,18 @@ from safetensors import safe_open
 
 from src.moe.shared_weights import SharedCPUMoEWeightArena
 from src.runtime.prefix_snapshot import PrefixSnapshotCache
-from src.runtime.partition_policy import (
+from src.models.deepseek_v4.partition_policy import (
     checkpoint_key_is_needed_for_policy,
     partition_rule_kind,
     shard_shape_for_rank,
     shard_tensor_for_rank,
 )
-from src.runtime.transformer import (
+from src.models.deepseek_v4.transformer import (
     Transformer,
     ModelArgs,
 )
 from src.kernels.ops import soft_fp8_blockfp8_weight_dequant
-from src.runtime.gguf_loader import load_gguf_model
+from src.models.deepseek_v4.gguf_loader import load_gguf_model
 from src.encoding.dsv4 import encode_messages, parse_message_from_completion_text
 
 

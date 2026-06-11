@@ -217,7 +217,7 @@ def _validate_ds4_q2(ds4) -> int:
 def _runtime_state_shapes(config_path: str, routed_experts_device: str) -> dict[str, tuple[int, ...]]:
     import torch
 
-    from src.runtime.transformer import ModelArgs, Transformer
+    from src.models.deepseek_v4.transformer import ModelArgs, Transformer
 
     with open(config_path) as f:
         config_data = json.load(f)

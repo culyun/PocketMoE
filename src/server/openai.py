@@ -66,7 +66,7 @@ from src.runtime.generation import (
     load_model,
 )
 from src.runtime.prefix_snapshot import PrefixSnapshotCache
-from src.runtime.transformer import ModelArgs, Transformer
+from src.models.deepseek_v4.transformer import ModelArgs, Transformer
 from src.runtime.pd_scheduler import PDExecutionFacade, PDScheduler
 from src.server.engine import DeepSeekServingEngine
 
