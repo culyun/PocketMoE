@@ -82,6 +82,62 @@ struct FlashMemoryPluginMetadata {
     uint64_t total_weight_bytes = 0;
 };
 
+struct FlashMemoryLayerDeviceWeights {
+    std::string layer;
+    void* wq_a = nullptr;
+    void* wq_b = nullptr;
+    void* q_norm_weight = nullptr;
+    void* weights_proj = nullptr;
+    SafeDType wq_a_dtype = SafeDType::Unknown;
+    SafeDType wq_b_dtype = SafeDType::Unknown;
+    SafeDType q_norm_dtype = SafeDType::Unknown;
+    SafeDType weights_proj_dtype = SafeDType::Unknown;
+    uint64_t bytes = 0;
+};
+
+struct FlashMemoryDeviceWeights {
+    std::vector<FlashMemoryLayerDeviceWeights> layers;
+    uint64_t total_device_bytes = 0;
+    uint64_t device_probe_checksum = 0;
+    bool loaded = false;
+
+    FlashMemoryDeviceWeights() = default;
+    FlashMemoryDeviceWeights(const FlashMemoryDeviceWeights&) = delete;
+    FlashMemoryDeviceWeights& operator=(const FlashMemoryDeviceWeights&) = delete;
+    FlashMemoryDeviceWeights(FlashMemoryDeviceWeights&& other) noexcept { *this = std::move(other); }
+    FlashMemoryDeviceWeights& operator=(FlashMemoryDeviceWeights&& other) noexcept {
+        if (this == &other) return *this;
+        release();
+        layers = std::move(other.layers);
+        total_device_bytes = other.total_device_bytes;
+        device_probe_checksum = other.device_probe_checksum;
+        loaded = other.loaded;
+        other.total_device_bytes = 0;
+        other.device_probe_checksum = 0;
+        other.loaded = false;
+        return *this;
+    }
+    ~FlashMemoryDeviceWeights() { release(); }
+
+    void release() {
+        for (auto& l : layers) {
+            cudaFree(l.wq_a);
+            cudaFree(l.wq_b);
+            cudaFree(l.q_norm_weight);
+            cudaFree(l.weights_proj);
+            l.wq_a = nullptr;
+            l.wq_b = nullptr;
+            l.q_norm_weight = nullptr;
+            l.weights_proj = nullptr;
+        }
+        layers.clear();
+        total_device_bytes = 0;
+        device_probe_checksum = 0;
+        loaded = false;
+    }
+};
+
+
 FlashMemoryPluginMetadata inspect_flashmemory_checkpoint_metadata(const std::string& ckpt_path) {
     SafeTensorsShard shard(ckpt_path);
     std::map<std::string, std::vector<std::string>> by_layer;
@@ -137,6 +193,85 @@ FlashMemoryPluginMetadata inspect_flashmemory_checkpoint_metadata(const std::str
         meta.layers.push_back(layer);
     }
     return meta;
+}
+
+void* upload_flashmemory_tensor(const SafeTensorsShard& shard, const SafeTensorInfo& info) {
+    if (!flashmemory_dtype_allowed(info.dtype)) {
+        throw std::runtime_error("FlashMemory plugin unsupported dtype for upload: " + info.name + " dtype=" + safe_dtype_name(info.dtype));
+    }
+    void* d = nullptr;
+    check_cuda(cudaMalloc(&d, info.nbytes), ("alloc FlashMemory tensor " + info.name).c_str());
+    check_cuda(cudaMemcpy(d, shard.tensor_data(info), info.nbytes, cudaMemcpyHostToDevice),
+               ("copy FlashMemory tensor " + info.name).c_str());
+    return d;
+}
+
+FlashMemoryDeviceWeights load_flashmemory_device_weights(const std::string& ckpt_path) {
+    SafeTensorsShard shard(ckpt_path);
+    FlashMemoryPluginMetadata meta = inspect_flashmemory_checkpoint_metadata(ckpt_path);
+    FlashMemoryDeviceWeights out;
+    out.layers.reserve(meta.layers.size());
+    auto require_info = [&](const std::string& tensor) -> const SafeTensorInfo& {
+        const SafeTensorInfo* info = shard.find_tensor(tensor);
+        if (info == nullptr) throw std::runtime_error("FlashMemory plugin missing tensor during device load: " + tensor);
+        return *info;
+    };
+    for (const std::string& layer : meta.layers) {
+        FlashMemoryLayerDeviceWeights lw;
+        lw.layer = layer;
+        const auto& wq_a = require_info("retrievers." + layer + ".wq_a.weight");
+        const auto& wq_b = require_info("retrievers." + layer + ".wq_b.weight");
+        const auto& q_norm = require_info("retrievers." + layer + ".q_norm_weight");
+        const auto& weights_proj = require_info("retrievers." + layer + ".weights_proj.weight");
+        lw.wq_a_dtype = wq_a.dtype;
+        lw.wq_b_dtype = wq_b.dtype;
+        lw.q_norm_dtype = q_norm.dtype;
+        lw.weights_proj_dtype = weights_proj.dtype;
+        lw.wq_a = upload_flashmemory_tensor(shard, wq_a);
+        lw.wq_b = upload_flashmemory_tensor(shard, wq_b);
+        lw.q_norm_weight = upload_flashmemory_tensor(shard, q_norm);
+        lw.weights_proj = upload_flashmemory_tensor(shard, weights_proj);
+        lw.bytes = wq_a.nbytes + wq_b.nbytes + q_norm.nbytes + weights_proj.nbytes;
+        out.total_device_bytes += lw.bytes;
+        out.layers.push_back(std::move(lw));
+    }
+    out.loaded = true;
+    return out;
+}
+
+// Mock scorer smoke: read back a small prefix from each layer's device weight
+// pointers and fold the bytes into a checksum. This does NOT run the FlashMemory
+// retriever; it only proves the device-loaded weights are addressable/readable
+// (round-trip D2H) so the isolated plugin path stays runtime_scoring=0 while
+// validating the GPU upload. Returns the number of probed pointers.
+uint64_t flashmemory_device_weight_smoke(FlashMemoryDeviceWeights& weights, uint64_t probe_bytes) {
+    if (!weights.loaded) throw std::runtime_error("FlashMemory mock scorer smoke requires loaded device weights");
+    std::vector<uint8_t> host;
+    uint64_t checksum = 1469598103934665603ULL;  // FNV-1a offset basis
+    uint64_t probed = 0;
+    auto probe_ptr = [&](void* ptr, SafeDType dtype, uint64_t tensor_bytes) {
+        if (ptr == nullptr) throw std::runtime_error("FlashMemory mock scorer smoke hit null device pointer");
+        const uint64_t n = std::min<uint64_t>(probe_bytes, tensor_bytes);
+        if (n == 0) return;
+        host.resize(static_cast<size_t>(n));
+        check_cuda(cudaMemcpy(host.data(), ptr, n, cudaMemcpyDeviceToHost), "FlashMemory mock scorer probe D2H");
+        checksum ^= static_cast<uint64_t>(dtype);
+        checksum *= 1099511628211ULL;
+        for (uint64_t i = 0; i < n; ++i) {
+            checksum ^= host[static_cast<size_t>(i)];
+            checksum *= 1099511628211ULL;  // FNV-1a prime
+        }
+        ++probed;
+    };
+    for (auto& l : weights.layers) {
+        const uint64_t per_tensor = l.bytes / 4;  // approximate even split for the probe cap
+        probe_ptr(l.wq_a, l.wq_a_dtype, per_tensor == 0 ? l.bytes : per_tensor);
+        probe_ptr(l.wq_b, l.wq_b_dtype, per_tensor == 0 ? l.bytes : per_tensor);
+        probe_ptr(l.q_norm_weight, l.q_norm_dtype, per_tensor == 0 ? l.bytes : per_tensor);
+        probe_ptr(l.weights_proj, l.weights_proj_dtype, per_tensor == 0 ? l.bytes : per_tensor);
+    }
+    weights.device_probe_checksum = checksum;
+    return probed;
 }
 
 
@@ -6779,14 +6914,22 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         env_int_or_default("DSV4_GGUF_KV_SWAP_TEST_ALLOW_TOPK_REDUCTION", 0) != 0;
     const bool gguf_flashmemory_plugin = env_int_or_default("DSV4_GGUF_FLASHMEMORY_PLUGIN", 0) != 0;
     const int gguf_flashmemory_metadata_only = env_int_or_default("DSV4_GGUF_FLASHMEMORY_METADATA_ONLY", 1);
+    const int gguf_flashmemory_load_device = env_int_or_default("DSV4_GGUF_FLASHMEMORY_LOAD_DEVICE", 0);
+    const int gguf_flashmemory_mock_smoke = env_int_or_default("DSV4_GGUF_FLASHMEMORY_MOCK_SCORER_SMOKE", 0);
     const char* gguf_flashmemory_ckpt_env = std::getenv("DSV4_GGUF_FLASHMEMORY_CKPT");
     const std::string gguf_flashmemory_ckpt = gguf_flashmemory_ckpt_env == nullptr ? std::string() : std::string(gguf_flashmemory_ckpt_env);
     if (gguf_flashmemory_plugin && gguf_flashmemory_metadata_only != 0 && gguf_flashmemory_metadata_only != 1)
         throw std::runtime_error("DSV4_GGUF_FLASHMEMORY_METADATA_ONLY must be 0 or 1");
+    if (gguf_flashmemory_plugin && gguf_flashmemory_load_device != 0 && gguf_flashmemory_load_device != 1)
+        throw std::runtime_error("DSV4_GGUF_FLASHMEMORY_LOAD_DEVICE must be 0 or 1");
+    if (gguf_flashmemory_plugin && gguf_flashmemory_mock_smoke != 0 && gguf_flashmemory_mock_smoke != 1)
+        throw std::runtime_error("DSV4_GGUF_FLASHMEMORY_MOCK_SCORER_SMOKE must be 0 or 1");
     if (gguf_flashmemory_plugin && gguf_flashmemory_ckpt.empty())
         throw std::runtime_error("DSV4_GGUF_FLASHMEMORY_PLUGIN requires DSV4_GGUF_FLASHMEMORY_CKPT=/path/flashmemory_ds_v4.safetensors");
+    if (gguf_flashmemory_plugin && gguf_flashmemory_mock_smoke && !gguf_flashmemory_load_device)
+        throw std::runtime_error("DSV4_GGUF_FLASHMEMORY_MOCK_SCORER_SMOKE requires DSV4_GGUF_FLASHMEMORY_LOAD_DEVICE=1");
     if (gguf_flashmemory_plugin && gguf_flashmemory_metadata_only == 0)
-        throw std::runtime_error("FlashMemory retriever runtime scoring is not wired yet; use DSV4_GGUF_FLASHMEMORY_METADATA_ONLY=1 for the paper-reproduction plugin skeleton");
+        throw std::runtime_error("FlashMemory retriever runtime scoring is not wired yet; keep DSV4_GGUF_FLASHMEMORY_METADATA_ONLY=1 for the isolated paper-reproduction plugin path");
     if (gguf_kv_swap_requested && !gguf_sparse_compressor)
         throw std::runtime_error("DSV4_GGUF_KV_SWAP requires DSV4_GGUF_SPARSE_COMPRESSOR=1");
     if (gguf_kv_swap_requested && gguf_kv_swap_pinned_mib <= 0)
@@ -6810,15 +6953,30 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         throw std::runtime_error("DSV4_GGUF_SPARSE_WINDOW must be > 0");
     if (gguf_sparse_compressor && (gguf_sparse_attn_threshold < 0 || gguf_sparse_attn_threshold > gguf_sparse_window))
         throw std::runtime_error("DSV4_GGUF_SPARSE_ATTN_THRESHOLD must be in [0, DSV4_GGUF_SPARSE_WINDOW]");
+    std::unique_ptr<FlashMemoryDeviceWeights> flashmemory_device_weights;
     if (gguf_flashmemory_plugin) {
         FlashMemoryPluginMetadata fm = inspect_flashmemory_checkpoint_metadata(gguf_flashmemory_ckpt);
+        uint64_t flashmemory_probed = 0;
+        if (gguf_flashmemory_load_device) {
+            flashmemory_device_weights = std::make_unique<FlashMemoryDeviceWeights>(
+                load_flashmemory_device_weights(gguf_flashmemory_ckpt));
+            check_cuda(cudaDeviceSynchronize(), "sync FlashMemory device weight load");
+            if (gguf_flashmemory_mock_smoke) {
+                flashmemory_probed = flashmemory_device_weight_smoke(*flashmemory_device_weights, /*probe_bytes=*/64);
+            }
+        }
         if (tp_rank == 0) {
             std::ostringstream layers;
             for (size_t i = 0; i < fm.layers.size(); ++i) {
                 if (i) layers << ",";
                 layers << fm.layers[i];
             }
-            std::cout << "gguf_flashmemory_plugin=1 metadata_only=1"
+            const double device_mib = flashmemory_device_weights && flashmemory_device_weights->loaded
+                ? static_cast<double>(flashmemory_device_weights->total_device_bytes) / (1024.0 * 1024.0)
+                : 0.0;
+            std::cout << "gguf_flashmemory_plugin=1 metadata_only=" << gguf_flashmemory_metadata_only
+                      << " load_device=" << gguf_flashmemory_load_device
+                      << " mock_scorer_smoke=" << gguf_flashmemory_mock_smoke
                       << " ckpt=" << gguf_flashmemory_ckpt
                       << " layers=" << layers.str()
                       << " n_heads=" << fm.n_heads
@@ -6827,7 +6985,12 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                       << " hidden_dim=" << fm.hidden_dim
                       << " rope_dim=" << fm.rope_dim
                       << " weight_mib=" << (static_cast<double>(fm.total_weight_bytes) / (1024.0 * 1024.0))
-                      << " runtime_scoring=0"
+                      << " device_mib=" << device_mib;
+            if (gguf_flashmemory_mock_smoke) {
+                std::cout << " mock_probed_ptrs=" << flashmemory_probed
+                          << " mock_probe_checksum=" << flashmemory_device_weights->device_probe_checksum;
+            }
+            std::cout << " runtime_scoring=0"
                       << "\n";
         }
     }
