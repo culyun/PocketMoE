@@ -258,6 +258,12 @@ class MiniMaxM2Spec:
         if os.environ.get("GGUF_Q4K_Q5K_MMA") is None:
             os.environ["GGUF_Q4K_Q5K_MMA"] = "1"
 
+        # Q4_K/Q5_K DP4A decode path (rows==1 GEMV) is implemented & numerically
+        # correct (max_abs~0.03, p99_rel~0.06) but NOT default-on: the current
+        # 1-warp-per-output kernel is ~1.4x slower than the tuned float decode GEMV
+        # (0.22ms vs 0.15ms). Enable GGUF_Q4K_Q5K_DP4A=1 to opt in; float decode
+        # is the default until the kernel is parallelized (multi-warp per output).
+
         model, _info = load_minimax_m2_gguf_model(
             bundle,
             device=device,

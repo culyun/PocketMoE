@@ -7547,9 +7547,14 @@ torch::Tensor gguf_quant_gemm_forward_cuda(
     int64_t row_elems,
     int64_t type_id,
     const torch::Tensor& signed_grid) {
-    // Q4_K/Q5_K DP4A decode path (rows==1) is intentionally NOT wired up yet:
-    // the Q5_K 5th-bit unpacking in the custom DP4A kernel needs fixing (see
-    // gguf_mma_wrapper.cu). Decode keeps the float path. Prefill MMA (rows>1) is live.
+    // DP4A decode path (rows==1) for Q4_K / Q5_K single-token GEMV.
+    if ((type_id == 3 || type_id == 4) && env_enabled_explicit("GGUF_Q4K_Q5K_DP4A")) {
+        const int64_t total = x.numel();
+        const int rows = static_cast<int>(row_elems > 0 ? total / row_elems : 0);
+        if (rows == 1 && (row_elems % 256) == 0) {
+            return gguf_q4k_q5k_dp4a_decode_forward_cuda(x, blocks, row_elems, type_id);
+        }
+    }
     c10::cuda::CUDAGuard device_guard(x.device());
     auto x_contig = x.contiguous();
     auto blocks_contig = blocks.contiguous();

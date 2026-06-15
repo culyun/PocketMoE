@@ -155,7 +155,48 @@ def test_q4k_mma_vs_float():
     print(f"✓ Q4_K MMA vs float: max_abs={max_abs:.4e}, mean_abs={mean_abs:.4e}, p99_rel={p99_rel:.4e}")
 
 
-@pytest.mark.skipif(True, reason="Q4_K/Q5_K DP4A decode kernel not wired up (Q5_K 5th-bit unpack WIP); float decode used")
+@pytest.mark.skipif(
+    not (REAL_MINIMAX_PATH.exists() and _cuda_gguf_ext_available()),
+    reason="real MiniMax-M2.7 GGUF bundle or CUDA extension not available",
+)
 def test_q5k_dp4a_decode_vs_float():
-    """Placeholder: Q5_K DP4A decode (rows=1) — disabled, see gguf_mma_wrapper.cu and task #70 notes."""
-    pass
+    """Q5_K DP4A decode (rows=1) matches float baseline within int8 tolerance."""
+    from src.kernels.cuda_loader import load_cuda_kernel
+
+    cuda_mod = load_cuda_kernel()
+    blocks, K, type_id = _load_qk_weight_rows("blk.0.attn_q.weight", row_count=512)
+    assert type_id == 4
+    N = blocks.size(0)
+    torch.manual_seed(2)
+    x = torch.randn(1, K, device="cuda", dtype=torch.float16)
+    grid = torch.empty(0, dtype=torch.int8, device="cuda")
+
+    env_mma = os.environ.get("GGUF_Q4K_Q5K_MMA")
+    env_dp4a = os.environ.get("GGUF_Q4K_Q5K_DP4A")
+    os.environ.pop("GGUF_Q4K_Q5K_MMA", None)
+    os.environ.pop("GGUF_Q4K_Q5K_DP4A", None)
+    y_float = cuda_mod.gguf_quant_gemm_forward(x, blocks, K, type_id, grid)
+
+    os.environ["GGUF_Q4K_Q5K_DP4A"] = "1"
+    y_dp4a = cuda_mod.gguf_quant_gemm_forward(x, blocks, K, type_id, grid)
+
+    for key, val in (("GGUF_Q4K_Q5K_MMA", env_mma), ("GGUF_Q4K_Q5K_DP4A", env_dp4a)):
+        if val is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = val
+
+    assert y_float.shape == y_dp4a.shape == (1, N)
+    abs_diff = (y_dp4a.to(torch.float32) - y_float.to(torch.float32)).abs()
+    max_abs = float(abs_diff.max().item())
+    mean_abs = float(abs_diff.mean().item())
+    mask = y_float.abs() > 0.1
+    rel_err = abs_diff[mask] / (y_float[mask].abs().to(torch.float32) + 1e-8)
+    p99_rel = float(torch.quantile(rel_err, 0.99).item()) if rel_err.numel() else 0.0
+
+    assert torch.isfinite(y_dp4a).all(), "DP4A decode output has non-finite values"
+    assert y_dp4a.abs().sum() > 0.0, "DP4A decode output is all-zero"
+    assert max_abs < 0.5, f"max_abs={max_abs:.4e}, mean_abs={mean_abs:.4e}, p99_rel={p99_rel:.4e}"
+    assert mean_abs < 3.0e-2, f"max_abs={max_abs:.4e}, mean_abs={mean_abs:.4e}, p99_rel={p99_rel:.4e}"
+    assert p99_rel < 0.25, f"max_abs={max_abs:.4e}, mean_abs={mean_abs:.4e}, p99_rel={p99_rel:.4e}"
+    print(f"✓ Q5_K DP4A decode vs float: max_abs={max_abs:.4e}, mean_abs={mean_abs:.4e}, p99_rel={p99_rel:.4e}")

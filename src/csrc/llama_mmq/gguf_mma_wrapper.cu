@@ -339,10 +339,10 @@ struct block_q8_1_decode {
     int8_t qs[32];  // quantized values
 };
 
-// 1 warp (32 threads) quantizes one 32-element block.
+// 1 warp (32 threads) quantizes one 32-element block_q8_1. One CUDA block per q8 block.
 __global__ void quantize_q8_1_decode_kernel(const float * __restrict__ x, void * __restrict__ vy,
         int k, int n_blocks) {
-    const int block_id = blockIdx.x * blockDim.x / 32 + threadIdx.y;
+    const int block_id = blockIdx.x;
     if (block_id >= n_blocks) return;
     const int lane = threadIdx.x;
     const int base = block_id * 32;
@@ -397,18 +397,22 @@ static __device__ __forceinline__ void gguf_get_scale_min_k4(
 //   sum_i x_i*w_i = d8 * [ d*sc_g*dp4a(q_g, x_g) - dmin*mn_g * (a->s / d8) ]
 //                 = d8*d*sc_g*dp4a - dmin*mn_g*a->s        (per group g)
 // We sum over the 8 groups in the weight block.
-template <ggml_type type>
+// 4 warps (128 threads) per output feature: tid = warp*32 + lane strides over
+// weight blocks (kb = tid, stride 128), each block fully handled by one thread
+// (8 groups x 8 dp4a packs). Cross-warp reduction via shared memory + warp reduce.
+template <ggml_type type, int NWARPS>
 __global__ void gguf_dp4a_decode_kernel(
         const char   * __restrict__ x_w,          // weight blocks [N, blocks_per_row, block_bytes]
         const block_q8_1_decode * __restrict__ y, // activation [n_q8_blocks]
         float        * __restrict__ dst,          // [N]
         const int      blocks_per_row,
         const int      block_bytes) {
+    constexpr int warp_size = 32;
     const int out_col = blockIdx.x;
-    const int lane = threadIdx.x;
+    const int tid = warp_size * threadIdx.y + threadIdx.x;
 
     float acc = 0.0f;
-    for (int kb = lane; kb < blocks_per_row; kb += 32) {
+    for (int kb = tid; kb < blocks_per_row; kb += NWARPS * warp_size) {
         const uint8_t * wb = reinterpret_cast<const uint8_t*>(x_w)
                              + (size_t)out_col * blocks_per_row * block_bytes
                              + (size_t)kb * block_bytes;
@@ -426,26 +430,31 @@ __global__ void gguf_dp4a_decode_kernel(
 
             int sumi = 0;
             const int * aq32 = (const int *) a->qs;
+            // Q4_K/Q5_K "supergroup" layout (mirrors ggml dequantize_row_q4_K/q5_K):
+            //   group g (0..7): element l in [0,32) reads byte ql[(g/2)*32 + l],
+            //   taking the low nibble if g is even, the high nibble if g is odd.
+            //   Q5_K 5th bit: qh[l] bit (1<<g) — qh is NOT offset by g (re-read from 0).
+            // Q4_K block: d@0, dmin@2, scales@4(12), qs@16(128).
+            // Q5_K block: d@0, dmin@2, scales@4(12), qh@16(32), qs@48(128).
+            const uint8_t * ql = (type == GGML_TYPE_Q4_K) ? (wb + 16) : (wb + 48);
+            const uint8_t * qh = (type == GGML_TYPE_Q5_K) ? (wb + 16) : nullptr;
+            const int ql_base = (g / 2) * 32;             // first ql byte for this is-pair
+            const int shift   = 4 * (g & 1);              // low nibble (even g) / high nibble (odd g)
+            const int hbit    = 1 << g;                   // 5th-bit mask for Q5_K (qh indexed from 0)
             #pragma unroll
             for (int p = 0; p < 8; ++p) {  // 8 int32 packs x 4 int8 = 32 elements
                 int8_t wp[4];
+                const int l0 = ql_base + p*4;             // element index within group g (0..31)
                 if constexpr (type == GGML_TYPE_Q4_K) {
-                    // qs[128]; group g uses qs[g*16 .. g*16+15]; 2 nibbles/byte.
-                    const uint8_t * qs = wb + 16 + g * 16;
-                    const uint8_t b0 = qs[p*2 + 0], b1 = qs[p*2 + 1];
-                    wp[0] = (int8_t)( b0        & 0x0F);
-                    wp[1] = (int8_t)((b0 >> 4)  & 0x0F);
-                    wp[2] = (int8_t)( b1        & 0x0F);
-                    wp[3] = (int8_t)((b1 >> 4)  & 0x0F);
-                } else {  // Q5_K: qh[32] at +16, qs[128] at +48; 5th bit from qh
-                    const uint8_t * qs = wb + 48 + g * 16;
-                    const uint8_t * qh = wb + 16 + g * 4;
-                    const uint8_t b0 = qs[p*2 + 0], b1 = qs[p*2 + 1];
-                    const uint8_t hb = qh[p];  // 8 bits: 4 for b0's 4 nibbles, 4 for b1's
-                    wp[0] = (int8_t)(( b0       & 0x0F) | (((hb >> 0) & 1) << 4));
-                    wp[1] = (int8_t)(((b0 >> 4) & 0x0F) | (((hb >> 1) & 1) << 4));
-                    wp[2] = (int8_t)(( b1       & 0x0F) | (((hb >> 2) & 1) << 4));
-                    wp[3] = (int8_t)(((b1 >> 4) & 0x0F) | (((hb >> 3) & 1) << 4));
+                    wp[0] = (int8_t)((ql[l0 + 0] >> shift) & 0x0F);
+                    wp[1] = (int8_t)((ql[l0 + 1] >> shift) & 0x0F);
+                    wp[2] = (int8_t)((ql[l0 + 2] >> shift) & 0x0F);
+                    wp[3] = (int8_t)((ql[l0 + 3] >> shift) & 0x0F);
+                } else {  // Q5_K: add 5th bit from qh (indexed from 0, not offset by g)
+                    wp[0] = (int8_t)(((ql[l0 + 0] >> shift) & 0x0F) | ((qh[p*4 + 0] & hbit) ? 16 : 0));
+                    wp[1] = (int8_t)(((ql[l0 + 1] >> shift) & 0x0F) | ((qh[p*4 + 1] & hbit) ? 16 : 0));
+                    wp[2] = (int8_t)(((ql[l0 + 2] >> shift) & 0x0F) | ((qh[p*4 + 2] & hbit) ? 16 : 0));
+                    wp[3] = (int8_t)(((ql[l0 + 3] >> shift) & 0x0F) | ((qh[p*4 + 3] & hbit) ? 16 : 0));
                 }
                 sumi = __dp4a(*((const int*)wp), aq32[p], sumi);
             }
@@ -455,13 +464,25 @@ __global__ void gguf_dp4a_decode_kernel(
         acc += block_acc;
     }
 
-    // warp reduce
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-        acc += __shfl_xor_sync(0xFFFFFFFF, acc, off);
+    // Reduce across NWARPS warps: warps 1..N-1 publish via shared, warp 0 sums.
+    __shared__ float reduce[NWARPS > 1 ? (NWARPS - 1) * warp_size : 1];
+    if (threadIdx.y > 0) {
+        reduce[(threadIdx.y - 1) * warp_size + threadIdx.x] = acc;
     }
-    if (lane == 0) {
-        dst[out_col] = acc;
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+
+    float v = acc;
+    #pragma unroll
+    for (int l = 0; l < NWARPS - 1; ++l) {
+        v += reduce[l * warp_size + threadIdx.x];
+    }
+    #pragma unroll
+    for (int off = warp_size / 2; off > 0; off >>= 1) {
+        v += __shfl_xor_sync(0xFFFFFFFF, v, off);
+    }
+    if (threadIdx.x == 0) {
+        dst[out_col] = v;
     }
 }
 
@@ -492,25 +513,25 @@ torch::Tensor gguf_q4k_q5k_dp4a_decode_forward_cuda(
     auto y_q = torch::empty({n_q8_blocks, (int)sizeof(block_q8_1_decode)},
                             x.options().dtype(torch::kUInt8));
     {
-        const int blocks_per_block = 32;  // threads per q8 block; we use 1 warp
-        const int nblocks = (n_q8_blocks + 31) / 32;
-        quantize_q8_1_decode_kernel<<<nblocks, dim3(32, 1), 0, stream>>>(
+        // One CUDA block (1 warp = 32 threads) per 32-element block_q8_1.
+        quantize_q8_1_decode_kernel<<<n_q8_blocks, dim3(32, 1), 0, stream>>>(
             x_f32.data_ptr<float>(), y_q.data_ptr(), k, n_q8_blocks);
     }
 
     // --- 3. DP4A decode GEMV -> fp32 [1, N] ---
     auto dst_f32 = torch::empty({1, N}, x.options().dtype(torch::kFloat32));
     const int block_bytes = static_cast<int>(blocks_contig.size(2));
+    constexpr int NWARPS = 4;  // 4 warps (128 threads) per output feature
     const int grid = N;
-    const dim3 block(32, 1, 1);
+    const dim3 block(32, NWARPS, 1);
 
     const char * x_w = reinterpret_cast<const char*>(blocks_contig.data_ptr<uint8_t>());
     if (type_id == 3) {
-        gguf_dp4a_decode_kernel<GGML_TYPE_Q4_K><<<grid, block, 0, stream>>>(
+        gguf_dp4a_decode_kernel<GGML_TYPE_Q4_K, NWARPS><<<grid, block, 0, stream>>>(
             x_w, reinterpret_cast<const block_q8_1_decode*>(y_q.data_ptr()),
             dst_f32.data_ptr<float>(), bpr, block_bytes);
     } else {
-        gguf_dp4a_decode_kernel<GGML_TYPE_Q5_K><<<grid, block, 0, stream>>>(
+        gguf_dp4a_decode_kernel<GGML_TYPE_Q5_K, NWARPS><<<grid, block, 0, stream>>>(
             x_w, reinterpret_cast<const block_q8_1_decode*>(y_q.data_ptr()),
             dst_f32.data_ptr<float>(), bpr, block_bytes);
     }
