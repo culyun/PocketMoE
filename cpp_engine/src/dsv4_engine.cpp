@@ -8317,16 +8317,24 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         const size_t chunk_inter = static_cast<size_t>(chunk_alloc) * moe_inter;
         const size_t routes_dim = static_cast<size_t>(routes_cap) * dim;
         const size_t routes_inter = static_cast<size_t>(routes_cap) * moe_inter;
-        int prefill_attn_window = env_int_or_default("DSV4_GGUF_PREFILL_ATTN_WINDOW", prompt_tokens);
+        // Default to sparse window=128 (same as FP4) instead of full causal
+        int prefill_attn_window = env_int_or_default("DSV4_GGUF_PREFILL_ATTN_WINDOW", 128);
         if (prefill_attn_window <= 0 || prefill_attn_window > prompt_tokens) prefill_attn_window = prompt_tokens;
         const int prefill_attn_topk = std::min(prompt_tokens, prefill_attn_window);
         const int64_t prefill_attn_index_elems = static_cast<int64_t>(prompt_tokens) * prefill_attn_topk;
         const int64_t prefill_attn_max_index_elems = static_cast<int64_t>(env_int_or_default("DSV4_GGUF_PREFILL_ATTN_MAX_INDEX_ELEMS", 64 * 1024 * 1024));
         const int prefill_attn_max_index_topk = env_int_or_default("DSV4_GGUF_PREFILL_INDEXED_ATTN_MAX_TOPK", 8192);
-        const bool use_prefill_indexed_attn = env_int_or_default("DSV4_GGUF_PREFILL_INDEXED_ATTN", 0) != 0 &&
+        // Enable indexed attention by default when window < prompt_tokens
+        const bool use_prefill_indexed_attn = env_int_or_default("DSV4_GGUF_PREFILL_INDEXED_ATTN", 1) != 0 &&
             prefill_attn_topk > 0 && prefill_attn_index_elems > 0 &&
             (prefill_attn_max_index_topk <= 0 || prefill_attn_topk <= prefill_attn_max_index_topk) &&
             (prefill_attn_max_index_elems <= 0 || prefill_attn_index_elems <= prefill_attn_max_index_elems);
+        if (tp_rank == 0) {
+            std::cout << "gguf_prefill_attention: use_indexed=" << (use_prefill_indexed_attn ? 1 : 0)
+                      << " window=" << prefill_attn_window
+                      << " topk=" << prefill_attn_topk
+                      << " prompt_tokens=" << prompt_tokens << "\n";
+        }
         const bool iq1_grouped_w2_q8_enabled = env_int_or_default("DSV4_IQ1_GROUPED_W2_Q8", 1) != 0;
         const bool iq1_grouped_gemm_enabled = env_int_or_default("DSV4_IQ1_GROUPED_GEMM", 1) != 0;
         const bool iq1_grouped_route_tile4_enabled = env_int_or_default("DSV4_IQ1_GROUPED_ROUTE_TILE4", 0) != 0;
@@ -8490,7 +8498,7 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                 if (!head_rmsnorm_rope_rows_cuda(d_kv_rows, cn, 1, head_dim, rope_dim, cs, ld.rope_theta, false, 0.0f)) throw std::runtime_error("GGUF prefill kv rope rows failed");
                 if (!copy_rows_to_kv_cache_cuda(d_kv_rows, d_kv_cache[L], cn, head_dim, layer_cache_capacity[L], cs)) throw std::runtime_error("GGUF prefill kv cache rows copy failed");
                 if (use_prefill_indexed_attn) {
-                    if (!prefill_sparse_attention_indexed_cuda(d_q_rows, d_kv_cache[L], d_attn_sink[L], d_prefill_attn_indices + static_cast<size_t>(cs) * prefill_attn_topk, d_attn_value_rows, cn, heads, ce, prefill_attn_topk, head_dim, 1.0f / std::sqrt(static_cast<float>(head_dim)))) throw std::runtime_error("GGUF prefill indexed attention rows failed");
+                    if (!prefill_sparse_attention_headpair_cuda(d_q_rows, d_kv_cache[L], d_attn_sink[L], d_prefill_attn_indices + static_cast<size_t>(cs) * prefill_attn_topk, d_attn_value_rows, cn, heads, ce, prefill_attn_topk, head_dim, 1.0f / std::sqrt(static_cast<float>(head_dim)))) throw std::runtime_error("GGUF prefill headpair attention rows failed");
                 } else {
                     if (!prefill_causal_attention_chunk_cuda(d_q_rows, d_kv_cache[L], d_attn_sink[L], d_attn_value_rows, cn, heads, ce, head_dim, layer_cache_capacity[L], cs, 1.0f / std::sqrt(static_cast<float>(head_dim)))) throw std::runtime_error("GGUF prefill attention rows failed");
                 }
