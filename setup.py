@@ -44,6 +44,7 @@ setup(
                 str(CSRC / "cuda_kernel.cpp"),
                 str(CSRC / "cuda_kernel_impl.cu"),
                 str(CSRC / "minimax_rope_kernel.cu"),
+                str(CSRC / "llama_mmq" / "gguf_mma_wrapper.cu"),
             ],
             libraries=["cublas"],
             extra_compile_args={
