@@ -4220,6 +4220,18 @@ struct GgufLayerDeviceWeights {
     DType routed_w1_dtype = DType::Unknown;
     DType routed_w2_dtype = DType::Unknown;
     DType routed_w3_dtype = DType::Unknown;
+
+    // HC (Hierarchical Classifier) per-layer transform weights. When
+    // d_hc_attn_fn is non-null, the layer functions run the HC pre/post
+    // transforms around attention and FFN (DeepSeek-V4-Flash hc_mult=4).
+    // Left null by non-HC smoke callers, which keep plain residual adds.
+    const float* d_hc_attn_fn = nullptr;     // [24, 4*dim] f32
+    const float* d_hc_attn_scale = nullptr;  // [3] f32
+    const float* d_hc_attn_base = nullptr;   // [24] f32
+    const float* d_hc_ffn_fn = nullptr;      // [24, 4*dim] f32
+    const float* d_hc_ffn_scale = nullptr;   // [3] f32
+    const float* d_hc_ffn_base = nullptr;    // [24] f32
+
     const GgufCompressorDeviceWeights* compressor = nullptr;
     const GgufIndexerDeviceWeights* indexer = nullptr;
     GgufSparseLayerState* sparse_state = nullptr;
@@ -4314,6 +4326,16 @@ struct GgufLayerScratch {
     float* d_indexer_comp_score = nullptr;
     float* d_index_q = nullptr;
     float* d_index_scores = nullptr;
+
+    // HC scratch. d_h4 holds the 4-copy hidden state [4*dim] that flows between
+    // layers (the residual stream when HC is active). d_x / d_x_normed* hold the
+    // reduced single-dim view that attention + FFN operate on. Only populated by
+    // the HC-enabled generate path; null for the plain smoke callers.
+    float* d_h4 = nullptr;          // [4*dim] residual stream (HC)
+    float* d_h4_next = nullptr;     // [4*dim] hc_post output
+    uint16_t* d_h4_bf16 = nullptr;  // [4*dim] bf16 round-trip scratch
+    float* d_hc_post = nullptr;     // [4] post weights from hc_pre
+    float* d_hc_comb = nullptr;     // [16] comb matrix from hc_pre
 };
 
 // Phase 1: attention residual + ffn_norm + shared expert + gate scoring.
@@ -4325,9 +4347,18 @@ void gguf_layer_forward_attn_to_gate(const GgufLayerDeviceWeights& w,
                                      const GgufLayerDims& d,
                                      int position,
                                      const GgufReduceContext* reduce_ctx) {
+    const bool use_hc = (w.d_hc_attn_fn != nullptr);
     // ===== Attention =====
-    check_cuda(cudaMemcpy(s.d_x_pre_attn, s.d_x, d.dim * sizeof(float),
-                          cudaMemcpyDeviceToDevice), "save x_pre_attn");
+    if (use_hc) {
+        // HC pre: reduce the 4-copy residual stream d_h4 -> d_x and emit the
+        // post/comb weights consumed by the matching hc_post after attention.
+        if (!hc_pre_float_cuda(s.d_h4, w.d_hc_attn_fn, w.d_hc_attn_scale,
+                               w.d_hc_attn_base, s.d_x, s.d_hc_post, s.d_hc_comb, d.dim))
+            throw std::runtime_error("gguf hc attn pre failed");
+    } else {
+        check_cuda(cudaMemcpy(s.d_x_pre_attn, s.d_x, d.dim * sizeof(float),
+                              cudaMemcpyDeviceToDevice), "save x_pre_attn");
+    }
     if (!rmsnorm_bf16_gamma_cuda(s.d_x, w.d_attn_gamma, s.d_x_normed, d.dim, 1e-6f))
         throw std::runtime_error("attn_norm failed");
     const bool use_sparse_compressor =
@@ -4591,15 +4622,36 @@ void gguf_layer_forward_attn_to_gate(const GgufLayerDeviceWeights& w,
     if (!q8_0_matvec_cuda(s.d_attn_mid, w.d_wo_b, s.d_attn_out, d.dim, d.attn_mid))
         throw std::runtime_error("wo_b failed");
     gguf_all_reduce_sum_fp32_inplace(s.d_attn_out, d.dim, reduce_ctx, "GGUF attention all-reduce");
-    // Attention residual.
-    if (!vector_add_cuda(s.d_x_pre_attn, s.d_attn_out, s.d_x, d.dim))
-        throw std::runtime_error("attn residual add failed");
+    if (use_hc) {
+        // HC post (attn): expand reduced attn output back to the 4-copy stream,
+        // mixing in the pre-attn residual via the comb matrix. bf16 round-trip
+        // matches the PyTorch reference numerics (h stored bf16 between blocks).
+        if (!hc_post_float_cuda(s.d_attn_out, s.d_h4, s.d_hc_post, s.d_hc_comb, s.d_h4_next, d.dim))
+            throw std::runtime_error("gguf hc attn post failed");
+        if (!fp32_to_bf16_cuda(s.d_h4_next, s.d_h4_bf16, 4 * d.dim))
+            throw std::runtime_error("gguf hc attn post bf16 round failed");
+        if (!bf16_to_fp32_cuda(s.d_h4_bf16, s.d_h4, 4 * d.dim))
+            throw std::runtime_error("gguf hc attn post bf16 restore failed");
 
-    // ===== FFN: norm + shared expert + gate =====
-    check_cuda(cudaMemcpy(s.d_x_pre_ffn, s.d_x, d.dim * sizeof(float),
-                          cudaMemcpyDeviceToDevice), "save x_pre_ffn");
-    if (!rmsnorm_bf16_gamma_cuda(s.d_x, w.d_ffn_gamma, s.d_x_normed_ffn, d.dim, 1e-6f))
-        throw std::runtime_error("ffn_norm failed");
+        // ===== FFN: hc_pre + norm + shared expert + gate =====
+        // HC pre (ffn): reduce d_h4 -> d_x_pre_ffn (reuse as reduced x) and emit
+        // fresh post/comb for the post-FFN hc_post.
+        if (!hc_pre_float_cuda(s.d_h4, w.d_hc_ffn_fn, w.d_hc_ffn_scale,
+                               w.d_hc_ffn_base, s.d_x_pre_ffn, s.d_hc_post, s.d_hc_comb, d.dim))
+            throw std::runtime_error("gguf hc ffn pre failed");
+        if (!rmsnorm_bf16_gamma_cuda(s.d_x_pre_ffn, w.d_ffn_gamma, s.d_x_normed_ffn, d.dim, 1e-6f))
+            throw std::runtime_error("ffn_norm failed");
+    } else {
+        // Attention residual.
+        if (!vector_add_cuda(s.d_x_pre_attn, s.d_attn_out, s.d_x, d.dim))
+            throw std::runtime_error("attn residual add failed");
+
+        // ===== FFN: norm + shared expert + gate =====
+        check_cuda(cudaMemcpy(s.d_x_pre_ffn, s.d_x, d.dim * sizeof(float),
+                              cudaMemcpyDeviceToDevice), "save x_pre_ffn");
+        if (!rmsnorm_bf16_gamma_cuda(s.d_x, w.d_ffn_gamma, s.d_x_normed_ffn, d.dim, 1e-6f))
+            throw std::runtime_error("ffn_norm failed");
+    }
 
     // Shared expert (Q8_0 w1/w3 + silu_mul + Q8_0 w2).
     if (!q8_0_matvec_cuda(s.d_x_normed_ffn, w.d_shared_w1, s.d_shared_gate,
@@ -4737,8 +4789,20 @@ void gguf_layer_forward_moe(const GgufLayerDeviceWeights& w,
 
     if (!vector_add_cuda(s.d_shared_out, s.d_moe_out, s.d_ffn_combined, d.dim))
         throw std::runtime_error("ffn combined add failed");
-    if (!vector_add_cuda(s.d_x_pre_ffn, s.d_ffn_combined, s.d_x, d.dim))
-        throw std::runtime_error("ffn residual add failed");
+    if (w.d_hc_attn_fn != nullptr) {
+        // HC post (ffn): expand the combined FFN output back to the 4-copy
+        // stream, mixing in the post-attn residual (s.d_h4) via comb, then
+        // bf16 round-trip. s.d_h4 becomes the input to the next layer's hc_pre.
+        if (!hc_post_float_cuda(s.d_ffn_combined, s.d_h4, s.d_hc_post, s.d_hc_comb, s.d_h4_next, d.dim))
+            throw std::runtime_error("gguf hc ffn post failed");
+        if (!fp32_to_bf16_cuda(s.d_h4_next, s.d_h4_bf16, 4 * d.dim))
+            throw std::runtime_error("gguf hc ffn post bf16 round failed");
+        if (!bf16_to_fp32_cuda(s.d_h4_bf16, s.d_h4, 4 * d.dim))
+            throw std::runtime_error("gguf hc ffn post bf16 restore failed");
+    } else {
+        if (!vector_add_cuda(s.d_x_pre_ffn, s.d_ffn_combined, s.d_x, d.dim))
+            throw std::runtime_error("ffn residual add failed");
+    }
 }
 
 // Convenience wrapper for the legacy single-layer smoke that pre-stages
@@ -7125,6 +7189,12 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     std::vector<uint8_t*> d_shared_w3(n_layers, nullptr);
     std::vector<uint16_t*> d_gate_w(n_layers, nullptr);
     std::vector<float*> d_gate_bias(n_layers, nullptr);
+    std::vector<float*> d_hc_attn_fn(n_layers, nullptr);
+    std::vector<float*> d_hc_attn_scale(n_layers, nullptr);
+    std::vector<float*> d_hc_attn_base(n_layers, nullptr);
+    std::vector<float*> d_hc_ffn_fn(n_layers, nullptr);
+    std::vector<float*> d_hc_ffn_scale(n_layers, nullptr);
+    std::vector<float*> d_hc_ffn_base(n_layers, nullptr);
     std::vector<GgufCompressorDeviceWeights> d_compressor_w(n_layers);
     std::vector<GgufIndexerDeviceWeights> d_indexer_w(n_layers);
     std::vector<GgufSparseLayerState> d_sparse_state(n_layers);
@@ -7184,6 +7254,29 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                 static_cast<int>(bias.shape[0]) != n_experts)
                 throw std::runtime_error("exp_probs_b.bias shape/dtype");
             d_gate_bias[L] = upload_f32(bias.data, n_experts);
+        }
+        // HC per-layer transforms. fn F16->F32; scale/base F32. The GGUF
+        // dims report [4*dim, mix] but the bytes are row-major with 4*dim
+        // (=16384) fastest-varying, matching the kernel's fn[r*(4*dim)+i].
+        {
+            WeightView attn_fn = gws.require(lp + ".hc_attn_fn");
+            WeightView attn_scale = gws.require(lp + ".hc_attn_scale");
+            WeightView attn_base = gws.require(lp + ".hc_attn_base");
+            WeightView ffn_fn = gws.require(lp + ".hc_ffn_fn");
+            WeightView ffn_scale = gws.require(lp + ".hc_ffn_scale");
+            WeightView ffn_base = gws.require(lp + ".hc_ffn_base");
+            if (attn_fn.dtype != DType::F16 || ffn_fn.dtype != DType::F16)
+                throw std::runtime_error("hc_attn_fn/hc_ffn_fn expected F16");
+            const size_t fn_elems = static_cast<size_t>(24) * 4 * dim;
+            if (attn_fn.nbytes != fn_elems * sizeof(uint16_t) ||
+                ffn_fn.nbytes != fn_elems * sizeof(uint16_t))
+                throw std::runtime_error("hc fn element count mismatch (expected 24*4*dim F16)");
+            d_hc_attn_fn[L] = upload_f32_from_f16(attn_fn.data, fn_elems);
+            d_hc_attn_scale[L] = upload_f32(attn_scale.data, 3);
+            d_hc_attn_base[L] = upload_f32(attn_base.data, 24);
+            d_hc_ffn_fn[L] = upload_f32_from_f16(ffn_fn.data, fn_elems);
+            d_hc_ffn_scale[L] = upload_f32(ffn_scale.data, 3);
+            d_hc_ffn_base[L] = upload_f32(ffn_base.data, 24);
         }
         if (gguf_sparse_compressor && L < static_cast<int>(ctx.config.compress_ratios.size()) && ctx.config.compress_ratios[L] > 0) {
             auto load_comp = [&](const std::string& prefix, int ratio, int state_head_dim) {
@@ -7257,6 +7350,28 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     uint16_t* d_final_norm_gamma = upload_bf16_from_f32(final_norm.data, dim);
     auto head_local = slice_q8_0_rows(head.data, local_vocab_start, local_vocab, dim);
     uint8_t* d_head = upload_u8(head_local.data(), head_local.size());
+
+    // ===== HC head weights (host-resident; hc_head_cpu consumes float*) =====
+    // output_hc_fn is F16 [4*dim, 4]; base [4] F32; scale [1] F32. hc_head_cpu
+    // reduces the final 4-copy hidden (4*dim) -> single dim via per-copy
+    // sigmoid weights (no post/comb). The reduction runs once per step on the
+    // host, matching the FP4 path; cost is negligible (4*4096 MACs).
+    WeightView hc_head_fn_v = gws.require("hc_head_fn");
+    WeightView hc_head_scale_v = gws.require("hc_head_scale");
+    WeightView hc_head_base_v = gws.require("hc_head_base");
+    if (hc_head_fn_v.dtype != DType::F16)
+        throw std::runtime_error("hc_head_fn expected F16");
+    const size_t hc_head_fn_elems = static_cast<size_t>(4) * 4 * dim;
+    if (hc_head_fn_v.nbytes != hc_head_fn_elems * sizeof(uint16_t))
+        throw std::runtime_error("hc_head_fn element count mismatch (expected 4*4*dim F16)");
+    std::vector<float> h_hc_head_fn =
+        f16_to_f32_host(reinterpret_cast<const uint16_t*>(hc_head_fn_v.data), hc_head_fn_elems);
+    std::vector<float> h_hc_head_scale(
+        reinterpret_cast<const float*>(hc_head_scale_v.data),
+        reinterpret_cast<const float*>(hc_head_scale_v.data) + 1);
+    std::vector<float> h_hc_head_base(
+        reinterpret_cast<const float*>(hc_head_base_v.data),
+        reinterpret_cast<const float*>(hc_head_base_v.data) + 4);
 
     // ===== routed expert staging / resident buffers =====
     // Dynamic IQ1_M GGUF changes W2 dtype/byte-size after early layers, so size
@@ -7729,6 +7844,11 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     float* d_index_q = nullptr;
     float* d_index_scores = nullptr;
     float* d_logits = nullptr;
+    float* d_h4 = nullptr;
+    float* d_h4_next = nullptr;
+    uint16_t* d_h4_bf16 = nullptr;
+    float* d_hc_post = nullptr;
+    float* d_hc_comb = nullptr;
     int* d_argmax_token = nullptr;
     float* d_argmax_logit = nullptr;
     check_cuda(cudaMalloc(&d_x, dim * sizeof(float)), "alloc d_x");
@@ -7803,6 +7923,11 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                    "alloc GGUF sparse index score scratch");
     }
     check_cuda(cudaMalloc(&d_logits, local_vocab * sizeof(float)), "alloc d_logits");
+    check_cuda(cudaMalloc(&d_h4, static_cast<size_t>(4) * dim * sizeof(float)), "alloc d_h4");
+    check_cuda(cudaMalloc(&d_h4_next, static_cast<size_t>(4) * dim * sizeof(float)), "alloc d_h4_next");
+    check_cuda(cudaMalloc(&d_h4_bf16, static_cast<size_t>(4) * dim * sizeof(uint16_t)), "alloc d_h4_bf16");
+    check_cuda(cudaMalloc(&d_hc_post, 4 * sizeof(float)), "alloc d_hc_post");
+    check_cuda(cudaMalloc(&d_hc_comb, 16 * sizeof(float)), "alloc d_hc_comb");
     check_cuda(cudaMalloc(&d_argmax_token, sizeof(int)), "alloc d_argmax_token");
     check_cuda(cudaMalloc(&d_argmax_logit, sizeof(float)), "alloc d_argmax_logit");
     if (gguf_mem_profile) gguf_log_mem("after_scratch", tp_rank);
@@ -7891,6 +8016,11 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     ls.d_indexer_comp_score = d_indexer_comp_score;
     ls.d_index_q = d_index_q;
     ls.d_index_scores = d_index_scores;
+    ls.d_h4 = d_h4;
+    ls.d_h4_next = d_h4_next;
+    ls.d_h4_bf16 = d_h4_bf16;
+    ls.d_hc_post = d_hc_post;
+    ls.d_hc_comb = d_hc_comb;
 
     auto t_load_end = std::chrono::steady_clock::now();
     const bool gguf_load_only = env_int_or_default("DSV4_GGUF_LOAD_ONLY", 0) != 0;
@@ -7957,6 +8087,10 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                               cudaMemcpyHostToDevice), "copy embed row");
         if (!f16_row_to_float_cuda(d_embed_row_f16, d_x, /*row=*/0, dim))
             throw std::runtime_error("f16 embed failed");
+        // DeepSeek-V4-Flash HC residual stream starts as 4 copies of the token
+        // embedding. Layer HC pre/post consumes and updates d_h4.
+        if (!hc_repeat_rows_cuda(d_x, d_h4, 1, dim))
+            throw std::runtime_error("hc repeat embed failed");
         auto t_embed_end = sync_now();
         if (profile_gguf) prof_embed_ms += elapsed_ms(t_embed_start, t_embed_end);
         int gguf_kv_index_count = 0;
@@ -8053,6 +8187,12 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
             lw.routed_w1_dtype = layer_w1_dtype[L];
             lw.routed_w2_dtype = layer_w2_dtype[L];
             lw.routed_w3_dtype = layer_w3_dtype[L];
+            lw.d_hc_attn_fn = d_hc_attn_fn[L];
+            lw.d_hc_attn_scale = d_hc_attn_scale[L];
+            lw.d_hc_attn_base = d_hc_attn_base[L];
+            lw.d_hc_ffn_fn = d_hc_ffn_fn[L];
+            lw.d_hc_ffn_scale = d_hc_ffn_scale[L];
+            lw.d_hc_ffn_base = d_hc_ffn_base[L];
             const bool layer_sparse_enabled = gguf_sparse_compressor && d_compressor_w[L].present;
             lw.compressor = layer_sparse_enabled ? &d_compressor_w[L] : nullptr;
             lw.indexer = (layer_sparse_enabled && d_indexer_w[L].present) ? &d_indexer_w[L] : nullptr;
@@ -8240,6 +8380,17 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
             if (profile_gguf && !decode_only_attention_only) prof_moe_ms += elapsed_ms(t_stage_end, t_moe_end);
         }
         auto t_head_start = sync_now();
+        {
+            std::vector<float> last_h4(static_cast<size_t>(4) * dim);
+            check_cuda(cudaMemcpy(last_h4.data(), d_h4,
+                                  static_cast<size_t>(4) * dim * sizeof(float),
+                                  cudaMemcpyDeviceToHost), "copy final hc h4");
+            std::vector<float> host_x = hc_head_cpu(last_h4, h_hc_head_fn.data(),
+                                                    h_hc_head_scale.data(),
+                                                    h_hc_head_base.data(), dim);
+            check_cuda(cudaMemcpy(d_x, host_x.data(), dim * sizeof(float),
+                                  cudaMemcpyHostToDevice), "copy hc head x");
+        }
         if (!rmsnorm_bf16_gamma_cuda(d_x, d_final_norm_gamma, d_x_normed, dim, 1e-6f))
             throw std::runtime_error("final norm failed");
         if (!q8_0_matvec_cuda(d_x_normed, d_head, d_logits, local_vocab, dim))
@@ -8284,8 +8435,12 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     };
 
     const bool gguf_chunked_prefill_requested = env_int_or_default("DSV4_GGUF_CHUNKED_PREFILL", 0) != 0;
+    // The row/chunked prefill path below is still the plain residual-stream path;
+    // keep it disabled for HC GGUF until hc_pre/hc_post rows are wired there too.
+    const bool gguf_hc_decode_path = !d_hc_attn_fn.empty() && d_hc_attn_fn[0] != nullptr;
     const bool gguf_chunked_prefill_available =
         gguf_chunked_prefill_requested &&
+        !gguf_hc_decode_path &&
         decode_only_context == 0 &&
         max_new_tokens > 0 &&
         !gguf_load_only &&
@@ -8294,7 +8449,8 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         hash_table_resident;
     if (gguf_chunked_prefill_requested && !gguf_chunked_prefill_available && tp_rank == 0) {
         const char* reason = "unknown";
-        if (decode_only_context != 0) reason = "decode_only";
+        if (gguf_hc_decode_path) reason = "hc_not_supported";
+        else if (decode_only_context != 0) reason = "decode_only";
         else if (max_new_tokens <= 0) reason = "no_generation";
         else if (gguf_load_only) reason = "load_only";
         else if (gguf_sparse_compressor) reason = "sparse_compressor_not_supported";
@@ -8825,6 +8981,8 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     free_vec_u8(d_wo_a); free_vec_u8(d_wo_b);
     free_vec_u8(d_shared_w1); free_vec_u8(d_shared_w2); free_vec_u8(d_shared_w3);
     free_vec_u16(d_gate_w); free_vec_f32(d_gate_bias);
+    free_vec_f32(d_hc_attn_fn); free_vec_f32(d_hc_attn_scale); free_vec_f32(d_hc_attn_base);
+    free_vec_f32(d_hc_ffn_fn); free_vec_f32(d_hc_ffn_scale); free_vec_f32(d_hc_ffn_base);
     for (auto& c : d_compressor_w) {
         cudaFree(const_cast<uint16_t*>(c.wkv));
         cudaFree(const_cast<uint16_t*>(c.wgate));
@@ -8870,6 +9028,8 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     cudaFree(d_indexer_comp_kv); cudaFree(d_indexer_comp_score);
     cudaFree(d_index_q); cudaFree(d_index_scores);
     cudaFree(d_logits);
+    cudaFree(d_h4); cudaFree(d_h4_next); cudaFree(d_h4_bf16);
+    cudaFree(d_hc_post); cudaFree(d_hc_comb);
     cudaFree(d_argmax_token); cudaFree(d_argmax_logit);
     free_vec_u8(d_resident_w1); free_vec_u8(d_resident_w2); free_vec_u8(d_resident_w3);
     if (moe_copy_stream_enabled) {
