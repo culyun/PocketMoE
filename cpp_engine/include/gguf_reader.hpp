@@ -60,8 +60,11 @@ public:
     std::vector<uint64_t> metadata_u64_array(const std::string& key) const;
     std::vector<double> metadata_f64_array(const std::string& key) const;
 
-    // Raw mmap base + size, exposed so callers can cudaHostRegister the
-    // entire file region for pinned async H2D out of GGUF data.
+    // Raw mmap base, for CPU-side reads of tensor bytes only.
+    // DO NOT cudaHostRegister this whole file-backed region: pinning an
+    // 80GB+ mmap poisons Linux dirty-page accounting and stalls writeback
+    // system-wide (balance_dirty_pages). Expert H2D must copy from these
+    // pageable pointers directly, or via a small bounded pinned staging buffer.
     const uint8_t* bytes() const { return static_cast<const uint8_t*>(data_); }
 
 private:

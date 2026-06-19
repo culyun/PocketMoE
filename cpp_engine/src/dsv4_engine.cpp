@@ -6964,31 +6964,15 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     GgufForwardContext ctx(ckpt_path);
     GGUFWeightSource& gws = *ctx.weight_source;
 
-    // ===== optional GGUF mmap pinning for async H2D out of expert bytes =====
-    // Do NOT register the whole GGUF mmap by default. Large file-backed
-    // cudaHostRegister() calls can make the kernel account the entire mapping as
-    // dirty/pinned; with TP4 an ~86 GiB GGUF becomes ~344 GiB per run and can
-    // quickly throttle unrelated git/build/source writes via balance_dirty_pages.
-    // Resident-routed decode no longer needs this for its hot path, so keep it as
-    // an explicit debug/legacy staging knob with a conservative size guard.
-    void* gguf_base = const_cast<uint8_t*>(gws.file().bytes());
-    const size_t gguf_bytes = gws.file().file_size();
-    bool gguf_registered = false;
-    const bool gguf_register_mmap = env_int_or_default("DSV4_GGUF_REGISTER_MMAP", 0) != 0;
-    const int gguf_register_mmap_max_gib = env_int_or_default("DSV4_GGUF_REGISTER_MMAP_MAX_GIB", 4);
-    const size_t gguf_register_mmap_max_bytes =
-        gguf_register_mmap_max_gib <= 0 ? 0 : static_cast<size_t>(gguf_register_mmap_max_gib) * 1024ULL * 1024ULL * 1024ULL;
-    if (gguf_register_mmap && gguf_register_mmap_max_bytes > 0 && gguf_bytes <= gguf_register_mmap_max_bytes) {
-        if (cudaHostRegister(gguf_base, gguf_bytes, cudaHostRegisterReadOnly) == cudaSuccess) {
-            gguf_registered = true;
-        } else if (cudaHostRegister(gguf_base, gguf_bytes, cudaHostRegisterDefault) == cudaSuccess) {
-            gguf_registered = true;
-        } else {
-            // Clear the error and continue with the pageable path; correctness
-            // is unaffected, only bandwidth.
-            cudaGetLastError();
-        }
-    }
+    // ===== whole-GGUF mmap pinning is BANNED =====
+    // Never cudaHostRegister the whole GGUF mmap. Registering a file-backed
+    // 80GB+ mapping pins file pages and poisons Linux dirty-page accounting /
+    // writeback: with TP4 an ~86 GiB GGUF is accounted ~344 GiB dirty, which
+    // wedges balance_dirty_pages and stalls all unrelated fsync/git/build I/O
+    // system-wide (observed Dirty ballooning to hundreds of GB, requiring a
+    // reboot). Reads still work, only writeback stalls, so it looks like a disk
+    // fault. Expert H2D MUST use pageable source pointers directly or the
+    // bounded anonymous pinned GgufPinnedStagingRing below; never pin the mmap.
 
     // ===== model dims =====
     const int n_layers = static_cast<int>(ctx.config.n_layers);
@@ -9062,7 +9046,6 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         cudaEventDestroy(gguf_kv_swap_stage_event);
         cudaStreamDestroy(gguf_kv_swap_copy_stream);
     }
-    if (gguf_registered) cudaHostUnregister(gguf_base);
     return r;
 }
 
