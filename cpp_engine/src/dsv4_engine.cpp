@@ -2082,6 +2082,27 @@ struct SafeForwardContext {
         return inserted.first->second;
     }
 
+    // Reset the streaming compressor running state (kv accumulator -> 0, score
+    // -> -INF) for every layer. Unlike the sliding-window KV cache and the
+    // indexer KV cache (which prefill overwrites position-by-position so a new
+    // request fully replaces the previous one when N < window), the compressor
+    // state is an *incremental* accumulator updated at offset = position % ratio
+    // and only flushed/pooled at block boundaries ((position+1) % ratio == 0).
+    // When a request ends mid-block, a partial accumulation lingers in kv/score
+    // and the next request resumes from it, contaminating compressed-KV output.
+    // reset_session() must call this to restore the initial state.
+    void reset_streaming_compressor_states() {
+        auto reset_one = [](DeviceCompressorState& s) {
+            if (s.kv == nullptr || s.score == nullptr || s.slots <= 0 || s.cols <= 0) return;
+            const size_t n = static_cast<size_t>(s.slots) * static_cast<size_t>(s.cols);
+            check_cuda(cudaMemset(s.kv, 0, n * sizeof(float)), "reset compressor kv state");
+            std::vector<float> init(n, -INFINITY);
+            check_cuda(cudaMemcpy(s.score, init.data(), n * sizeof(float), cudaMemcpyHostToDevice), "reset compressor score state");
+        };
+        for (auto& [_, s] : compressor_device_state) reset_one(s);
+        for (auto& [_, s] : indexer_compressor_device_state) reset_one(s);
+    }
+
     int kv_cache_capacity_for_layer(int layer_id) const {
         const int window = static_cast<int>(config.window_size == 0 ? 128 : config.window_size);
         uint64_t ratio = 0;
@@ -9093,10 +9114,16 @@ PersistentEngine::PersistentEngine(const std::string& ckpt_dir,
 PersistentEngine::~PersistentEngine() = default;
 
 void PersistentEngine::reset_session() {
-    // KV / indexer caches are pre-allocated to max_context capacity. Prefill
-    // overwrites positions 0..N-1, and decode writes positions >= N, so cross
-    // request contamination is impossible by construction. We still sync to
-    // drain any in-flight stream work from the previous request.
+    // Sliding-window KV and indexer KV caches are pre-allocated to max_context
+    // and prefill overwrites positions 0..N-1, so for N < window a new request
+    // fully replaces the previous one with no carryover. The streaming
+    // compressor running state is different: it is an incremental accumulator
+    // (offset = position % ratio, flushed only at block boundaries), so a
+    // request that ends mid-block leaves a partial accumulation that the next
+    // request would resume from. Explicitly restore it to the initial state.
+    auto& ctx = *state_->ctx;
+    ctx.reset_streaming_compressor_states();
+    // Sync to drain any in-flight stream work from the previous request.
     cudaDeviceSynchronize();
 }
 
