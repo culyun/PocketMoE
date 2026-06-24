@@ -7449,7 +7449,7 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     const bool device_route_slots = any_resident_routed &&
         env_int_or_default("DSV4_GGUF_DEVICE_ROUTE_SLOTS", 1) != 0;
     GgufPinnedStagingRing gguf_pinned_stage;
-    const bool gguf_pinned_stage_enabled = env_int_or_default("DSV4_GGUF_PINNED_STAGE", 0) != 0;
+    const bool gguf_pinned_stage_enabled = env_int_or_default("DSV4_GGUF_PINNED_STAGE", 1) != 0;
     if (gguf_pinned_stage_enabled && !all_resident_routed) {
         const size_t max_stage_copy_bytes = std::max<size_t>(
             static_cast<size_t>(std::max(max_per_w1_bytes, std::max(max_per_w2_bytes, max_per_w3_bytes))),
@@ -7970,6 +7970,18 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         check_cuda(cudaEventRecord(gguf_moe_consume_event, nullptr),
                    "record initial gguf moe consume event");
     }
+    const bool gguf_prefill_shared_overlap_enabled = env_int_or_default("DSV4_GGUF_PREFILL_SHARED_OVERLAP", 0) != 0;
+    cudaStream_t gguf_prefill_shared_stream = nullptr;
+    cudaEvent_t gguf_prefill_shared_ready_event = nullptr;
+    cudaEvent_t gguf_prefill_shared_done_event = nullptr;
+    if (gguf_prefill_shared_overlap_enabled) {
+        check_cuda(cudaStreamCreateWithFlags(&gguf_prefill_shared_stream, cudaStreamNonBlocking),
+                   "create GGUF prefill shared stream");
+        check_cuda(cudaEventCreateWithFlags(&gguf_prefill_shared_ready_event, cudaEventDisableTiming),
+                   "create GGUF prefill shared ready event");
+        check_cuda(cudaEventCreateWithFlags(&gguf_prefill_shared_done_event, cudaEventDisableTiming),
+                   "create GGUF prefill shared done event");
+    }
 
 #ifdef DSV4_HAVE_NCCL
     BF16AllReduceScratch bf16_reduce_scratch;
@@ -8439,13 +8451,9 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         return {top_t, top_l};
     };
 
-    const bool gguf_chunked_prefill_requested = env_int_or_default("DSV4_GGUF_CHUNKED_PREFILL", 0) != 0;
-    // The row/chunked prefill path below is still the plain residual-stream path;
-    // keep it disabled for HC GGUF until hc_pre/hc_post rows are wired there too.
-    const bool gguf_hc_decode_path = !d_hc_attn_fn.empty() && d_hc_attn_fn[0] != nullptr;
+    const bool gguf_chunked_prefill_requested = env_int_or_default("DSV4_GGUF_CHUNKED_PREFILL", 1) != 0;
     const bool gguf_chunked_prefill_available =
         gguf_chunked_prefill_requested &&
-        !gguf_hc_decode_path &&
         decode_only_context == 0 &&
         max_new_tokens > 0 &&
         !gguf_load_only &&
@@ -8454,8 +8462,7 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         hash_table_resident;
     if (gguf_chunked_prefill_requested && !gguf_chunked_prefill_available && tp_rank == 0) {
         const char* reason = "unknown";
-        if (gguf_hc_decode_path) reason = "hc_not_supported";
-        else if (decode_only_context != 0) reason = "decode_only";
+        if (decode_only_context != 0) reason = "decode_only";
         else if (max_new_tokens <= 0) reason = "no_generation";
         else if (gguf_load_only) reason = "load_only";
         else if (gguf_sparse_compressor) reason = "sparse_compressor_not_supported";
@@ -8466,6 +8473,7 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
 
     auto run_chunked_prefill = [&]() -> std::pair<int, float> {
         const int prompt_tokens = static_cast<int>(seed_tokens.size());
+        const bool use_hc = !d_hc_attn_fn.empty() && d_hc_attn_fn[0] != nullptr;
         int chunk_tokens = env_int_or_default("DSV4_GGUF_PREFILL_CHUNK_TOKENS", 512);
         if (chunk_tokens <= 0 || chunk_tokens > prompt_tokens) chunk_tokens = prompt_tokens;
         const int chunk_alloc = chunk_tokens;
@@ -8478,16 +8486,18 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         const size_t chunk_inter = static_cast<size_t>(chunk_alloc) * moe_inter;
         const size_t routes_dim = static_cast<size_t>(routes_cap) * dim;
         const size_t routes_inter = static_cast<size_t>(routes_cap) * moe_inter;
-        int prefill_attn_window = env_int_or_default("DSV4_GGUF_PREFILL_ATTN_WINDOW", prompt_tokens);
+        int prefill_attn_window = env_int_or_default("DSV4_GGUF_PREFILL_ATTN_WINDOW", static_cast<int>(ctx.config.window_size == 0 ? 128 : ctx.config.window_size));
         if (prefill_attn_window <= 0 || prefill_attn_window > prompt_tokens) prefill_attn_window = prompt_tokens;
         const int prefill_attn_topk = std::min(prompt_tokens, prefill_attn_window);
         const int64_t prefill_attn_index_elems = static_cast<int64_t>(prompt_tokens) * prefill_attn_topk;
         const int64_t prefill_attn_max_index_elems = static_cast<int64_t>(env_int_or_default("DSV4_GGUF_PREFILL_ATTN_MAX_INDEX_ELEMS", 64 * 1024 * 1024));
         const int prefill_attn_max_index_topk = env_int_or_default("DSV4_GGUF_PREFILL_INDEXED_ATTN_MAX_TOPK", 8192);
-        const bool use_prefill_indexed_attn = env_int_or_default("DSV4_GGUF_PREFILL_INDEXED_ATTN", 0) != 0 &&
+        const bool use_prefill_indexed_attn = env_int_or_default("DSV4_GGUF_PREFILL_INDEXED_ATTN", 1) != 0 &&
             prefill_attn_topk > 0 && prefill_attn_index_elems > 0 &&
             (prefill_attn_max_index_topk <= 0 || prefill_attn_topk <= prefill_attn_max_index_topk) &&
             (prefill_attn_max_index_elems <= 0 || prefill_attn_index_elems <= prefill_attn_max_index_elems);
+        const bool use_prefill_headpair_attn = use_prefill_indexed_attn &&
+            env_int_or_default("DSV4_GGUF_PREFILL_HEADPAIR_ATTN", 0) != 0;
         const bool iq1_grouped_w2_q8_enabled = env_int_or_default("DSV4_IQ1_GROUPED_W2_Q8", 1) != 0;
         const bool iq1_grouped_gemm_enabled = env_int_or_default("DSV4_IQ1_GROUPED_GEMM", 1) != 0;
         const bool iq1_grouped_route_tile4_enabled = env_int_or_default("DSV4_IQ1_GROUPED_ROUTE_TILE4", 0) != 0;
@@ -8523,6 +8533,13 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         int32_t* d_total_routes = nullptr;
         int32_t* d_prefill_attn_indices = nullptr;
         float* d_final_norm_rows = nullptr;
+        float* d_h4_rows = nullptr;
+        float* d_h4_next_rows = nullptr;
+        uint16_t* d_h4_bf16_rows = nullptr;
+        float* d_hc_post_rows = nullptr;
+        float* d_hc_comb_rows = nullptr;
+        float* d_x_rows = nullptr;
+        float* d_hc_last_x = nullptr;
 
         MoePrefillQ2GroupedWorkspace q2_ws;
         MoePrefillIq1GroupedWorkspace iq1_ws;
@@ -8577,6 +8594,15 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                       << " max_index_elems=" << prefill_attn_max_index_elems << "\n";
         }
         check_cuda(cudaMalloc(&d_final_norm_rows, static_cast<size_t>(dim) * sizeof(float)), "alloc GGUF prefill final norm");
+        if (use_hc) {
+            check_cuda(cudaMalloc(&d_h4_rows, static_cast<size_t>(prompt_tokens) * 4 * dim * sizeof(float)), "alloc GGUF prefill hc h4 rows");
+            check_cuda(cudaMalloc(&d_h4_next_rows, chunk_dim * 4 * sizeof(float)), "alloc GGUF prefill hc h4 next rows");
+            check_cuda(cudaMalloc(&d_h4_bf16_rows, chunk_dim * 4 * sizeof(uint16_t)), "alloc GGUF prefill hc h4 bf16 rows");
+            check_cuda(cudaMalloc(&d_hc_post_rows, static_cast<size_t>(chunk_alloc) * 4 * sizeof(float)), "alloc GGUF prefill hc post rows");
+            check_cuda(cudaMalloc(&d_hc_comb_rows, static_cast<size_t>(chunk_alloc) * 16 * sizeof(float)), "alloc GGUF prefill hc comb rows");
+            check_cuda(cudaMalloc(&d_x_rows, chunk_dim * sizeof(float)), "alloc GGUF prefill hc x rows");
+            check_cuda(cudaMalloc(&d_hc_last_x, static_cast<size_t>(dim) * sizeof(float)), "alloc GGUF prefill hc last x");
+        }
         if (need_q2_ws) {
             q2_ws.routes_cap = routes_cap; q2_ws.dim = dim; q2_ws.inter_dim = moe_inter;
             check_cuda(cudaMalloc(&q2_ws.d_x_route, routes_dim * sizeof(float)), "alloc GGUF prefill q2 x route");
@@ -8616,13 +8642,21 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                             static_cast<size_t>(dim) * sizeof(uint16_t));
             }
             check_cuda(cudaMemcpy(d_embed_chunk_f16, h_embed_chunk.data(), static_cast<size_t>(cn) * dim * sizeof(uint16_t), cudaMemcpyHostToDevice), "copy GGUF prefill embed chunk");
-            if (!f16_contiguous_rows_to_float_cuda(d_embed_chunk_f16, d_state_rows + static_cast<size_t>(cs) * dim, cn, dim))
-                throw std::runtime_error("GGUF prefill embed rows failed");
+            if (use_hc) {
+                if (!f16_contiguous_rows_to_float_cuda(d_embed_chunk_f16, d_x_rows, cn, dim))
+                    throw std::runtime_error("GGUF prefill embed rows (hc) failed");
+                if (!hc_repeat_rows_cuda(d_x_rows, d_h4_rows + static_cast<size_t>(cs) * 4 * dim, cn, dim))
+                    throw std::runtime_error("GGUF prefill hc repeat rows failed");
+            } else {
+                if (!f16_contiguous_rows_to_float_cuda(d_embed_chunk_f16, d_state_rows + static_cast<size_t>(cs) * dim, cn, dim))
+                    throw std::runtime_error("GGUF prefill embed rows failed");
+            }
         }
 
         std::vector<int32_t> h_counts(static_cast<size_t>(experts_per_rank));
         double prof_prefill_attn_ms = 0.0;
         double prof_prefill_gate_ms = 0.0;
+        double prof_prefill_stage_ms = 0.0;
         double prof_prefill_moe_ms = 0.0;
         double prof_prefill_shared_ms = 0.0;
         for (int L = 0; L < n_layers; ++L) {
@@ -8640,8 +8674,13 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                 const int ce = cs + cn;
                 const size_t cn_dim = static_cast<size_t>(cn) * dim;
                 float* state_chunk = d_state_rows + static_cast<size_t>(cs) * dim;
+                float* h4_chunk = use_hc ? (d_h4_rows + static_cast<size_t>(cs) * 4 * dim) : nullptr;
+                float* residual_chunk = use_hc ? d_x_rows : state_chunk;
                 auto stage_t = sync_now();
-                if (!rmsnorm_bf16_gamma_rows_cuda(state_chunk, d_attn_gamma[L], d_attn_norm_rows, cn, dim, 1e-6f)) throw std::runtime_error("GGUF prefill attn norm rows failed");
+                if (use_hc) {
+                    if (!hc_pre_float_rows_cuda(h4_chunk, d_hc_attn_fn[L], d_hc_attn_scale[L], d_hc_attn_base[L], d_x_rows, d_hc_post_rows, d_hc_comb_rows, cn, dim)) throw std::runtime_error("GGUF prefill hc attn pre rows failed");
+                }
+                if (!rmsnorm_bf16_gamma_rows_cuda(residual_chunk, d_attn_gamma[L], d_attn_norm_rows, cn, dim, 1e-6f)) throw std::runtime_error("GGUF prefill attn norm rows failed");
                 if (!q8_0_matmul_rows_cuda(d_attn_norm_rows, d_wq_a[L], d_q_a_rows, cn, q_a_dim, dim)) throw std::runtime_error("GGUF prefill wq_a rows failed");
                 if (!rmsnorm_bf16_gamma_rows_cuda(d_q_a_rows, d_q_gamma[L], d_q_norm_rows, cn, q_a_dim, 1e-6f)) throw std::runtime_error("GGUF prefill q norm rows failed");
                 if (!q8_0_matmul_rows_cuda(d_q_norm_rows, d_wq_b[L], d_q_rows, cn, q_full, q_a_dim)) throw std::runtime_error("GGUF prefill wq_b rows failed");
@@ -8651,7 +8690,11 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                 if (!head_rmsnorm_rope_rows_cuda(d_kv_rows, cn, 1, head_dim, rope_dim, cs, ld.rope_theta, false, 0.0f)) throw std::runtime_error("GGUF prefill kv rope rows failed");
                 if (!copy_rows_to_kv_cache_cuda(d_kv_rows, d_kv_cache[L], cn, head_dim, layer_cache_capacity[L], cs)) throw std::runtime_error("GGUF prefill kv cache rows copy failed");
                 if (use_prefill_indexed_attn) {
-                    if (!prefill_sparse_attention_indexed_cuda(d_q_rows, d_kv_cache[L], d_attn_sink[L], d_prefill_attn_indices + static_cast<size_t>(cs) * prefill_attn_topk, d_attn_value_rows, cn, heads, ce, prefill_attn_topk, head_dim, 1.0f / std::sqrt(static_cast<float>(head_dim)))) throw std::runtime_error("GGUF prefill indexed attention rows failed");
+                    if (use_prefill_headpair_attn) {
+                        if (!prefill_sparse_attention_headpair_cuda(d_q_rows, d_kv_cache[L], d_attn_sink[L], d_prefill_attn_indices + static_cast<size_t>(cs) * prefill_attn_topk, d_attn_value_rows, cn, heads, ce, prefill_attn_topk, head_dim, 1.0f / std::sqrt(static_cast<float>(head_dim)))) throw std::runtime_error("GGUF prefill headpair indexed attention rows failed");
+                    } else {
+                        if (!prefill_sparse_attention_indexed_cuda(d_q_rows, d_kv_cache[L], d_attn_sink[L], d_prefill_attn_indices + static_cast<size_t>(cs) * prefill_attn_topk, d_attn_value_rows, cn, heads, ce, prefill_attn_topk, head_dim, 1.0f / std::sqrt(static_cast<float>(head_dim)))) throw std::runtime_error("GGUF prefill indexed attention rows failed");
+                    }
                 } else {
                     if (!prefill_causal_attention_chunk_cuda(d_q_rows, d_kv_cache[L], d_attn_sink[L], d_attn_value_rows, cn, heads, ce, head_dim, layer_cache_capacity[L], cs, 1.0f / std::sqrt(static_cast<float>(head_dim)))) throw std::runtime_error("GGUF prefill attention rows failed");
                 }
@@ -8665,11 +8708,20 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                 }
                 if (!q8_0_matmul_rows_cuda(d_attn_mid_rows, d_wo_b[L], d_attn_out_rows, cn, dim, attn_mid)) throw std::runtime_error("GGUF prefill wo_b rows failed");
                 gguf_all_reduce_sum_fp32_inplace(d_attn_out_rows, static_cast<int>(cn_dim), reduce_ctx_ptr, "GGUF prefill attention all-reduce");
-                if (!vector_accum_rows_cuda(d_attn_out_rows, state_chunk, cn, dim, 1.0f)) throw std::runtime_error("GGUF prefill attention residual failed");
+                if (use_hc) {
+                    if (!hc_post_float_rows_cuda(d_attn_out_rows, h4_chunk, d_hc_post_rows, d_hc_comb_rows, d_h4_next_rows, cn, dim)) throw std::runtime_error("GGUF prefill hc attn post rows failed");
+                    if (!fp32_to_bf16_cuda(d_h4_next_rows, d_h4_bf16_rows, static_cast<int>(cn_dim * 4))) throw std::runtime_error("GGUF prefill hc attn post bf16 round failed");
+                    if (!bf16_to_fp32_cuda(d_h4_bf16_rows, h4_chunk, static_cast<int>(cn_dim * 4))) throw std::runtime_error("GGUF prefill hc attn post bf16 restore failed");
+                } else {
+                    if (!vector_accum_rows_cuda(d_attn_out_rows, state_chunk, cn, dim, 1.0f)) throw std::runtime_error("GGUF prefill attention residual failed");
+                }
                 if (profile_gguf) prof_prefill_attn_ms += elapsed_ms(stage_t, sync_now());
 
                 stage_t = sync_now();
-                if (!rmsnorm_bf16_gamma_rows_cuda(state_chunk, d_ffn_gamma[L], d_ffn_norm_rows, cn, dim, 1e-6f)) throw std::runtime_error("GGUF prefill ffn norm rows failed");
+                if (use_hc) {
+                    if (!hc_pre_float_rows_cuda(h4_chunk, d_hc_ffn_fn[L], d_hc_ffn_scale[L], d_hc_ffn_base[L], d_x_rows, d_hc_post_rows, d_hc_comb_rows, cn, dim)) throw std::runtime_error("GGUF prefill hc ffn pre rows failed");
+                }
+                if (!rmsnorm_bf16_gamma_rows_cuda(residual_chunk, d_ffn_gamma[L], d_ffn_norm_rows, cn, dim, 1e-6f)) throw std::runtime_error("GGUF prefill ffn norm rows failed");
                 if (is_hash) {
                     if (d_tid2eid_table[L] == nullptr) throw std::runtime_error("GGUF chunked prefill requires resident hash table");
                     if (!gate_hash_bf16_rows_cuda(d_ffn_norm_rows, d_gate_w[L], d_tid2eid_table[L], d_prefill_token_ids + cs, d_prefill_route_indices, d_prefill_route_weights, cn, dim, topk, topk, ld.route_scale)) throw std::runtime_error("GGUF prefill hash gate rows failed");
@@ -8707,28 +8759,69 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                 }
 
                 stage_t = sync_now();
-                if (total_routes > 0 && max_count > 0) {
-                    const uint8_t* routed_w1 = is_resident_routed_layer[L] ? d_resident_w1[L] : d_routed_w1;
-                    const uint8_t* routed_w2 = is_resident_routed_layer[L] ? d_resident_w2[L] : d_routed_w2;
-                    const uint8_t* routed_w3 = is_resident_routed_layer[L] ? d_resident_w3[L] : d_routed_w3;
-                    int routed_n = is_resident_routed_layer[L] ? experts_per_rank : experts_per_rank;
-                    if (!is_resident_routed_layer[L]) {
-                        const size_t w1_layer_bytes = static_cast<size_t>(layer_w1_bytes[L]);
-                        const size_t w2_layer_bytes = static_cast<size_t>(layer_w2_bytes[L]);
-                        const size_t w3_layer_bytes = static_cast<size_t>(layer_w3_bytes[L]);
-                        for (int local = 0; local < experts_per_rank; ++local) {
-                            if (h_counts[static_cast<size_t>(local)] == 0 || h_prefill_staged_local[static_cast<size_t>(local)] != 0) continue;
-                            const int eid = expert_start + local;
-                            const std::string lp = "layers." + std::to_string(L);
-                            auto wv1 = gws.get_expert(lp + ".ffn.experts.routed.w1", lp + ".ffn.experts.routed.w1", eid);
-                            auto wv2 = gws.get_expert(lp + ".ffn.experts.routed.w2", lp + ".ffn.experts.routed.w2", eid);
-                            auto wv3 = gws.get_expert(lp + ".ffn.experts.routed.w3", lp + ".ffn.experts.routed.w3", eid);
-                            if (!wv1.found || !wv2.found || !wv3.found) throw std::runtime_error("GGUF prefill get_expert failed");
-                            check_cuda(cudaMemcpy(d_routed_w1 + w1_layer_bytes * local, wv1.data, w1_layer_bytes, cudaMemcpyHostToDevice), "stage GGUF prefill routed w1");
-                            check_cuda(cudaMemcpy(d_routed_w2 + w2_layer_bytes * local, wv2.data, w2_layer_bytes, cudaMemcpyHostToDevice), "stage GGUF prefill routed w2");
-                            check_cuda(cudaMemcpy(d_routed_w3 + w3_layer_bytes * local, wv3.data, w3_layer_bytes, cudaMemcpyHostToDevice), "stage GGUF prefill routed w3");
-                            h_prefill_staged_local[static_cast<size_t>(local)] = 1;
+                const bool have_routes = total_routes > 0 && max_count > 0;
+                const uint8_t* routed_w1 = is_resident_routed_layer[L] ? d_resident_w1[L] : d_routed_w1;
+                const uint8_t* routed_w2 = is_resident_routed_layer[L] ? d_resident_w2[L] : d_routed_w2;
+                const uint8_t* routed_w3 = is_resident_routed_layer[L] ? d_resident_w3[L] : d_routed_w3;
+                const int routed_n = experts_per_rank;
+                bool staged_this_chunk = false;
+                if (have_routes && !is_resident_routed_layer[L]) {
+                    const size_t w1_layer_bytes = static_cast<size_t>(layer_w1_bytes[L]);
+                    const size_t w2_layer_bytes = static_cast<size_t>(layer_w2_bytes[L]);
+                    const size_t w3_layer_bytes = static_cast<size_t>(layer_w3_bytes[L]);
+                    const std::string lp = "layers." + std::to_string(L);
+                    bool copy_stream_waited = false;
+                    cudaStream_t stage_stream = moe_copy_stream_enabled ? gguf_moe_copy_stream : nullptr;
+                    for (int local = 0; local < experts_per_rank; ++local) {
+                        if (h_counts[static_cast<size_t>(local)] == 0 || h_prefill_staged_local[static_cast<size_t>(local)] != 0) continue;
+                        if (moe_copy_stream_enabled && !copy_stream_waited) {
+                            check_cuda(cudaStreamWaitEvent(gguf_moe_copy_stream, gguf_moe_consume_event, 0),
+                                       "GGUF prefill copy stream wait prior MoE consume event");
+                            copy_stream_waited = true;
                         }
+                        const int eid = expert_start + local;
+                        auto wv1 = gws.get_expert(lp + ".ffn.experts.routed.w1", lp + ".ffn.experts.routed.w1", eid);
+                        auto wv2 = gws.get_expert(lp + ".ffn.experts.routed.w2", lp + ".ffn.experts.routed.w2", eid);
+                        auto wv3 = gws.get_expert(lp + ".ffn.experts.routed.w3", lp + ".ffn.experts.routed.w3", eid);
+                        if (!wv1.found || !wv2.found || !wv3.found) throw std::runtime_error("GGUF prefill get_expert failed");
+                        gguf_pinned_stage.copy_async(d_routed_w1 + w1_layer_bytes * local, wv1.data, w1_layer_bytes, stage_stream, "stage GGUF prefill routed w1");
+                        gguf_pinned_stage.copy_async(d_routed_w2 + w2_layer_bytes * local, wv2.data, w2_layer_bytes, stage_stream, "stage GGUF prefill routed w2");
+                        gguf_pinned_stage.copy_async(d_routed_w3 + w3_layer_bytes * local, wv3.data, w3_layer_bytes, stage_stream, "stage GGUF prefill routed w3");
+                        h_prefill_staged_local[static_cast<size_t>(local)] = 1;
+                        staged_this_chunk = true;
+                    }
+                    if (moe_copy_stream_enabled && staged_this_chunk) {
+                        check_cuda(cudaEventRecord(gguf_moe_stage_event, gguf_moe_copy_stream),
+                                   "record GGUF prefill MoE stage event");
+                    }
+                }
+                if (profile_gguf) prof_prefill_stage_ms += elapsed_ms(stage_t, sync_now());
+
+                auto shared_t = std::chrono::steady_clock::now();
+                if (gguf_prefill_shared_overlap_enabled) {
+                    check_cuda(cudaEventRecord(gguf_prefill_shared_ready_event, nullptr),
+                               "record GGUF prefill shared ready event");
+                    check_cuda(cudaStreamWaitEvent(gguf_prefill_shared_stream, gguf_prefill_shared_ready_event, 0),
+                               "GGUF prefill shared stream wait ready event");
+                    if (!q8_0_matmul_rows_cuda(d_ffn_norm_rows, d_shared_w1[L], d_shared_gate_rows, cn, moe_inter, dim, gguf_prefill_shared_stream)) throw std::runtime_error("GGUF prefill shared w1 overlap rows failed");
+                    if (!q8_0_matmul_rows_cuda(d_ffn_norm_rows, d_shared_w3[L], d_shared_up_rows, cn, moe_inter, dim, gguf_prefill_shared_stream)) throw std::runtime_error("GGUF prefill shared w3 overlap rows failed");
+                    if (!silu_mul_rows_cuda(d_shared_gate_rows, d_shared_up_rows, d_shared_hidden_rows, cn, moe_inter, gguf_prefill_shared_stream)) throw std::runtime_error("GGUF prefill shared silu overlap rows failed");
+                    if (!q8_0_matmul_rows_cuda(d_shared_hidden_rows, d_shared_w2[L], d_shared_out_rows, cn, dim, moe_inter, gguf_prefill_shared_stream)) throw std::runtime_error("GGUF prefill shared w2 overlap rows failed");
+                    check_cuda(cudaEventRecord(gguf_prefill_shared_done_event, gguf_prefill_shared_stream),
+                               "record GGUF prefill shared done event");
+                } else {
+                    if (!q8_0_matmul_rows_cuda(d_ffn_norm_rows, d_shared_w1[L], d_shared_gate_rows, cn, moe_inter, dim)) throw std::runtime_error("GGUF prefill shared w1 rows failed");
+                    if (!q8_0_matmul_rows_cuda(d_ffn_norm_rows, d_shared_w3[L], d_shared_up_rows, cn, moe_inter, dim)) throw std::runtime_error("GGUF prefill shared w3 rows failed");
+                    if (!silu_mul_rows_cuda(d_shared_gate_rows, d_shared_up_rows, d_shared_hidden_rows, cn, moe_inter)) throw std::runtime_error("GGUF prefill shared silu rows failed");
+                    if (!q8_0_matmul_rows_cuda(d_shared_hidden_rows, d_shared_w2[L], d_shared_out_rows, cn, dim, moe_inter)) throw std::runtime_error("GGUF prefill shared w2 rows failed");
+                }
+                if (profile_gguf) prof_prefill_shared_ms += elapsed_ms(shared_t, sync_now());
+
+                stage_t = sync_now();
+                if (have_routes) {
+                    if (moe_copy_stream_enabled && staged_this_chunk) {
+                        check_cuda(cudaStreamWaitEvent(nullptr, gguf_moe_stage_event, 0),
+                                   "GGUF prefill default stream wait MoE stage event");
                     }
                     if (q2_recipe) {
                         if (!moe_prefill_q2_grouped_cuda_with_workspace(d_ffn_norm_rows, d_group_route_tokens, d_group_route_weights, d_seg_starts, routed_w1, routed_w2, routed_w3, d_moe_rows, cn, total_routes, routed_n, max_count, dim, moe_inter, ld.swiglu_limit, q2_ws)) throw std::runtime_error("GGUF prefill grouped Q2 MoE failed");
@@ -8741,24 +8834,41 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                     } else {
                         throw std::runtime_error("GGUF prefill unsupported routed dtype recipe");
                     }
+                    if (moe_copy_stream_enabled && !is_resident_routed_layer[L]) {
+                        check_cuda(cudaEventRecord(gguf_moe_consume_event, nullptr),
+                                   "record GGUF prefill MoE consume event");
+                    }
                 } else {
                     check_cuda(cudaMemset(d_moe_rows, 0, cn_dim * sizeof(float)), "zero GGUF prefill empty moe rows");
                 }
                 gguf_all_reduce_sum_fp32_inplace(d_moe_rows, static_cast<int>(cn_dim), reduce_ctx_ptr, "GGUF prefill MoE all-reduce");
-                if (profile_gguf) prof_prefill_moe_ms += elapsed_ms(stage_t, sync_now());
-
-                stage_t = sync_now();
-                if (!q8_0_matmul_rows_cuda(d_ffn_norm_rows, d_shared_w1[L], d_shared_gate_rows, cn, moe_inter, dim)) throw std::runtime_error("GGUF prefill shared w1 rows failed");
-                if (!q8_0_matmul_rows_cuda(d_ffn_norm_rows, d_shared_w3[L], d_shared_up_rows, cn, moe_inter, dim)) throw std::runtime_error("GGUF prefill shared w3 rows failed");
-                if (!silu_mul_rows_cuda(d_shared_gate_rows, d_shared_up_rows, d_shared_hidden_rows, cn, moe_inter)) throw std::runtime_error("GGUF prefill shared silu rows failed");
-                if (!q8_0_matmul_rows_cuda(d_shared_hidden_rows, d_shared_w2[L], d_shared_out_rows, cn, dim, moe_inter)) throw std::runtime_error("GGUF prefill shared w2 rows failed");
+                if (gguf_prefill_shared_overlap_enabled) {
+                    check_cuda(cudaStreamWaitEvent(nullptr, gguf_prefill_shared_done_event, 0),
+                               "GGUF prefill default stream wait shared done event");
+                }
                 if (!vector_accum_rows_cuda(d_shared_out_rows, d_moe_rows, cn, dim, 1.0f)) throw std::runtime_error("GGUF prefill shared accum failed");
-                if (!vector_accum_rows_cuda(d_moe_rows, state_chunk, cn, dim, 1.0f)) throw std::runtime_error("GGUF prefill ffn residual failed");
-                if (profile_gguf) prof_prefill_shared_ms += elapsed_ms(stage_t, sync_now());
+                if (use_hc) {
+                    if (!hc_post_float_rows_cuda(d_moe_rows, h4_chunk, d_hc_post_rows, d_hc_comb_rows, d_h4_next_rows, cn, dim)) throw std::runtime_error("GGUF prefill hc ffn post rows failed");
+                    if (!fp32_to_bf16_cuda(d_h4_next_rows, d_h4_bf16_rows, static_cast<int>(cn_dim * 4))) throw std::runtime_error("GGUF prefill hc ffn post bf16 round failed");
+                    if (!bf16_to_fp32_cuda(d_h4_bf16_rows, h4_chunk, static_cast<int>(cn_dim * 4))) throw std::runtime_error("GGUF prefill hc ffn post bf16 restore failed");
+                } else {
+                    if (!vector_accum_rows_cuda(d_moe_rows, state_chunk, cn, dim, 1.0f)) throw std::runtime_error("GGUF prefill ffn residual failed");
+                }
+                if (profile_gguf) prof_prefill_moe_ms += elapsed_ms(stage_t, sync_now());
             }
         }
 
-        float* last_row = d_state_rows + static_cast<size_t>(prompt_tokens - 1) * dim;
+        const float* last_row = d_state_rows + static_cast<size_t>(prompt_tokens - 1) * dim;
+        if (use_hc) {
+            std::vector<float> last_h4(static_cast<size_t>(4) * dim);
+            check_cuda(cudaMemcpy(last_h4.data(), d_h4_rows + static_cast<size_t>(prompt_tokens - 1) * 4 * dim,
+                                  static_cast<size_t>(4) * dim * sizeof(float), cudaMemcpyDeviceToHost),
+                       "copy GGUF prefill final hc h4");
+            std::vector<float> host_x = hc_head_cpu(last_h4, h_hc_head_fn.data(), h_hc_head_scale.data(), h_hc_head_base.data(), dim);
+            check_cuda(cudaMemcpy(d_hc_last_x, host_x.data(), static_cast<size_t>(dim) * sizeof(float), cudaMemcpyHostToDevice),
+                       "copy GGUF prefill hc head x");
+            last_row = d_hc_last_x;
+        }
         if (!rmsnorm_bf16_gamma_cuda(last_row, d_final_norm_gamma, d_final_norm_rows, dim, 1e-6f)) throw std::runtime_error("GGUF prefill final norm failed");
         if (!q8_0_matvec_cuda(d_final_norm_rows, d_head, d_logits, local_vocab, dim)) throw std::runtime_error("GGUF prefill head failed");
         int top_t = local_vocab_start;
@@ -8788,7 +8898,7 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         }
 #endif
         double prof_prefill_refine_ms = 0.0;
-        int refine_last_tokens = env_int_or_default("DSV4_GGUF_PREFILL_REFINE_LAST_TOKENS", env_int_or_default("DSV4_GGUF_PREFILL_REFINE_LAST", 1) != 0 ? 1 : 0);
+        int refine_last_tokens = env_int_or_default("DSV4_GGUF_PREFILL_REFINE_LAST_TOKENS", env_int_or_default("DSV4_GGUF_PREFILL_REFINE_LAST", 0) != 0 ? 1 : 0);
         if (refine_last_tokens < 0) refine_last_tokens = 0;
         if (refine_last_tokens > prompt_tokens) refine_last_tokens = prompt_tokens;
         if (refine_last_tokens > 0 && prompt_tokens > 0) {
@@ -8809,6 +8919,7 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
                       << " iq1_tile4=" << (iq1_grouped_route_tile4_enabled ? 1 : 0)
                       << " iq1_route_major=" << (iq1_grouped_route_major_enabled ? 1 : 0)
                       << " indexed_attn=" << (use_prefill_indexed_attn ? 1 : 0)
+                      << " headpair_attn=" << (use_prefill_headpair_attn ? 1 : 0)
                       << " attn_topk=" << prefill_attn_topk
                       << " attn_ms=" << prof_prefill_attn_ms
                       << " gate_ms=" << prof_prefill_gate_ms
@@ -8824,6 +8935,7 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         cudaFree(d_ffn_norm_rows); cudaFree(d_shared_gate_rows); cudaFree(d_shared_up_rows); cudaFree(d_shared_hidden_rows); cudaFree(d_shared_out_rows); cudaFree(d_moe_rows);
         cudaFree(d_prefill_route_indices); cudaFree(d_prefill_route_weights); cudaFree(d_group_route_tokens); cudaFree(d_group_route_weights);
         cudaFree(d_seg_starts); cudaFree(d_counts); cudaFree(d_offsets); cudaFree(d_total_routes); cudaFree(d_prefill_attn_indices); cudaFree(d_final_norm_rows);
+        cudaFree(d_h4_rows); cudaFree(d_h4_next_rows); cudaFree(d_h4_bf16_rows); cudaFree(d_hc_post_rows); cudaFree(d_hc_comb_rows); cudaFree(d_x_rows); cudaFree(d_hc_last_x);
         cudaFree(q2_ws.d_x_route); cudaFree(q2_ws.d_x_q); cudaFree(q2_ws.d_x_scale); cudaFree(q2_ws.d_route_slots); cudaFree(q2_ws.d_gate); cudaFree(q2_ws.d_up); cudaFree(q2_ws.d_hidden_q); cudaFree(q2_ws.d_hidden_scale);
         cudaFree(iq1_ws.d_hidden); cudaFree(iq1_ws.d_hidden_q); cudaFree(iq1_ws.d_hidden_scale); cudaFree(iq1_ws.d_x_q); cudaFree(iq1_ws.d_x_scale); cudaFree(iq1_ws.d_tile_experts); cudaFree(iq1_ws.d_tile_rows);
         return {top_t, top_l};
@@ -9041,6 +9153,11 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         cudaEventDestroy(gguf_moe_stage_event);
         cudaEventDestroy(gguf_moe_consume_event);
         cudaStreamDestroy(gguf_moe_copy_stream);
+    }
+    if (gguf_prefill_shared_overlap_enabled) {
+        cudaEventDestroy(gguf_prefill_shared_ready_event);
+        cudaEventDestroy(gguf_prefill_shared_done_event);
+        cudaStreamDestroy(gguf_prefill_shared_stream);
     }
     if (gguf_kv_swap_async_h2d) {
         cudaEventDestroy(gguf_kv_swap_stage_event);
