@@ -2082,6 +2082,27 @@ struct SafeForwardContext {
         return inserted.first->second;
     }
 
+    // Reset the streaming compressor running state (kv accumulator -> 0, score
+    // -> -INF) for every layer. Unlike the sliding-window KV cache and the
+    // indexer KV cache (which prefill overwrites position-by-position so a new
+    // request fully replaces the previous one when N < window), the compressor
+    // state is an *incremental* accumulator updated at offset = position % ratio
+    // and only flushed/pooled at block boundaries ((position+1) % ratio == 0).
+    // When a request ends mid-block, a partial accumulation lingers in kv/score
+    // and the next request resumes from it, contaminating compressed-KV output.
+    // reset_session() must call this to restore the initial state.
+    void reset_streaming_compressor_states() {
+        auto reset_one = [](DeviceCompressorState& s) {
+            if (s.kv == nullptr || s.score == nullptr || s.slots <= 0 || s.cols <= 0) return;
+            const size_t n = static_cast<size_t>(s.slots) * static_cast<size_t>(s.cols);
+            check_cuda(cudaMemset(s.kv, 0, n * sizeof(float)), "reset compressor kv state");
+            std::vector<float> init(n, -INFINITY);
+            check_cuda(cudaMemcpy(s.score, init.data(), n * sizeof(float), cudaMemcpyHostToDevice), "reset compressor score state");
+        };
+        for (auto& [_, s] : compressor_device_state) reset_one(s);
+        for (auto& [_, s] : indexer_compressor_device_state) reset_one(s);
+    }
+
     int kv_cache_capacity_for_layer(int layer_id) const {
         const int window = static_cast<int>(config.window_size == 0 ? 128 : config.window_size);
         uint64_t ratio = 0;
@@ -6943,31 +6964,15 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
     GgufForwardContext ctx(ckpt_path);
     GGUFWeightSource& gws = *ctx.weight_source;
 
-    // ===== optional GGUF mmap pinning for async H2D out of expert bytes =====
-    // Do NOT register the whole GGUF mmap by default. Large file-backed
-    // cudaHostRegister() calls can make the kernel account the entire mapping as
-    // dirty/pinned; with TP4 an ~86 GiB GGUF becomes ~344 GiB per run and can
-    // quickly throttle unrelated git/build/source writes via balance_dirty_pages.
-    // Resident-routed decode no longer needs this for its hot path, so keep it as
-    // an explicit debug/legacy staging knob with a conservative size guard.
-    void* gguf_base = const_cast<uint8_t*>(gws.file().bytes());
-    const size_t gguf_bytes = gws.file().file_size();
-    bool gguf_registered = false;
-    const bool gguf_register_mmap = env_int_or_default("DSV4_GGUF_REGISTER_MMAP", 0) != 0;
-    const int gguf_register_mmap_max_gib = env_int_or_default("DSV4_GGUF_REGISTER_MMAP_MAX_GIB", 4);
-    const size_t gguf_register_mmap_max_bytes =
-        gguf_register_mmap_max_gib <= 0 ? 0 : static_cast<size_t>(gguf_register_mmap_max_gib) * 1024ULL * 1024ULL * 1024ULL;
-    if (gguf_register_mmap && gguf_register_mmap_max_bytes > 0 && gguf_bytes <= gguf_register_mmap_max_bytes) {
-        if (cudaHostRegister(gguf_base, gguf_bytes, cudaHostRegisterReadOnly) == cudaSuccess) {
-            gguf_registered = true;
-        } else if (cudaHostRegister(gguf_base, gguf_bytes, cudaHostRegisterDefault) == cudaSuccess) {
-            gguf_registered = true;
-        } else {
-            // Clear the error and continue with the pageable path; correctness
-            // is unaffected, only bandwidth.
-            cudaGetLastError();
-        }
-    }
+    // ===== whole-GGUF mmap pinning is BANNED =====
+    // Never cudaHostRegister the whole GGUF mmap. Registering a file-backed
+    // 80GB+ mapping pins file pages and poisons Linux dirty-page accounting /
+    // writeback: with TP4 an ~86 GiB GGUF is accounted ~344 GiB dirty, which
+    // wedges balance_dirty_pages and stalls all unrelated fsync/git/build I/O
+    // system-wide (observed Dirty ballooning to hundreds of GB, requiring a
+    // reboot). Reads still work, only writeback stalls, so it looks like a disk
+    // fault. Expert H2D MUST use pageable source pointers directly or the
+    // bounded anonymous pinned GgufPinnedStagingRing below; never pin the mmap.
 
     // ===== model dims =====
     const int n_layers = static_cast<int>(ctx.config.n_layers);
@@ -9041,7 +9046,6 @@ GgufDecodeResult run_gguf_generate_smoke(const std::string& ckpt_path,
         cudaEventDestroy(gguf_kv_swap_stage_event);
         cudaStreamDestroy(gguf_kv_swap_copy_stream);
     }
-    if (gguf_registered) cudaHostUnregister(gguf_base);
     return r;
 }
 
@@ -9093,10 +9097,16 @@ PersistentEngine::PersistentEngine(const std::string& ckpt_dir,
 PersistentEngine::~PersistentEngine() = default;
 
 void PersistentEngine::reset_session() {
-    // KV / indexer caches are pre-allocated to max_context capacity. Prefill
-    // overwrites positions 0..N-1, and decode writes positions >= N, so cross
-    // request contamination is impossible by construction. We still sync to
-    // drain any in-flight stream work from the previous request.
+    // Sliding-window KV and indexer KV caches are pre-allocated to max_context
+    // and prefill overwrites positions 0..N-1, so for N < window a new request
+    // fully replaces the previous one with no carryover. The streaming
+    // compressor running state is different: it is an incremental accumulator
+    // (offset = position % ratio, flushed only at block boundaries), so a
+    // request that ends mid-block leaves a partial accumulation that the next
+    // request would resume from. Explicitly restore it to the initial state.
+    auto& ctx = *state_->ctx;
+    ctx.reset_streaming_compressor_states();
+    // Sync to drain any in-flight stream work from the previous request.
     cudaDeviceSynchronize();
 }
 
