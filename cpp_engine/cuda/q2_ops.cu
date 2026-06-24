@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 
 namespace dsv4 {
@@ -100,6 +101,12 @@ static const uint64_t kIQ2XXSGrid[256] = {
 
 // Constants borrowed from the PyTorch kernel.
 constexpr int kQ2TileN = 8;  // output cols per thread block (mirror kGGUFQuantTileN)
+
+bool env_enabled_q2(const char* name, bool default_value = false) {
+    const char* v = std::getenv(name);
+    if (v == nullptr) return default_value;
+    return !(v[0] == '\0' || v[0] == '0' || v[0] == 'f' || v[0] == 'F' || v[0] == 'n' || v[0] == 'N');
+}
 
 // signed_grid layout: [256 grid_ids][128 sign_indices][8 int8 elems] = 262144 bytes.
 // Total ~256 KiB — too large for __constant__ memory on Turing (64 KiB limit), so
@@ -563,6 +570,143 @@ __global__ void gguf_moe_grouped_w13_iq2_xxs_dp4a_kernel(
     }
 }
 
+__global__ void gguf_moe_grouped_w13_iq2_xxs_dp4a_expert_tile_kernel(
+    const int8_t* __restrict__ x_q,
+    const float* __restrict__ x_scale,
+    const int32_t* __restrict__ seg_starts,
+    const uint8_t* __restrict__ w1_blocks,
+    const uint8_t* __restrict__ w3_blocks,
+    const int8_t* __restrict__ signed_grid,
+    float* __restrict__ gate,
+    float* __restrict__ up,
+    int n_experts,
+    int dim,
+    int inter_dim,
+    int blocks_per_row,
+    int x_groups) {
+    constexpr int kRouteTile = 8;
+    const int expert = blockIdx.y;
+    const int route_tile = blockIdx.z;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int out_col = blockIdx.x * kQ2TileN + warp;
+    if (expert >= n_experts || warp >= kQ2TileN) return;
+
+    const int route_start = seg_starts[expert] + route_tile * kRouteTile;
+    const int route_end = seg_starts[expert + 1];
+    const int valid_rows = min(kRouteTile, route_end - route_start);
+    if (valid_rows <= 0) return;
+
+    __shared__ int x_shared_q[kRouteTile][64];
+    __shared__ float x_shared_scale[kRouteTile][8];
+
+    float acc1[kRouteTile];
+    float acc3[kRouteTile];
+    #pragma unroll
+    for (int r = 0; r < kRouteTile; ++r) {
+        acc1[r] = 0.0f;
+        acc3[r] = 0.0f;
+    }
+
+    const uint8_t* w1_row = w1_blocks + (static_cast<int64_t>(expert) * inter_dim + out_col) * blocks_per_row * 66;
+    const uint8_t* w3_row = w3_blocks + (static_cast<int64_t>(expert) * inter_dim + out_col) * blocks_per_row * 66;
+
+    for (int block_idx = 0; block_idx < blocks_per_row; ++block_idx) {
+        const int k_base = block_idx * 256;
+        const int tid = threadIdx.x;
+        #pragma unroll
+        for (int r = 0; r < kRouteTile; ++r) {
+            if (r < valid_rows) {
+                const int route = route_start + r;
+                const int8_t* xq_row = x_q + static_cast<int64_t>(route) * dim;
+                const float* xs_row = x_scale + static_cast<int64_t>(route) * x_groups;
+                if (tid < 64) {
+                    const int byte_off = tid * 4;
+                    int v = 0;
+                    if (k_base + byte_off + 4 <= dim) {
+                        v = *reinterpret_cast<const int*>(xq_row + k_base + byte_off);
+                    }
+                    x_shared_q[r][tid] = v;
+                }
+                if (tid < 8) {
+                    const int sg_idx = block_idx * 8 + tid;
+                    x_shared_scale[r][tid] = sg_idx < x_groups ? xs_row[sg_idx] : 0.0f;
+                }
+            }
+        }
+        __syncthreads();
+
+        if (out_col < inter_dim) {
+            const int sub = lane >> 2;
+            const int part = lane & 3;
+            const uint8_t* w1_block = w1_row + static_cast<int64_t>(block_idx) * 66;
+            const uint8_t* w3_block = w3_row + static_cast<int64_t>(block_idx) * 66;
+            const uint8_t* chunk1 = w1_block + 2 + sub * 8;
+            const uint8_t* chunk3 = w3_block + 2 + sub * 8;
+            const float d1 = gguf_block_scale_f16(w1_block);
+            const float d3 = gguf_block_scale_f16(w3_block);
+            const uint32_t aux1 = static_cast<uint32_t>(chunk1[4]) |
+                (static_cast<uint32_t>(chunk1[5]) << 8) |
+                (static_cast<uint32_t>(chunk1[6]) << 16) |
+                (static_cast<uint32_t>(chunk1[7]) << 24);
+            const uint32_t aux3 = static_cast<uint32_t>(chunk3[4]) |
+                (static_cast<uint32_t>(chunk3[5]) << 8) |
+                (static_cast<uint32_t>(chunk3[6]) << 16) |
+                (static_cast<uint32_t>(chunk3[7]) << 24);
+            const int grid_id1 = chunk1[part];
+            const int grid_id3 = chunk3[part];
+            const int sign_idx1 = static_cast<int>((aux1 >> (7 * part)) & 127);
+            const int sign_idx3 = static_cast<int>((aux3 >> (7 * part)) & 127);
+            const float s1 = 0.125f * d1 * static_cast<float>(2 * (aux1 >> 28) + 1);
+            const float s3 = 0.125f * d3 * static_cast<float>(2 * (aux3 >> 28) + 1);
+            const int8_t* vals1 = signed_grid + (grid_id1 * 128 + sign_idx1) * 8;
+            const int8_t* vals3 = signed_grid + (grid_id3 * 128 + sign_idx3) * 8;
+            const int v1_p0 = *reinterpret_cast<const int*>(vals1);
+            const int v1_p1 = *reinterpret_cast<const int*>(vals1 + 4);
+            const int v3_p0 = *reinterpret_cast<const int*>(vals3);
+            const int v3_p1 = *reinterpret_cast<const int*>(vals3 + 4);
+            const int xq_base = sub * 8 + part * 2;
+            #pragma unroll
+            for (int r = 0; r < kRouteTile; ++r) {
+                float local1 = 0.0f;
+                float local3 = 0.0f;
+                if (r < valid_rows) {
+                    const int x_p0 = x_shared_q[r][xq_base];
+                    const int x_p1 = x_shared_q[r][xq_base + 1];
+                    int sumi1 = __dp4a(v1_p0, x_p0, 0);
+                    sumi1 = __dp4a(v1_p1, x_p1, sumi1);
+                    int sumi3 = __dp4a(v3_p0, x_p0, 0);
+                    sumi3 = __dp4a(v3_p1, x_p1, sumi3);
+                    const float xs = x_shared_scale[r][sub];
+                    local1 = s1 * xs * static_cast<float>(sumi1);
+                    local3 = s3 * xs * static_cast<float>(sumi3);
+                }
+                #pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    local1 += __shfl_down_sync(0xffffffff, local1, offset);
+                    local3 += __shfl_down_sync(0xffffffff, local3, offset);
+                }
+                if (lane == 0) {
+                    acc1[r] += local1;
+                    acc3[r] += local3;
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0 && out_col < inter_dim) {
+        #pragma unroll
+        for (int r = 0; r < kRouteTile; ++r) {
+            if (r < valid_rows) {
+                const int route = route_start + r;
+                gate[static_cast<int64_t>(route) * inter_dim + out_col] = acc1[r];
+                up[static_cast<int64_t>(route) * inter_dim + out_col] = acc3[r];
+            }
+        }
+    }
+}
+
 __global__ void q2_route_slots_from_segments_kernel(
     const int32_t* __restrict__ seg_starts,
     int64_t* __restrict__ route_slots,
@@ -649,6 +793,195 @@ __global__ void gguf_moe_grouped_w2_q2k_dp4a_kernel(
         }
     }
     if (lane == 0) atomicAdd(y_rows + token * static_cast<int64_t>(dim) + out_col, acc);
+}
+
+__global__ void gguf_moe_grouped_w2_q2k_dp4a_route_tile_kernel(
+    const int8_t* __restrict__ hidden_q,
+    const float* __restrict__ hidden_scale,
+    const int64_t* __restrict__ route_tokens,
+    const int32_t* __restrict__ seg_starts,
+    const uint8_t* __restrict__ w2_blocks,
+    float* __restrict__ y_rows,
+    int n_experts,
+    int dim,
+    int inter_dim,
+    int w2_blocks_per_row,
+    int hidden_groups) {
+    constexpr int kRouteTile = 8;
+    const int expert = blockIdx.y;
+    const int route_tile = blockIdx.z;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int out_col = blockIdx.x * kQ2TileN + warp;
+    if (expert >= n_experts || warp >= kQ2TileN || out_col >= dim) return;
+
+    const int route_start = seg_starts[expert] + route_tile * kRouteTile;
+    const int route_end = seg_starts[expert + 1];
+    const int valid_rows = min(kRouteTile, route_end - route_start);
+    if (valid_rows <= 0) return;
+
+    const uint8_t* w2_row = w2_blocks + (static_cast<int64_t>(expert) * dim + out_col) * w2_blocks_per_row * 84;
+    float acc[kRouteTile];
+    #pragma unroll
+    for (int r = 0; r < kRouteTile; ++r) acc[r] = 0.0f;
+
+    for (int block_idx = 0; block_idx < w2_blocks_per_row; ++block_idx) {
+        const uint8_t* block = w2_row + static_cast<int64_t>(block_idx) * 84;
+        const uint8_t* scales = block;
+        const uint8_t* qs = block + 16;
+        const float d = gguf_block_scale_f16(block + 80);
+        const float dmin = gguf_block_scale_f16(block + 82);
+        const int k_base = block_idx * 256;
+        for (int half = 0; half < 2; ++half) {
+            const int sub = lane >> 2;
+            const int part = lane & 3;
+            const int group = half * 8 + sub;
+            const int shift = (sub >> 1) * 2;
+            const int byte_start = half * 32 + (sub & 1) * 16;
+            const int idx = part * 4;
+            const int q0 = static_cast<int>((qs[byte_start + idx + 0] >> shift) & 0x03);
+            const int q1 = static_cast<int>((qs[byte_start + idx + 1] >> shift) & 0x03);
+            const int q2 = static_cast<int>((qs[byte_start + idx + 2] >> shift) & 0x03);
+            const int q3 = static_cast<int>((qs[byte_start + idx + 3] >> shift) & 0x03);
+            const int w_pack = pack_i8x4(q0, q1, q2, q3);
+            const int h_idx = k_base + group * 16 + idx;
+            const float qscale = d * static_cast<float>(scales[group] & 0x0f);
+            const float base = dmin * static_cast<float>(scales[group] >> 4);
+            const unsigned group_mask = 0x0fu << (sub * 4);
+            #pragma unroll
+            for (int r = 0; r < kRouteTile; ++r) {
+                float local = 0.0f;
+                if (r < valid_rows) {
+                    const int route = route_start + r;
+                    const int64_t token = route_tokens[route];
+                    if (token >= 0) {
+                        const int8_t* hidden_row = hidden_q + static_cast<int64_t>(route) * inter_dim;
+                        const float* hs_row = hidden_scale + static_cast<int64_t>(route) * hidden_groups;
+                        const int h_pack = pack_i8x4(
+                            static_cast<int>(hidden_row[h_idx + 0]),
+                            static_cast<int>(hidden_row[h_idx + 1]),
+                            static_cast<int>(hidden_row[h_idx + 2]),
+                            static_cast<int>(hidden_row[h_idx + 3]));
+                        const int dot_q = __dp4a(w_pack, h_pack, 0);
+                        const int sum_h = __dp4a(0x01010101, h_pack, 0);
+                        local = hs_row[block_idx * 16 + group] * (qscale * static_cast<float>(dot_q) - base * static_cast<float>(sum_h));
+                    }
+                }
+                local += __shfl_down_sync(group_mask, local, 2, 4);
+                local += __shfl_down_sync(group_mask, local, 1, 4);
+                float group_sum = (part == 0) ? local : 0.0f;
+                #pragma unroll
+                for (int offset = 16; offset > 0; offset >>= 1) {
+                    group_sum += __shfl_down_sync(0xffffffff, group_sum, offset);
+                }
+                if (lane == 0) acc[r] += group_sum;
+            }
+        }
+    }
+
+    if (lane == 0) {
+        #pragma unroll
+        for (int r = 0; r < kRouteTile; ++r) {
+            if (r < valid_rows) {
+                const int route = route_start + r;
+                const int64_t token = route_tokens[route];
+                if (token >= 0) atomicAdd(y_rows + token * static_cast<int64_t>(dim) + out_col, acc[r]);
+            }
+        }
+    }
+}
+
+__global__ void gguf_moe_grouped_w2_q2k_dp4a_expert_tile_kernel(
+    const int8_t* __restrict__ hidden_q,
+    const float* __restrict__ hidden_scale,
+    const int64_t* __restrict__ route_tokens,
+    const int32_t* __restrict__ seg_starts,
+    const uint8_t* __restrict__ w2_blocks,
+    float* __restrict__ y_rows,
+    int n_experts,
+    int dim,
+    int inter_dim,
+    int w2_blocks_per_row,
+    int hidden_groups) {
+    constexpr int kRouteTile = 8;
+    constexpr int kSubwarpCols = 8;
+    const int expert = blockIdx.y;
+    const int route_tile = blockIdx.z;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int sub = lane >> 2;
+    const int part = lane & 3;
+    const int out_col = blockIdx.x * (kQ2TileN * kSubwarpCols) + warp * kSubwarpCols + sub;
+    if (expert >= n_experts || warp >= kQ2TileN || out_col >= dim) return;
+
+    const int route_start = seg_starts[expert] + route_tile * kRouteTile;
+    const int route_end = seg_starts[expert + 1];
+    const int valid_rows = min(kRouteTile, route_end - route_start);
+    if (valid_rows <= 0) return;
+
+    const uint8_t* w2_row = w2_blocks + (static_cast<int64_t>(expert) * dim + out_col) * w2_blocks_per_row * 84;
+    const unsigned mask = 0x0fu << (sub * 4);
+    float acc[kRouteTile];
+    #pragma unroll
+    for (int r = 0; r < kRouteTile; ++r) acc[r] = 0.0f;
+
+    for (int block_idx = 0; block_idx < w2_blocks_per_row; ++block_idx) {
+        const uint8_t* block = w2_row + static_cast<int64_t>(block_idx) * 84;
+        const uint8_t* scales = block;
+        const uint8_t* qs = block + 16;
+        const float d = gguf_block_scale_f16(block + 80);
+        const float dmin = gguf_block_scale_f16(block + 82);
+        const int k_base = block_idx * 256;
+        for (int group = 0; group < 16; ++group) {
+            const int half_block = group >> 3;
+            const int group_in_half = group & 7;
+            const int shift = (group_in_half >> 1) * 2;
+            const int byte_start = half_block * 32 + (group_in_half & 1) * 16;
+            const int idx = part * 4;
+            const int q0 = static_cast<int>((qs[byte_start + idx + 0] >> shift) & 0x03);
+            const int q1 = static_cast<int>((qs[byte_start + idx + 1] >> shift) & 0x03);
+            const int q2 = static_cast<int>((qs[byte_start + idx + 2] >> shift) & 0x03);
+            const int q3 = static_cast<int>((qs[byte_start + idx + 3] >> shift) & 0x03);
+            const int w_pack = pack_i8x4(q0, q1, q2, q3);
+            const float qscale = d * static_cast<float>(scales[group] & 0x0f);
+            const float base = dmin * static_cast<float>(scales[group] >> 4);
+            const int h_idx = k_base + group * 16 + idx;
+            #pragma unroll
+            for (int r = 0; r < kRouteTile; ++r) {
+                float local = 0.0f;
+                if (r < valid_rows) {
+                    const int route = route_start + r;
+                    const int64_t token = route_tokens[route];
+                    if (token >= 0) {
+                        const int8_t* hidden_row = hidden_q + static_cast<int64_t>(route) * inter_dim;
+                        const float* hs_row = hidden_scale + static_cast<int64_t>(route) * hidden_groups;
+                        const int h_pack = pack_i8x4(
+                            static_cast<int>(hidden_row[h_idx + 0]),
+                            static_cast<int>(hidden_row[h_idx + 1]),
+                            static_cast<int>(hidden_row[h_idx + 2]),
+                            static_cast<int>(hidden_row[h_idx + 3]));
+                        const int dot_q = __dp4a(w_pack, h_pack, 0);
+                        const int sum_h = __dp4a(0x01010101, h_pack, 0);
+                        local = hs_row[block_idx * 16 + group] * (qscale * static_cast<float>(dot_q) - base * static_cast<float>(sum_h));
+                    }
+                }
+                local += __shfl_down_sync(mask, local, 2, 4);
+                local += __shfl_down_sync(mask, local, 1, 4);
+                if (part == 0) acc[r] += local;
+            }
+        }
+    }
+
+    if (part == 0) {
+        #pragma unroll
+        for (int r = 0; r < kRouteTile; ++r) {
+            if (r < valid_rows) {
+                const int route = route_start + r;
+                const int64_t token = route_tokens[route];
+                if (token >= 0) atomicAdd(y_rows + token * static_cast<int64_t>(dim) + out_col, acc[r]);
+            }
+        }
+    }
 }
 
 inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
@@ -827,11 +1160,18 @@ bool moe_prefill_q2_grouped_cuda_with_workspace(
     if (cudaGetLastError() != cudaSuccess) return false;
     const int blocks_per_row = dim / 256;
     const int x_groups = ceil_div(dim, 32);
-    dim3 grid_w13(ceil_div(inter_dim, kQ2TileN), routes);
     dim3 block(256);
-    gguf_moe_grouped_w13_iq2_xxs_dp4a_kernel<<<grid_w13, block, 0, cs>>>(
-        workspace.d_x_q, workspace.d_x_scale, workspace.d_route_slots, d_w1_blocks, d_w3_blocks, sg,
-        workspace.d_gate, workspace.d_up, routes, n_experts, dim, inter_dim, blocks_per_row, x_groups);
+    if (env_enabled_q2("DSV4_Q2_PREFILL_W13_EXPERT_TILE", true)) {
+        dim3 grid_w13_tile(ceil_div(inter_dim, kQ2TileN), n_experts, ceil_div(max_count, 8));
+        gguf_moe_grouped_w13_iq2_xxs_dp4a_expert_tile_kernel<<<grid_w13_tile, block, 0, cs>>>(
+            workspace.d_x_q, workspace.d_x_scale, d_seg_starts, d_w1_blocks, d_w3_blocks, sg,
+            workspace.d_gate, workspace.d_up, n_experts, dim, inter_dim, blocks_per_row, x_groups);
+    } else {
+        dim3 grid_w13(ceil_div(inter_dim, kQ2TileN), routes);
+        gguf_moe_grouped_w13_iq2_xxs_dp4a_kernel<<<grid_w13, block, 0, cs>>>(
+            workspace.d_x_q, workspace.d_x_scale, workspace.d_route_slots, d_w1_blocks, d_w3_blocks, sg,
+            workspace.d_gate, workspace.d_up, routes, n_experts, dim, inter_dim, blocks_per_row, x_groups);
+    }
     if (cudaGetLastError() != cudaSuccess) return false;
     if (!q2_route_swiglu_quantize_hidden_q8_1_cuda(workspace.d_gate, workspace.d_up, d_route_weights,
                                                    workspace.d_hidden_q, workspace.d_hidden_scale,
@@ -840,10 +1180,22 @@ bool moe_prefill_q2_grouped_cuda_with_workspace(
     }
     const int w2_blocks_per_row = inter_dim / 256;
     const int hidden_groups = ceil_div(inter_dim, 16);
-    dim3 grid_w2(ceil_div(dim, kQ2TileN), max_count, n_experts);
-    gguf_moe_grouped_w2_q2k_dp4a_kernel<<<grid_w2, block, 0, cs>>>(
-        workspace.d_hidden_q, workspace.d_hidden_scale, d_route_tokens, d_seg_starts, d_w2_blocks,
-        d_y_rows, routes, n_experts, max_count, dim, inter_dim, w2_blocks_per_row, hidden_groups);
+    if (env_enabled_q2("DSV4_Q2_PREFILL_W2_EXPERT_TILE", false)) {
+        dim3 grid_w2_tile(ceil_div(dim, kQ2TileN * 8), n_experts, ceil_div(max_count, 8));
+        gguf_moe_grouped_w2_q2k_dp4a_expert_tile_kernel<<<grid_w2_tile, block, 0, cs>>>(
+            workspace.d_hidden_q, workspace.d_hidden_scale, d_route_tokens, d_seg_starts, d_w2_blocks,
+            d_y_rows, n_experts, dim, inter_dim, w2_blocks_per_row, hidden_groups);
+    } else if (env_enabled_q2("DSV4_Q2_PREFILL_W2_ROUTE_TILE", true)) {
+        dim3 grid_w2_route_tile(ceil_div(dim, kQ2TileN), n_experts, ceil_div(max_count, 8));
+        gguf_moe_grouped_w2_q2k_dp4a_route_tile_kernel<<<grid_w2_route_tile, block, 0, cs>>>(
+            workspace.d_hidden_q, workspace.d_hidden_scale, d_route_tokens, d_seg_starts, d_w2_blocks,
+            d_y_rows, n_experts, dim, inter_dim, w2_blocks_per_row, hidden_groups);
+    } else {
+        dim3 grid_w2(ceil_div(dim, kQ2TileN), max_count, n_experts);
+        gguf_moe_grouped_w2_q2k_dp4a_kernel<<<grid_w2, block, 0, cs>>>(
+            workspace.d_hidden_q, workspace.d_hidden_scale, d_route_tokens, d_seg_starts, d_w2_blocks,
+            d_y_rows, routes, n_experts, max_count, dim, inter_dim, w2_blocks_per_row, hidden_groups);
+    }
     return cudaGetLastError() == cudaSuccess;
 }
 
