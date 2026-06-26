@@ -108,6 +108,7 @@ def test_real_minimax_m27_bundle_validates_when_available() -> None:
     assert params.n_layers == 62
     assert params.hidden_size == 3072
     assert params.vocab_size == 200064
+    assert params.context_length == 196608
     assert params.n_routed_experts == 256
     assert params.top_k == 8
     assert bundle.tensor_count == 809
