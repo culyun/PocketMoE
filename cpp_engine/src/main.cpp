@@ -197,7 +197,10 @@ int main(int argc, char** argv) {
             opts.tp_rank = args.tp_rank;
             opts.device = args.device >= 0 ? args.device : args.tp_rank;
             opts.nccl_id_path = args.nccl_id_path;
+            const dsv4::ModelConfig model_cfg = dsv4::ModelConfig::from_hf_config(args.ckpt);
             dsv4::PersistentEngine engine(args.ckpt, opts, layer_count, max_context);
+            std::cout << "server_max_context=" << max_context << "\n";
+            std::cout << "model_context_length=" << model_cfg.context_length << "\n";
             engine.warmup_tp();
             if (args.tp_rank > 0) {
                 // Worker rank: park on the NCCL command channel until rank 0
